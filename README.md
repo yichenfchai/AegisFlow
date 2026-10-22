@@ -1,4 +1,12 @@
-# React + TypeScript + Vite
+# AegisFlow
+
+轻量交付治理平台。前端使用 React + TypeScript + Vite，Go 后端公共设施与本地账号鉴权已加入 `backend/`。
+
+后端启动、环境变量、接口契约及验证命令见 [Go 后端文档](backend/README.md)。当前前端仍使用 mock 数据与 mock 登录，尚未接入真实后端。
+
+## 前端模板说明
+
+React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
 

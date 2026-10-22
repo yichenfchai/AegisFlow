@@ -22,3 +22,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Backend runtime data and local credentials
+backend/data/
+backend/.env
+backend/server
+backend/server.exe
+backend/coverage.out
