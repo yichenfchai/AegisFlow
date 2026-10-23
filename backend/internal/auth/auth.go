@@ -42,10 +42,12 @@ type User struct {
 }
 
 type Tokens struct {
-	User         User   `json:"user"`
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	ExpiresIn    int64  `json:"expiresIn"` // Seconds until the access token expires.
+	User             User   `json:"user"`
+	AccessToken      string `json:"accessToken"`
+	RefreshToken     string `json:"-"`         // Only the HTTP cookie transport may expose this value.
+	ExpiresIn        int64  `json:"expiresIn"` // Seconds until the access token expires.
+	Remember         bool   `json:"-"`
+	SessionExpiresAt int64  `json:"-"` // Absolute Unix deadline, never extended by rotation.
 }
 
 type Service struct {
@@ -71,31 +73,54 @@ func (s *Service) valid() error {
 	return nil
 }
 
-// Migrate is idempotent. Refresh history is retained so replay can revoke a session.
+// Migrate applies versioned PostgreSQL migrations under a transaction-scoped lock.
+// Refresh history is retained so replay can revoke a session.
 func (s *Service) Migrate(ctx context.Context) error {
 	if err := s.valid(); err != nil {
 		return err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	for _, stmt := range []string{
-		`CREATE TABLE IF NOT EXISTS auth_users (
- id TEXT PRIMARY KEY, username TEXT NOT NULL COLLATE NOCASE UNIQUE,
- password_hash TEXT NOT NULL, display_name TEXT NOT NULL,
- role TEXT NOT NULL CHECK(role IN ('admin','member','viewer')))`,
-		`CREATE TABLE IF NOT EXISTS auth_sessions (
- id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES auth_users(id),
- expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1)))`,
-		`CREATE TABLE IF NOT EXISTS auth_refresh_tokens (
- token_hash TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES auth_sessions(id),
- consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed IN (0,1)))`,
-		`CREATE INDEX IF NOT EXISTS auth_refresh_session_idx ON auth_refresh_tokens(session_id)`,
-	} {
-		if _, err = tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migrate auth: %w", err)
+	if err = advisoryLock(ctx, tx, "migrate"); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+ version BIGINT PRIMARY KEY, applied_at BIGINT NOT NULL)`); err != nil {
+		return fmt.Errorf("create migration ledger: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT version FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		return err
+	}
+	var version int64
+	for rows.Next() {
+		var found int64
+		if err = rows.Scan(&found); err != nil {
+			rows.Close()
+			return err
+		}
+		if found != version+1 || found > int64(len(authMigrations)) {
+			rows.Close()
+			return fmt.Errorf("unsupported auth schema migration version %d", found)
+		}
+		version = found
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for i := int(version); i < len(authMigrations); i++ {
+		for _, stmt := range authMigrations[i] {
+			if _, err = tx.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("migrate auth version %d: %w", i+1, err)
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES($1,$2)`, i+1, time.Now().Unix()); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
@@ -133,13 +158,16 @@ func (s *Service) Bootstrap(ctx context.Context, username, password string) erro
 	if err != nil {
 		return err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if err = advisoryLock(ctx, tx, "bootstrap"); err != nil {
+		return err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO auth_users(id,username,password_hash,display_name,role)
- SELECT ?,?,?,?,'admin' WHERE NOT EXISTS(SELECT 1 FROM auth_users)`, id, username, string(hash), username)
+ SELECT $1,$2,$3,$4,'admin' WHERE NOT EXISTS(SELECT 1 FROM auth_users)`, id, username, string(hash), username)
 	if err != nil {
 		return fmt.Errorf("bootstrap: %w", err)
 	}
@@ -165,7 +193,7 @@ func (s *Service) CreateUser(ctx context.Context, username, password, displayNam
 	if err != nil {
 		return nil, err
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO auth_users(id,username,password_hash,display_name,role) VALUES(?,?,?,?,?) ON CONFLICT(username) DO NOTHING`, id, username, string(hash), displayName, role)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO auth_users(id,username,password_hash,display_name,role) VALUES($1,$2,$3,$4,$5) ON CONFLICT (lower(username)) DO NOTHING`, id, username, string(hash), displayName, role)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +211,7 @@ func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,username,display_name,role FROM auth_users ORDER BY username COLLATE NOCASE,id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,username,display_name,role FROM auth_users ORDER BY lower(username),id`)
 	if err != nil {
 		return nil, err
 	}
@@ -199,13 +227,18 @@ func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 	return users, rows.Err()
 }
 
+// Login keeps the original Go API for non-HTTP callers; sessions default to non-persistent.
 func (s *Service) Login(ctx context.Context, username, password string) (*Tokens, error) {
+	return s.LoginWithRemember(ctx, username, password, false)
+}
+
+func (s *Service) LoginWithRemember(ctx context.Context, username, password string, remember bool) (*Tokens, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
 	}
 	var u User
 	var hash string
-	err := s.db.QueryRowContext(ctx, `SELECT id,username,display_name,role,password_hash FROM auth_users WHERE username=?`, username).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &hash)
+	err := s.db.QueryRowContext(ctx, `SELECT id,username,display_name,role,password_hash FROM auth_users WHERE lower(username)=lower($1)`, username).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &hash)
 	if errors.Is(err, sql.ErrNoRows) {
 		// A fixed valid bcrypt hash keeps unknown-user failures comparable to bad passwords.
 		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"), []byte(password))
@@ -226,19 +259,23 @@ func (s *Service) Login(ctx context.Context, username, password string) (*Tokens
 		return nil, err
 	}
 	expires := time.Now().Add(s.refreshTTL).Unix()
-	tokens, err := s.issue(u, sid, refresh, expires)
+	tokens, err := s.issue(u, sid, refresh, expires, remember)
 	if err != nil {
 		return nil, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_sessions(id,user_id,expires_at) VALUES(?,?,?)`, sid, u.ID, expires); err != nil {
+	rememberInt := 0
+	if remember {
+		rememberInt = 1
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_sessions(id,user_id,expires_at,remember) VALUES($1,$2,$3,$4)`, sid, u.ID, expires, rememberInt); err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_refresh_tokens(token_hash,session_id) VALUES(?,?)`, hashToken(refresh), sid); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_refresh_tokens(token_hash,session_id) VALUES($1,$2)`, hashToken(refresh), sid); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -255,26 +292,33 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*Tokens, er
 		return nil, ErrUnauthorized
 	}
 	hash := hashToken(refreshToken)
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	// The first statement is a write: concurrent consumers serialize before reading.
-	result, err := tx.ExecContext(ctx, `UPDATE auth_refresh_tokens SET consumed=1 WHERE token_hash=? AND consumed=0
- AND EXISTS(SELECT 1 FROM auth_sessions s WHERE s.id=auth_refresh_tokens.session_id AND s.revoked=0 AND s.expires_at>?)`, hash, time.Now().Unix())
+	// Resolve the immutable session id without locking the token. Every operation
+	// then locks session -> token, serializing all generations across processes.
+	sid, err := lockRefreshSession(ctx, tx, hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUnauthorized
+	}
 	if err != nil {
 		return nil, err
 	}
-	n, err := result.RowsAffected()
-	if err != nil {
+	var u User
+	var expires int64
+	var revoked, remember, consumed int
+	if err = tx.QueryRowContext(ctx, `SELECT u.id,u.username,u.display_name,u.role,s.expires_at,s.revoked,s.remember
+ FROM auth_sessions s JOIN auth_users u ON u.id=s.user_id WHERE s.id=$1`, sid).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &expires, &revoked, &remember); err != nil {
 		return nil, err
 	}
-	if n == 0 {
-		// A previously consumed token is evidence of replay, even if a newer token exists.
-		_, err = tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE id IN
-   (SELECT session_id FROM auth_refresh_tokens WHERE token_hash=? AND consumed=1)`, hash)
-		if err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT consumed FROM auth_refresh_tokens WHERE token_hash=$1 AND session_id=$2 FOR UPDATE`, hash, sid).Scan(&consumed); err != nil {
+		return nil, err
+	}
+	if consumed != 0 {
+		// Commit the replay revocation, including when a concurrent rotation won.
+		if _, err = tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE id=$1`, sid); err != nil {
 			return nil, err
 		}
 		if err = tx.Commit(); err != nil {
@@ -282,23 +326,21 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*Tokens, er
 		}
 		return nil, ErrUnauthorized
 	}
-	var u User
-	var sid string
-	var expires int64
-	err = tx.QueryRowContext(ctx, `SELECT u.id,u.username,u.display_name,u.role,s.id,s.expires_at
- FROM auth_refresh_tokens r JOIN auth_sessions s ON s.id=r.session_id JOIN auth_users u ON u.id=s.user_id WHERE r.token_hash=?`, hash).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &sid, &expires)
-	if err != nil {
+	if revoked != 0 || expires <= time.Now().Unix() {
+		return nil, ErrUnauthorized
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE auth_refresh_tokens SET consumed=1 WHERE token_hash=$1`, hash); err != nil {
 		return nil, err
 	}
 	next, err := randomToken(32)
 	if err != nil {
 		return nil, err
 	}
-	tokens, err := s.issue(u, sid, next, expires)
+	tokens, err := s.issue(u, sid, next, expires, remember != 0)
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_refresh_tokens(token_hash,session_id) VALUES(?,?)`, hashToken(next), sid); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_refresh_tokens(token_hash,session_id) VALUES($1,$2)`, hashToken(next), sid); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -316,8 +358,34 @@ func (s *Service) Logout(ctx context.Context, refreshToken string) error {
 	if !validRefresh(refreshToken) {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE id IN(SELECT session_id FROM auth_refresh_tokens WHERE token_hash=?)`, hashToken(refreshToken))
-	return err
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	sid, err := lockRefreshSession(ctx, tx, hashToken(refreshToken))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE id=$1`, sid); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Token-to-session associations are immutable and history is never deleted.
+// Lock only the session here; locking a joined token first would allow deadlocks
+// between an old-token replay, a new-token refresh, and logout.
+func lockRefreshSession(ctx context.Context, tx *sql.Tx, hash string) (string, error) {
+	var sid string
+	if err := tx.QueryRowContext(ctx, `SELECT session_id FROM auth_refresh_tokens WHERE token_hash=$1`, hash).Scan(&sid); err != nil {
+		return "", err
+	}
+	err := tx.QueryRowContext(ctx, `SELECT id FROM auth_sessions WHERE id=$1 FOR UPDATE`, sid).Scan(&sid)
+	return sid, err
 }
 
 func (s *Service) Authenticate(ctx context.Context, accessToken string) (*User, error) {
@@ -336,7 +404,7 @@ func (s *Service) Authenticate(ctx context.Context, accessToken string) (*User, 
 	}
 	var u User
 	err = s.db.QueryRowContext(ctx, `SELECT u.id,u.username,u.display_name,u.role FROM auth_sessions s
- JOIN auth_users u ON u.id=s.user_id WHERE s.id=? AND s.user_id=? AND s.revoked=0 AND s.expires_at>?`, claims.SessionID, claims.Subject, time.Now().Unix()).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role)
+ JOIN auth_users u ON u.id=s.user_id WHERE s.id=$1 AND s.user_id=$2 AND s.revoked=0 AND s.expires_at>$3`, claims.SessionID, claims.Subject, time.Now().Unix()).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrUnauthorized
 	}
@@ -346,7 +414,7 @@ func (s *Service) Authenticate(ctx context.Context, accessToken string) (*User, 
 	return &u, nil
 }
 
-func (s *Service) issue(u User, sid, refresh string, sessionExpires int64) (*Tokens, error) {
+func (s *Service) issue(u User, sid, refresh string, sessionExpires int64, remember bool) (*Tokens, error) {
 	now := time.Now().Unix()
 	expires := time.Now().Add(s.accessTTL).Unix()
 	if expires > sessionExpires {
@@ -360,7 +428,7 @@ func (s *Service) issue(u User, sid, refresh string, sessionExpires int64) (*Tok
 	if err != nil {
 		return nil, err
 	}
-	return &Tokens{User: u, AccessToken: access, RefreshToken: refresh, ExpiresIn: expires - now}, nil
+	return &Tokens{User: u, AccessToken: access, RefreshToken: refresh, ExpiresIn: expires - now, Remember: remember, SessionExpiresAt: sessionExpires}, nil
 }
 
 func randomToken(size int) (string, error) {

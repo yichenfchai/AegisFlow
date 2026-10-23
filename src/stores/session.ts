@@ -1,72 +1,146 @@
 import { create } from 'zustand'
+import { ApiError, authAPI, httpRequest } from '@/api/http'
+import type { AuthSession, SessionUser } from '@/api/http'
 
-interface SessionUser {
-  id: string
-  username: string
-  displayName: string
-  role: 'admin' | 'member' | 'viewer'
-}
-
+export type { SessionUser }
 interface SessionState {
   user: SessionUser | null
   accessToken: string | null
-  login: (user: SessionUser, token: string) => void
-  logout: () => void
+  status: 'loading' | 'authenticated' | 'anonymous' | 'error'
+  error: string | null
+  login: (username: string, password: string, remember: boolean) => Promise<void>
+  restore: () => Promise<void>
+  logout: () => Promise<void>
 }
-
-const SESSION_KEY = 'gp_session'
-
-/** 解析 JWT payload 并校验 exp；过期/损坏返回 null */
-function parseToken(token: string): { exp: number } | null {
-  try {
-    const [, payloadB64] = token.split('.')
-    const payload = JSON.parse(atob(payloadB64))
-    if (typeof payload.exp !== 'number' || payload.exp * 1000 < Date.now()) return null
-    return payload
-  } catch {
-    return null
-  }
+let refreshFlight: Promise<void> | null = null
+let restoreFlight: Promise<void> | null = null
+let revision = 0
+let initialized = false
+let expiresAt = 0
+let refreshTimer: ReturnType<typeof setTimeout> | undefined
+function scheduleRefresh(delay: number) {
+  clearTimeout(refreshTimer)
+  refreshTimer = setTimeout(() => {
+    if (useSession.getState().status !== 'authenticated') return
+    void refreshSession().catch(error => {
+      if (!isUnauthorized(error) && useSession.getState().status === 'authenticated') scheduleRefresh(30_000)
+    })
+  }, delay)
 }
+const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('aegisflow-session') : null
 
-function restore(): { user: SessionUser | null; accessToken: string | null } {
-  try {
-    const raw = localStorage.getItem(SESSION_KEY)
-    if (!raw) return { user: null, accessToken: null }
-    const { user, accessToken } = JSON.parse(raw)
-    // token 缺失或已过期 → 丢弃会话
-    if (!accessToken || !parseToken(accessToken)) {
-      localStorage.removeItem(SESSION_KEY)
-      return { user: null, accessToken: null }
-    }
-    return { user, accessToken }
-  } catch {
-    return { user: null, accessToken: null }
-  }
-}
+// The old demo session must never be treated as an authenticated server session.
+try { localStorage.removeItem('gp_session') } catch { /* Storage may be disabled. */ }
 
-/**
- * 会话存储：localStorage 持久化 JWT 形状，恢复时校验 exp。
- * 真实后端就绪后：login() 由 /auth/login 响应驱动，refresh 走 /auth/refresh。
- */
-export const useSession = create<SessionState>((set) => ({
-  ...restore(),
-  login: (user, accessToken) => {
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ user, accessToken, ts: Date.now() }))
-    set({ user, accessToken })
+export const useSession = create<SessionState>(() => ({
+  user: null, accessToken: null, status: 'loading', error: null,
+  login: async (username, password, remember) => {
+    const expected = ++revision
+    await withSessionLock(async () => {
+      const session = await authAPI.login(username, password, remember)
+      if (expected !== revision) return
+      initialized = true
+      apply(session)
+      channel?.postMessage({ type: 'changed' })
+    })
   },
-  logout: () => {
-    localStorage.removeItem(SESSION_KEY)
-    set({ user: null, accessToken: null })
+  restore: () => {
+    if (restoreFlight) return restoreFlight
+    if (initialized) return Promise.resolve()
+    useSession.setState({ status: 'loading', error: null })
+    const restoringRevision = revision
+    restoreFlight = (async () => {
+      try {
+        await refreshSession()
+        const expected = revision
+        const token = useSession.getState().accessToken!
+        const user = await authAPI.me(token)
+        if (expected === revision) useSession.setState({ user })
+        initialized = true
+      } catch (error) {
+        if (restoringRevision !== revision && useSession.getState().status === 'authenticated') return
+        if (isUnauthorized(error)) { clearSession(); initialized = true }
+        else if (restoringRevision === revision) useSession.setState({ status: 'error', error: errorMessage(error) })
+      }
+    })().finally(() => { restoreFlight = null })
+    return restoreFlight
+  },
+  logout: async () => {
+    // Wait for ongoing rotation, then revoke the latest cookie. Keep state on network failure.
+    await withSessionLock(async () => {
+      await authAPI.logout()
+      revision++
+      initialized = true
+      clearSession()
+      channel?.postMessage({ type: 'logout' })
+    })
   },
 }))
-
-/** mock JWT 签发（形状对齐后端：header.payload.signature 的 payload 部分） */
-export function mockJwtFor(username: string, ttlSec = 60 * 60 * 24 * 30): string {
-  const payload = {
-    sub: username,
-    iss: 'gopulse',
-    exp: Math.floor(Date.now() / 1000) + ttlSec,
-    scope: 'read write approve',
-  }
-  return `mock.${btoa(JSON.stringify(payload))}.sig`
+function apply(session: AuthSession) {
+  expiresAt = Date.now() + session.expiresIn * 1000
+  scheduleRefresh(Math.max(1000, session.expiresIn * 1000 - Math.min(30_000, session.expiresIn * 200)))
+  useSession.setState({ user: session.user, accessToken: session.accessToken, status: 'authenticated', error: null })
 }
+function clearSession() {
+  clearTimeout(refreshTimer)
+  expiresAt = 0
+  useSession.setState({ user: null, accessToken: null, status: 'anonymous', error: null })
+}
+export function errorMessage(error: unknown): string {
+  if (error instanceof ApiError && error.status === 401) return '账号、密码错误或会话已过期，请重新登录'
+  return error instanceof Error ? error.message : '请求失败，请稍后重试'
+}
+function isUnauthorized(error: unknown) { return error instanceof ApiError && error.status === 401 }
+async function withSessionLock<T>(action: () => Promise<T>): Promise<T> {
+  // Without Web Locks, concurrent tabs could rotate the same cookie and trigger replay detection.
+  // Fail explicitly rather than silently weakening session coordination.
+  if (!navigator.locks) throw new Error('请使用支持 Web Locks 的现代浏览器，并通过 HTTPS 或 localhost 访问')
+  return navigator.locks.request('aegisflow-auth-cookie', action)
+}
+export function refreshSession(): Promise<void> {
+  if (refreshFlight) return refreshFlight
+  const expected = revision
+  refreshFlight = withSessionLock(async () => {
+    if (expected !== revision) throw new ApiError(401, 'session_changed', '会话已变更，请重新登录')
+    try {
+      const session = await authAPI.refresh()
+      if (expected !== revision) throw new ApiError(401, 'session_changed', '会话已变更，请重新登录')
+      apply(session)
+    } catch (error) {
+      if (expected === revision && isUnauthorized(error)) {
+        revision++
+        clearSession()
+        channel?.postMessage({ type: 'logout' })
+      }
+      throw error
+    }
+  }).finally(() => { refreshFlight = null })
+  return refreshFlight
+}
+// One refresh and at most one retry per request. A late 401 reuses a token already refreshed by a peer request.
+export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  if (useSession.getState().status === 'loading') await useSession.getState().restore()
+  if (useSession.getState().status !== 'authenticated') throw new ApiError(401, 'unauthorized', '请先登录')
+  if (Date.now() >= expiresAt - 5000) await refreshSession()
+  const token = useSession.getState().accessToken!
+  const expected = revision
+  try { return await httpRequest<T>(path, init, token) } catch (error) {
+    if (!isUnauthorized(error)) throw error
+    if (expected !== revision) throw error
+    if (useSession.getState().accessToken === token) await refreshSession()
+    try { return await httpRequest<T>(path, init, useSession.getState().accessToken!) } catch (retryError) {
+      if (expected === revision && isUnauthorized(retryError)) { revision++; clearSession(); channel?.postMessage({ type: 'logout' }) }
+      throw retryError
+    }
+  }
+}
+channel?.addEventListener('message', (event: MessageEvent) => {
+  if (event.data?.type !== 'logout' && event.data?.type !== 'changed') return
+  revision++
+  clearSession()
+  if (event.data.type === 'changed') {
+    initialized = false
+    // Allow an old refresh flight to settle before restoring the new account.
+    void (refreshFlight ?? Promise.resolve()).catch(() => {}).then(() => useSession.getState().restore())
+  }
+})

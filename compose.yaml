@@ -1,0 +1,66 @@
+# Local multi-instance acceptance stack; external production TLS/HA services are separate.
+x-api: &api
+  build: ./backend
+  environment: &api-env
+    AEGIS_HTTP_ADDR: 0.0.0.0:8080
+    AEGIS_DATABASE_URL: postgres://aegis:${AEGIS_POSTGRES_PASSWORD:?Set AEGIS_POSTGRES_PASSWORD}@postgres:5432/aegisflow?sslmode=disable
+    AEGIS_REDIS_URL: redis://redis:6379/0
+    AEGIS_REDIS_NAMESPACE: aegisflow
+    AEGIS_JWT_SECRET: ${AEGIS_JWT_SECRET:?Set AEGIS_JWT_SECRET}
+    AEGIS_BOOTSTRAP_USERNAME: ${AEGIS_BOOTSTRAP_USERNAME:-}
+    AEGIS_BOOTSTRAP_PASSWORD: ${AEGIS_BOOTSTRAP_PASSWORD:-}
+    AEGIS_ALLOWED_ORIGINS: ${AEGIS_ALLOWED_ORIGINS:-http://localhost:5173}
+    AEGIS_COOKIE_SECURE: ${AEGIS_COOKIE_SECURE:-false}
+    AEGIS_TRUSTED_PROXIES: 172.30.88.10/32
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks: [aegis]
+  restart: unless-stopped
+  stop_grace_period: 15s
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: aegis
+      POSTGRES_PASSWORD: ${AEGIS_POSTGRES_PASSWORD:?Set AEGIS_POSTGRES_PASSWORD}
+      POSTGRES_DB: aegisflow
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U aegis -d aegisflow']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [aegis]
+  redis:
+    image: redis:7.4-alpine
+    command: [redis-server, --appendonly, 'yes']
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [aegis]
+  api1:
+    <<: *api
+  api2:
+    <<: *api
+  gateway:
+    image: nginx:1.28-alpine
+    ports: ['127.0.0.1:8080:8080']
+    volumes: ['./deploy/nginx.conf:/etc/nginx/nginx.conf:ro']
+    depends_on: [api1, api2]
+    networks:
+      aegis:
+        ipv4_address: 172.30.88.10
+networks:
+  aegis:
+    ipam:
+      config:
+        - subnet: 172.30.88.0/24
+volumes:
+  postgres-data:
+  redis-data:

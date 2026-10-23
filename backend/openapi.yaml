@@ -1,0 +1,428 @@
+openapi: 3.0.3
+info:
+  title: AegisFlow Browser Authentication API
+  version: 1.0.0
+  description: |
+    Multi-instance PostgreSQL backend with Redis shared rate limiting behind a same-origin reverse proxy (recommended).
+    All JSON responses use data/error plus requestId envelopes. All responses include
+    X-Request-ID and Cache-Control: no-store. POST bodies must be one JSON object,
+    Content-Type application/json, <=16 KiB, with no unknown properties. An empty
+    object {} is mandatory for refresh/logout; JSON refreshToken is never accepted
+    or returned. Optional fields must have their documented type when present.
+
+    Every /api/v1/auth POST, including login, requires exactly one Origin header
+    exactly matching AEGIS_ALLOWED_ORIGINS (scheme, host, port; no trailing slash).
+    Missing/disallowed Origin and Sec-Fetch-Site: cross-site return 403 before any
+    mutation. This applies to same-origin clients and non-browser scripts as well.
+    Origin null is not allowed. Any supplied Origin on other routes must also be
+    allowlisted. CORS reflects the allowed Origin, enables credentials, and varies
+    on Origin and Sec-Fetch-Site. OPTIONS returns 204 with GET, POST, OPTIONS and
+    Authorization, Content-Type allowed; its Vary also covers request method/headers.
+
+    Login/refresh set a host-only aegis_refresh cookie, Path=/api/v1/auth, HttpOnly,
+    SameSite=Strict. Secure is explicitly AEGIS_COOKIE_SECURE (default false locally;
+    set true for production HTTPS), not inferred from forwarding headers. remember
+    defaults false (session cookie, no Max-Age/Expires). true adds Max-Age and Expires
+    up to the absolute session deadline. Rotation preserves remember/deadline and
+    replaces the cookie, never extends the session. Default absolute lifetime 720h;
+    default access lifetime 15m (expiresIn is seconds, capped by session deadline).
+    A browser may restore session cookies after restart; closing it does not reliably
+    log out. Logout must be used for immediate revocation. Access tokens are Bearer
+    only, validated against PostgreSQL session state; cookies never authorize me/users.
+    Keep access tokens in memory, do not store refresh tokens in JavaScript storage.
+    Serialize refresh calls: replay of a consumed token revokes the whole session.
+servers:
+  - url: /
+    description: Same-origin proxy; use relative /api/v1 URLs in the browser
+security: []
+tags:
+  - name: Auth
+    description: Browser Cookie session lifecycle and Bearer identity
+  - name: Users
+    description: Administrator-only local user management
+  - name: Health
+    description: Process liveness and database readiness
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      operationId: health
+      summary: Process liveness (no database check)
+      responses:
+        '200':
+          description: Process is alive
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [status]
+                    properties:
+                      status: { type: string, enum: [ok] }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /readyz:
+    get:
+      tags: [Health]
+      operationId: readiness
+      summary: PostgreSQL and Redis readiness with a two-second timeout
+      responses:
+        '200':
+          description: Database is ready
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/RequestID' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [status]
+                    properties:
+                      status: { type: string, enum: [ready] }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503':
+          description: PostgreSQL or Redis unavailable; error.code is not_ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Authenticate credentials and set refresh cookie
+      description: Username lookup is case-insensitive. All attempts count toward the Redis shared IP limit (10/minute across instances). Only configured trusted proxy CIDRs may supply X-Forwarded-For. Redis failure returns 503 without local fallback. Invalid credentials return the same 401. No public registration.
+      parameters:
+        - { $ref: '#/components/parameters/AuthOrigin' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginInput' }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429':
+          description: Login rate limit exceeded; error.code is rate_limited
+          headers:
+            Retry-After:
+              description: Retry delay in seconds
+              schema: { type: string, pattern: '^[1-9][0-9]*$' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '503':
+          description: Shared limiter unavailable; error.code is dependencies_unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refresh
+      summary: Rotate refresh cookie and return a new access token
+      description: |
+        Requires the cookie, not a Bearer token. Unknown/expired/revoked/replayed or
+        missing cookie returns 401 and deletes the cookie. Replay also revokes the
+        entire session including outstanding access tokens. Malformed body/CSRF
+        failures do not rotate or revoke. No JSON refresh credential fallback.
+      security:
+        - refreshCookie: []
+      parameters:
+        - { $ref: '#/components/parameters/AuthOrigin' }
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Missing or invalid refresh session; deletes aegis_refresh cookie
+          headers:
+            Set-Cookie: { $ref: '#/components/headers/DeletedRefreshCookie' }
+            WWW-Authenticate: { $ref: '#/components/headers/BearerChallenge' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Revoke the current session and delete the refresh cookie
+      description: |
+        Idempotent. With a known refresh cookie (even a historical rotated value),
+        revokes the whole session immediately. Missing, unknown or already revoked
+        cookie still returns 200 and deletion Set-Cookie. A missing cookie cannot
+        identify/revoke another session. Storage failure returns 500 without deleting
+        the cookie, allowing retry. No Bearer required. JSON body must be {}.
+      parameters:
+        - { $ref: '#/components/parameters/AuthOrigin' }
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200':
+          description: Logged out, including an already absent session
+          headers:
+            Set-Cookie: { $ref: '#/components/headers/DeletedRefreshCookie' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [loggedOut]
+                    properties:
+                      loggedOut: { type: boolean, enum: [true] }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      operationId: currentUser
+      summary: Return the current database-backed user and role
+      security:
+        - bearerAuth: []
+      responses:
+        '200': { $ref: '#/components/responses/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/users:
+    get:
+      tags: [Users]
+      operationId: listUsers
+      summary: List users (admin only)
+      description: Ordered by username case-insensitively, then id; empty list is []. Password hashes are never included.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/User' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Users]
+      operationId: createUser
+      summary: Create a local user (admin only)
+      description: Only a Bearer token grants access; no cookie authorization. displayName defaults to username when omitted or empty. No self-service registration.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateUserInput' }
+      responses:
+        '201': { $ref: '#/components/responses/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Username already exists (case-insensitive); error.code is conflict
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: HS256 access token, checked against a live PostgreSQL session and current user role
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: aegis_refresh
+      description: HttpOnly host-only cookie set/rotated by login/refresh; JavaScript must never read or set it
+  parameters:
+    AuthOrigin:
+      name: Origin
+      in: header
+      required: true
+      description: Exactly one browser Origin, matching AEGIS_ALLOWED_ORIGINS exactly; required on all auth POSTs even same-origin and scripts
+      schema: { type: string, example: 'http://localhost:5173' }
+  requestBodies:
+    EmptyObject:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            maxProperties: 0
+          example: {}
+  headers:
+    RequestID:
+      description: Same value as the envelope requestId
+      schema: { $ref: '#/components/schemas/RequestID' }
+    BearerChallenge:
+      schema: { type: string, enum: [Bearer] }
+    RefreshCookie:
+      description: |
+        aegis_refresh=<opaque>; Path=/api/v1/auth; HttpOnly; SameSite=Strict;
+        Secure only when explicitly configured. remember=true adds Max-Age and
+        Expires bounded by the original absolute deadline. No Domain attribute.
+      schema: { type: string }
+    DeletedRefreshCookie:
+      description: Empty aegis_refresh cookie with matching Path/HttpOnly/SameSite/Secure, Max-Age=0 and an expired Expires
+      schema: { type: string }
+  schemas:
+    RequestID:
+      type: string
+      pattern: '^[a-f0-9]{32}$'
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, username, displayName, role]
+      properties:
+        id: { type: string }
+        username: { $ref: '#/components/schemas/Username' }
+        displayName:
+          type: string
+          description: Valid UTF-8, at most 256 bytes
+        role: { type: string, enum: [admin, member, viewer] }
+    Username:
+      type: string
+      minLength: 3
+      maxLength: 64
+      pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$'
+      description: ASCII only; uniqueness and login lookup are case-insensitive
+    Password:
+      type: string
+      format: password
+      writeOnly: true
+      description: 12-72 UTF-8 bytes (byte limits, not Unicode character limits); bcrypt hashed
+    LoginInput:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password, writeOnly: true }
+        remember: { type: boolean, default: false }
+    CreateUserInput:
+      type: object
+      additionalProperties: false
+      required: [username, password, role]
+      properties:
+        username: { $ref: '#/components/schemas/Username' }
+        password: { $ref: '#/components/schemas/Password' }
+        displayName:
+          type: string
+          description: Optional, defaults to username if empty; valid UTF-8, at most 256 bytes
+        role: { type: string, enum: [admin, member, viewer] }
+    TokenData:
+      type: object
+      additionalProperties: false
+      required: [user, accessToken, expiresIn]
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        accessToken: { type: string, description: Short-lived Bearer JWT; keep in memory }
+        expiresIn: { type: integer, format: int64, minimum: 1, description: 'Access lifetime in seconds, capped by the absolute session deadline' }
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error, requestId]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [invalid_request, validation_failed, unauthorized, forbidden, origin_denied, conflict, unsupported_media_type, rate_limited, not_found, not_ready, dependencies_unavailable, internal_error]
+            message: { type: string, description: Human-readable safe detail; clients should branch on code/status }
+        requestId: { $ref: '#/components/schemas/RequestID' }
+  responses:
+    Tokens:
+      description: Access token and public user only; refresh secret is Set-Cookie only
+      headers:
+        Set-Cookie: { $ref: '#/components/headers/RefreshCookie' }
+        X-Request-ID: { $ref: '#/components/headers/RequestID' }
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [data, requestId]
+            properties:
+              data: { $ref: '#/components/schemas/TokenData' }
+              requestId: { $ref: '#/components/schemas/RequestID' }
+    User:
+      description: Public user
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [data, requestId]
+            properties:
+              data: { $ref: '#/components/schemas/User' }
+              requestId: { $ref: '#/components/schemas/RequestID' }
+    BadRequest:
+      description: Invalid JSON, unknown field, non-object or >16 KiB (invalid_request), or invalid user fields (validation_failed)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Unauthorized:
+      description: Invalid credentials or missing/invalid/expired/revoked Bearer/session; error.code is unauthorized
+      headers:
+        WWW-Authenticate: { $ref: '#/components/headers/BearerChallenge' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Forbidden:
+      description: Missing/disallowed auth Origin or cross-site request (origin_denied), or non-admin user (forbidden)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    UnsupportedMediaType:
+      description: Missing/wrong Content-Type (application/json required); error.code is unsupported_media_type
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    InternalError:
+      description: Internal error; error.code is internal_error, no sensitive implementation details
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }

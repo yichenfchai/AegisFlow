@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -10,12 +11,13 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 )
 
 type contextKey int
@@ -24,22 +26,41 @@ const requestIDKey contextKey = 0
 const userKey = "authenticatedUser"
 
 type Server struct {
-	auth    *auth.Service
-	logger  *slog.Logger
-	ready   func(context.Context) error
-	origins map[string]bool
-	limiter *loginLimiter
+	auth         *auth.Service
+	logger       *slog.Logger
+	ready        func(context.Context) error
+	origins      map[string]bool
+	limiter      ratelimit.Limiter
+	cookieSecure bool
+}
+
+const refreshCookieName = "aegis_refresh"
+const refreshCookiePath = "/api/v1/auth"
+
+// Options is explicit deployment configuration; Secure is never inferred from headers.
+type Options struct {
+	CookieSecure   bool
+	Limiter        ratelimit.Limiter
+	TrustedProxies []string
 }
 
 // New builds an isolated Gin engine; business services depend only on context.Context.
-func New(service *auth.Service, logger *slog.Logger, ready func(context.Context) error, origins []string) *gin.Engine {
-	s := &Server{auth: service, logger: logger, ready: ready, origins: map[string]bool{}, limiter: &loginLimiter{entries: map[string]attempt{}}}
+func New(service *auth.Service, logger *slog.Logger, ready func(context.Context) error, origins []string, options ...Options) *gin.Engine {
+	var opts Options
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	s := &Server{auth: service, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure}
 	for _, o := range origins {
 		s.origins[o] = true
 	}
 	router := gin.New()
-	// Explicitly disable proxy trust. ClientIP must not trust arbitrary forwarding headers.
-	_ = router.SetTrustedProxies(nil)
+	// The entrypoint validates deployment CIDRs. Invalid input here fails safe:
+	// never retain Gin's default trust-all proxies after a configuration error.
+	router.RemoteIPHeaders = []string{"X-Forwarded-For"}
+	if err := router.SetTrustedProxies(opts.TrustedProxies); err != nil {
+		_ = router.SetTrustedProxies(nil)
+	}
 	router.RedirectTrailingSlash = false
 	router.RedirectFixedPath = false
 	router.Use(s.middleware())
@@ -48,7 +69,7 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 		defer cancel()
 		if err := s.ready(ctx); err != nil {
-			s.fail(c, 503, "not_ready", "database unavailable")
+			s.fail(c, 503, "not_ready", "dependencies unavailable")
 			return
 		}
 		s.respond(c, 200, gin.H{"status": "ready"})
@@ -66,53 +87,100 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	return router
 }
 func (s *Server) login(c *gin.Context) {
-	if !s.limiter.allow(c.ClientIP(), time.Now()) {
-		c.Header("Retry-After", "60")
+	// No in-process fallback: all instances must share the same quota.
+	if s.limiter == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	allowed, retryAfter, err := s.limiter.Allow(c.Request.Context(), c.ClientIP())
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "login limiter unavailable", "requestId", c.Request.Context().Value(requestIDKey), "error", err)
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	if !allowed {
+		seconds := int64(retryAfter / time.Second)
+		if retryAfter%time.Second > 0 {
+			seconds++
+		}
+		if seconds < 1 {
+			seconds = 1
+		}
+		c.Header("Retry-After", strconv.FormatInt(seconds, 10))
 		s.fail(c, 429, "rate_limited", "too many login attempts")
 		return
 	}
 	var input struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		Remember bool   `json:"remember"`
 	}
 	if !s.decode(c, &input) {
 		return
 	}
 	ctx := c.Request.Context()
-	tokens, err := s.auth.Login(ctx, input.Username, input.Password)
+	tokens, err := s.auth.LoginWithRemember(ctx, input.Username, input.Password, input.Remember)
 	s.logger.InfoContext(ctx, "auth.login", "requestId", ctx.Value(requestIDKey), "success", err == nil)
 	if err != nil {
 		s.authError(c, err)
 		return
 	}
+	s.setRefreshCookie(c, tokens)
 	s.respond(c, 200, tokens)
 }
 func (s *Server) refresh(c *gin.Context) {
-	var input struct {
-		RefreshToken string `json:"refreshToken"`
-	}
-	if !s.decode(c, &input) {
+	if !s.decode(c, &struct{}{}) {
 		return
 	}
-	tokens, err := s.auth.Refresh(c.Request.Context(), input.RefreshToken)
+	cookie, err := c.Request.Cookie(refreshCookieName)
+	if err != nil || cookie.Value == "" {
+		s.clearRefreshCookie(c)
+		s.authError(c, auth.ErrUnauthorized)
+		return
+	}
+	tokens, err := s.auth.Refresh(c.Request.Context(), cookie.Value)
 	if err != nil {
+		if errors.Is(err, auth.ErrUnauthorized) {
+			s.clearRefreshCookie(c)
+		}
 		s.authError(c, err)
 		return
 	}
+	s.setRefreshCookie(c, tokens)
 	s.respond(c, 200, tokens)
 }
 func (s *Server) logout(c *gin.Context) {
-	var input struct {
-		RefreshToken string `json:"refreshToken"`
-	}
-	if !s.decode(c, &input) {
+	if !s.decode(c, &struct{}{}) {
 		return
 	}
-	if err := s.auth.Logout(c.Request.Context(), input.RefreshToken); err != nil {
-		s.authError(c, err)
-		return
+	// Keep the credential on storage failure so a retry can still revoke the session.
+	cookie, err := c.Request.Cookie(refreshCookieName)
+	if err == nil {
+		if err = s.auth.Logout(c.Request.Context(), cookie.Value); err != nil {
+			s.authError(c, err)
+			return
+		}
 	}
+	s.clearRefreshCookie(c)
 	s.respond(c, 200, gin.H{"loggedOut": true})
+}
+func (s *Server) setRefreshCookie(c *gin.Context, tokens *auth.Tokens) {
+	cookie := &http.Cookie{Name: refreshCookieName, Value: tokens.RefreshToken, Path: refreshCookiePath,
+		HttpOnly: true, Secure: s.cookieSecure, SameSite: http.SameSiteStrictMode}
+	if tokens.Remember {
+		// expires_at is stored once at login; rotation must not create a sliding window.
+		cookie.MaxAge = int(tokens.SessionExpiresAt - time.Now().Unix())
+		if cookie.MaxAge <= 0 {
+			cookie.MaxAge = -1
+		}
+		cookie.Expires = time.Unix(tokens.SessionExpiresAt, 0).UTC()
+	}
+	http.SetCookie(c.Writer, cookie)
+}
+func (s *Server) clearRefreshCookie(c *gin.Context) {
+	http.SetCookie(c.Writer, &http.Cookie{Name: refreshCookieName, Value: "", Path: refreshCookiePath,
+		HttpOnly: true, Secure: s.cookieSecure, SameSite: http.SameSiteStrictMode,
+		MaxAge: -1, Expires: time.Unix(1, 0).UTC()})
 }
 func (s *Server) authenticate() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -178,7 +246,29 @@ func (s *Server) decode(c *gin.Context, v any) bool {
 		return false
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
+	// Decode via RawMessage first so null/arrays/scalars cannot masquerade as objects.
+	var raw json.RawMessage
 	d := json.NewDecoder(c.Request.Body)
+	if err := d.Decode(&raw); err != nil || len(bytes.TrimSpace(raw)) == 0 || bytes.TrimSpace(raw)[0] != '{' {
+		s.fail(c, 400, "invalid_request", "body must contain one JSON object of at most 16 KiB")
+		return false
+	}
+	if err := d.Decode(new(any)); err != io.EOF {
+		s.fail(c, 400, "invalid_request", "body must contain one JSON object")
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		s.fail(c, 400, "invalid_request", "invalid JSON object")
+		return false
+	}
+	for _, value := range fields {
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			s.fail(c, 400, "invalid_request", "fields must not be null")
+			return false
+		}
+	}
+	d = json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
 	if err := d.Decode(v); err != nil {
 		s.fail(c, 400, "invalid_request", "invalid JSON body or body exceeds 16 KiB")
@@ -236,17 +326,30 @@ func (s *Server) middleware() gin.HandlerFunc {
 			}
 			s.logger.Info("http request", "requestId", id, "method", c.Request.Method, "path", c.Request.URL.Path, "status", c.Writer.Status(), "durationMs", time.Since(start).Milliseconds())
 		}()
+		// Vary also on denied/missing origins so intermediaries cannot reuse CORS decisions.
+		c.Writer.Header().Add("Vary", "Origin")
+		c.Writer.Header().Add("Vary", "Sec-Fetch-Site")
+		if strings.EqualFold(strings.TrimSpace(c.GetHeader("Sec-Fetch-Site")), "cross-site") {
+			s.fail(c, 403, "origin_denied", "cross-site requests are not allowed")
+			return
+		}
 		origin := c.GetHeader("Origin")
+		if c.Request.Method == http.MethodPost && (c.Request.URL.Path == refreshCookiePath || strings.HasPrefix(c.Request.URL.Path, refreshCookiePath+"/")) && (origin == "" || len(c.Request.Header.Values("Origin")) != 1 || !s.origins[origin]) {
+			s.fail(c, 403, "origin_denied", "an allowed Origin is required")
+			return
+		}
 		if origin != "" {
-			c.Writer.Header().Add("Vary", "Origin")
 			if !s.origins[origin] {
 				s.fail(c, 403, "origin_denied", "origin not allowed")
 				return
 			}
 			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Access-Control-Allow-Credentials", "true")
 			c.Header("Access-Control-Expose-Headers", "X-Request-ID")
 		}
 		if c.Request.Method == http.MethodOptions {
+			c.Writer.Header().Add("Vary", "Access-Control-Request-Method")
+			c.Writer.Header().Add("Vary", "Access-Control-Request-Headers")
 			c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
 			c.AbortWithStatus(204)
@@ -254,37 +357,4 @@ func (s *Server) middleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
-}
-
-type attempt struct {
-	count int
-	start time.Time
-}
-type loginLimiter struct {
-	mu      sync.Mutex
-	entries map[string]attempt
-}
-
-// The limiter uses the direct peer address. Untrusted forwarding headers are ignored.
-func (l *loginLimiter) allow(ip string, now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for k, v := range l.entries {
-		if now.Sub(v.start) >= time.Minute {
-			delete(l.entries, k)
-		}
-	}
-	v := l.entries[ip]
-	if v.start.IsZero() {
-		if len(l.entries) >= 10000 {
-			return false
-		}
-		v.start = now
-	}
-	if v.count >= 10 {
-		return false
-	}
-	v.count++
-	l.entries[ip] = v
-	return true
 }

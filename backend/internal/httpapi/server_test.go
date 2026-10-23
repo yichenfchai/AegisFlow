@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,29 +14,25 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
-	_ "modernc.org/sqlite"
+	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
 func testServer(t *testing.T) (http.Handler, *auth.Service) {
 	t.Helper()
-	db, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() { db.Close() })
+	db := testutil.OpenPostgres(t)
 	s := auth.New(db, strings.Repeat("k", 32), time.Minute, time.Hour)
-	if err = s.Migrate(context.Background()); err != nil {
+	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.Bootstrap(context.Background(), "admin", "a-strong-password"); err != nil {
+	if err := s.Bootstrap(context.Background(), "admin", "a-strong-password"); err != nil {
 		t.Fatal(err)
 	}
-	return New(s, slog.New(slog.NewJSONHandler(io.Discard, nil)), db.PingContext, []string{"http://localhost:5173"}), s
+	return New(s, slog.New(slog.NewJSONHandler(io.Discard, nil)), db.PingContext, []string{"http://localhost:5173"}, Options{Limiter: newTestLimiter()}), s
 }
 func request(h http.Handler, method, path, body, token string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Origin", "http://localhost:5173")
 	if token != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -61,6 +56,7 @@ func TestAuthenticationAndRBAC(t *testing.T) {
 		t.Fatal(err)
 	}
 	admin := result.Data.AccessToken
+	loginCookie := w.Result().Cookies()[0]
 	if admin == "" {
 		t.Fatal("missing token")
 	}
@@ -83,7 +79,7 @@ func TestAuthenticationAndRBAC(t *testing.T) {
 	if w = request(h, "GET", "/api/v1/users", "", admin); w.Code != 200 || strings.Contains(w.Body.String(), "password") {
 		t.Fatal(w.Code, w.Body.String())
 	}
-	if w = request(h, "POST", "/api/v1/auth/logout", fmt.Sprintf(`{"refreshToken":%q}`, result.Data.RefreshToken), ""); w.Code != 200 {
+	if w = cookieRequest(h, "POST", "/api/v1/auth/logout", `{}`, loginCookie); w.Code != 200 {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	if w = request(h, "GET", "/api/v1/auth/me", "", admin); w.Code != 401 {
@@ -98,6 +94,7 @@ func TestHTTPGuards(t *testing.T) {
 		}
 	}
 	r := httptest.NewRequest("POST", "/api/v1/auth/login", strings.NewReader(`{}`))
+	r.Header.Set("Origin", "http://localhost:5173")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	if w.Code != 415 {
@@ -171,6 +168,7 @@ func TestForwardedHeadersCannotBypassLoginLimit(t *testing.T) {
 	for i := 0; i < 11; i++ {
 		r := httptest.NewRequest("POST", "/api/v1/auth/login", strings.NewReader(`{}`))
 		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Origin", "http://localhost:5173")
 		r.Header.Set("X-Forwarded-For", fmt.Sprintf("198.51.100.%d", i+1))
 		r.Header.Set("X-Real-IP", fmt.Sprintf("203.0.113.%d", i+1))
 		w := httptest.NewRecorder()
@@ -178,21 +176,5 @@ func TestForwardedHeadersCannotBypassLoginLimit(t *testing.T) {
 		if i == 10 && w.Code != 429 {
 			t.Fatalf("forwarded headers bypassed limit: %d", w.Code)
 		}
-	}
-}
-
-func TestLimiterWindow(t *testing.T) {
-	l := &loginLimiter{entries: map[string]attempt{}}
-	now := time.Now()
-	for i := 0; i < 10; i++ {
-		if !l.allow("peer", now) {
-			t.Fatal("early limit")
-		}
-	}
-	if l.allow("peer", now) {
-		t.Fatal("missing limit")
-	}
-	if !l.allow("peer", now.Add(time.Minute)) {
-		t.Fatal("window not reset")
 	}
 }

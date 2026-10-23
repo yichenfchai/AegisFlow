@@ -5,36 +5,21 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	_ "modernc.org/sqlite"
+	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
 const testPassword = "correct-horse-battery"
 const testSecret = "integration-test-secret-at-least-32-bytes"
 
-func openTestDB(t *testing.T, path string) *sql.DB {
-	t.Helper()
-	db, err := sql.Open("sqlite", filepath.ToSlash(path)+"?_pragma=busy_timeout(10000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.SetMaxOpenConns(8)
-	t.Cleanup(func() { _ = db.Close() })
-	if err = db.Ping(); err != nil {
-		t.Fatal(err)
-	}
-	return db
-}
-
 func testService(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()
-	db := openTestDB(t, filepath.Join(t.TempDir(), "auth.db"))
+	db := testutil.OpenPostgres(t)
 	s := New(db, testSecret, 15*time.Minute, 24*time.Hour)
 	if err := s.Migrate(context.Background()); err != nil {
 		t.Fatal(err)
@@ -69,6 +54,9 @@ func TestLoginAndPasswordFailures(t *testing.T) {
 			t.Fatalf("Login(%q) error = %v", pair[0], err)
 		}
 	}
+	if _, err := s.Login(ctx, "ADMIN", testPassword); err != nil {
+		t.Fatalf("ASCII case-insensitive login failed: %v", err)
+	}
 	tokens := loginTest(t, s)
 	if tokens.ExpiresIn <= 0 || tokens.ExpiresIn > 900 || tokens.User.Role != "admin" || tokens.RefreshToken == "" {
 		t.Fatalf("invalid tokens: %+v", tokens)
@@ -94,7 +82,7 @@ func TestLoginAndPasswordFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "password") || !strings.Contains(string(data), `"displayName"`) || !strings.Contains(string(data), `"expiresIn"`) {
+	if strings.Contains(string(data), "password") || strings.Contains(string(data), "refreshToken") || strings.Contains(string(data), tokens.RefreshToken) || !strings.Contains(string(data), `"displayName"`) || !strings.Contains(string(data), `"expiresIn"`) {
 		t.Fatalf("invalid JSON shape: %s", data)
 	}
 }
@@ -177,22 +165,23 @@ func TestRefreshRotationReplayRevokesSession(t *testing.T) {
 }
 
 func TestConcurrentRefreshSingleConsumer(t *testing.T) {
-	s, _ := testService(t)
+	s, db := testService(t)
+	s2 := New(testutil.ClonePostgres(t, db), testSecret, time.Minute, time.Hour)
 	ctx := context.Background()
 	first := loginTest(t, s)
 	start := make(chan struct{})
 	results := make(chan *Tokens, 2)
 	errs := make(chan error, 2)
 	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
+	for _, s := range []*Service{s, s2} {
 		wg.Add(1)
-		go func() {
+		go func(s *Service) {
 			defer wg.Done()
 			<-start
 			tokens, err := s.Refresh(ctx, first.RefreshToken)
 			results <- tokens
 			errs <- err
-		}()
+		}(s)
 	}
 	close(start)
 	wg.Wait()
@@ -248,8 +237,7 @@ func TestLogout(t *testing.T) {
 
 func TestPersistence(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "persist.db")
-	db := openTestDB(t, path)
+	db := testutil.OpenPostgres(t)
 	s := New(db, testSecret, time.Minute, time.Hour)
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatal(err)
@@ -258,10 +246,10 @@ func TestPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := loginTest(t, s)
+	db2 := testutil.ClonePostgres(t, db)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db2 := openTestDB(t, path)
 	s2 := New(db2, testSecret, time.Minute, time.Hour)
 	if err := s2.Migrate(ctx); err != nil {
 		t.Fatal(err)
@@ -316,7 +304,7 @@ func TestUsersValidationAndCurrentRole(t *testing.T) {
 		t.Fatalf("72 byte password rejected: %v", err)
 	}
 	tokens := loginTest(t, s)
-	if _, err := db.Exec(`UPDATE auth_users SET role='viewer' WHERE id=?`, tokens.User.ID); err != nil {
+	if _, err := db.Exec(`UPDATE auth_users SET role='viewer' WHERE id=$1`, tokens.User.ID); err != nil {
 		t.Fatal(err)
 	}
 	user, err := s.Authenticate(ctx, tokens.AccessToken)
@@ -335,16 +323,17 @@ func TestUsersValidationAndCurrentRole(t *testing.T) {
 
 func TestBootstrapIsIdempotentAndConcurrent(t *testing.T) {
 	ctx := context.Background()
-	db := openTestDB(t, filepath.Join(t.TempDir(), "bootstrap.db"))
+	db := testutil.OpenPostgres(t)
 	s := New(db, testSecret, time.Minute, time.Hour)
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	s2 := New(testutil.ClonePostgres(t, db), testSecret, time.Minute, time.Hour)
 	errs := make(chan error, 2)
 	var wg sync.WaitGroup
-	for _, name := range []string{"first-admin", "second-admin"} {
+	for i, name := range []string{"first-admin", "second-admin"} {
 		wg.Add(1)
-		go func(name string) { defer wg.Done(); errs <- s.Bootstrap(ctx, name, testPassword) }(name)
+		go func(s *Service, name string) { defer wg.Done(); errs <- s.Bootstrap(ctx, name, testPassword) }([]*Service{s, s2}[i], name)
 	}
 	wg.Wait()
 	close(errs)
@@ -373,7 +362,7 @@ func TestSessionExpiryAndInvalidConfig(t *testing.T) {
 	s, db := testService(t)
 	ctx := context.Background()
 	tokens := loginTest(t, s)
-	if _, err := db.Exec(`UPDATE auth_sessions SET expires_at=?`, time.Now().Add(-time.Second).Unix()); err != nil {
+	if _, err := db.Exec(`UPDATE auth_sessions SET expires_at=$1`, time.Now().Add(-time.Second).Unix()); err != nil {
 		t.Fatal(err)
 	}
 	assertUnauthorized(t, s, tokens.AccessToken)

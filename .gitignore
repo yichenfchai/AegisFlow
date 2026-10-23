@@ -29,3 +29,7 @@ backend/.env
 backend/server
 backend/server.exe
 backend/coverage.out
+
+# Browser test artifacts
+playwright-report/
+test-results/

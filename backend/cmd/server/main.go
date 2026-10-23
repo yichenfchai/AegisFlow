@@ -8,14 +8,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/redis/go-redis/v9"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/config"
 	"github.com/yichenfchai/AegisFlow/backend/internal/httpapi"
-	_ "modernc.org/sqlite"
+	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 )
 
 func main() {
@@ -30,26 +31,38 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if err = os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0700); err != nil {
-		return err
-	}
-	db, err := sql.Open("sqlite", cfg.DatabasePath)
+	db, err := sql.Open("pgx", cfg.DatabaseURL)
 	if err != nil {
-		return err
+		return errors.New("invalid PostgreSQL connection configuration")
 	}
 	defer db.Close()
-	// One connection serializes SQLite writers and keeps PRAGMAs applied consistently.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	db.SetMaxOpenConns(cfg.DBMaxOpen)
+	db.SetMaxIdleConns(cfg.DBMaxIdle)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	redisOptions, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		return errors.New("invalid Redis configuration")
+	}
+	redisOptions.DialTimeout = 3 * time.Second
+	redisOptions.ReadTimeout = 2 * time.Second
+	redisOptions.WriteTimeout = 2 * time.Second
+	redisOptions.MaxRetries = 0
+	cache := redis.NewClient(redisOptions)
+	defer cache.Close()
+	ready := func(ctx context.Context) error {
+		if err := db.PingContext(ctx); err != nil {
+			return errors.New("PostgreSQL unavailable")
+		}
+		if err := cache.Ping(ctx).Err(); err != nil {
+			return errors.New("Redis unavailable")
+		}
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err = db.PingContext(ctx); err != nil {
+	if err = ready(ctx); err != nil {
 		return err
-	}
-	for _, statement := range []string{"PRAGMA foreign_keys = ON", "PRAGMA journal_mode = WAL", "PRAGMA busy_timeout = 5000"} {
-		if _, err = db.ExecContext(ctx, statement); err != nil {
-			return err
-		}
 	}
 	service := auth.New(db, cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
 	if err = service.Migrate(ctx); err != nil {
@@ -60,7 +73,8 @@ func run(logger *slog.Logger) error {
 			return err
 		}
 	}
-	server := &http.Server{Addr: cfg.Address, Handler: httpapi.New(service, logger, db.PingContext, cfg.AllowedOrigins), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.New(cache, cfg.RedisNamespace), TrustedProxies: cfg.TrustedProxies})
+	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	result := make(chan error, 1)

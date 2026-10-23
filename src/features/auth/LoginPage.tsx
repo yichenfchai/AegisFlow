@@ -1,12 +1,18 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router'
+import { useLocation, useNavigate } from 'react-router'
 import { Icon } from '@/components/ui/Icon'
 import { Button } from '@/components/ui/DataTable'
-import { useSession, mockJwtFor } from '@/stores/session'
+import { errorMessage, useSession } from '@/stores/session'
+import { SessionGate } from './SessionGate'
+import { safeReturnTo } from './returnTo'
 
-/** 登录页（gopulse 稿）：本地账号 + LDAP 入口 · JWT 会话 */
 export function LoginPage() {
+  return <SessionGate publicOnly><LoginForm /></SessionGate>
+}
+
+function LoginForm() {
   const nav = useNavigate()
+  const location = useLocation()
   const login = useSession((s) => s.login)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -17,6 +23,7 @@ export function LoginPage() {
 
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault()
+    if (loading) return
     setError('')
     if (!username.trim()) {
       setError('用户名不能为空')
@@ -27,24 +34,14 @@ export function LoginPage() {
       return
     }
     setLoading(true)
-    // mock 鉴权：任何非空账号通过；真实后端就绪后替换为 POST /api/v1/auth/login
-    await new Promise((r) => setTimeout(r, 500))
-    if (password.toLowerCase() === 'ldap') {
-      setError('LDAP 登录当前未配置，请使用本地账号')
+    try {
+      await login(username.trim(), password, remember)
+      nav(safeReturnTo(new URLSearchParams(location.search).get('returnTo')), { replace: true })
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
       setLoading(false)
-      return
     }
-    login(
-      {
-        id: 'u-alex',
-        username,
-        displayName: username === 'alex' ? 'Alex Mercer' : username,
-        role: 'admin',
-      },
-      mockJwtFor(username),
-    )
-    setLoading(false)
-    nav('/', { replace: true })
   }
 
   return (
@@ -73,26 +70,34 @@ export function LoginPage() {
         </div>
 
         {/* 登录卡片 */}
-        <form onSubmit={submit} className="bg-surface-container rounded-lg border border-surface-container-highest p-space-xl space-y-space-lg">
+        <form onSubmit={submit} aria-busy={loading} className="bg-surface-container rounded-lg border border-surface-container-highest p-space-xl space-y-space-lg">
           <div>
-            <label className="block text-label-md text-on-surface-variant mb-space-sm">用户名</label>
+            <label htmlFor="login-username" className="block text-label-md text-on-surface-variant mb-space-sm">用户名</label>
             <div className="relative">
               <Icon name="person" size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-outline" />
               <input
+                id="login-username"
+                name="username"
+                autoComplete="username"
+                disabled={loading}
                 autoFocus
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="用户名或 LDAP 账号"
+                placeholder="用户名"
                 className="w-full bg-surface-container-lowest border border-surface-container-highest rounded pl-9 pr-3 py-space-md text-body-md text-on-surface placeholder:text-text-3 focus:outline-none focus:border-primary/60 transition-colors"
               />
             </div>
           </div>
 
           <div>
-            <label className="block text-label-md text-on-surface-variant mb-space-sm">密码</label>
+            <label htmlFor="login-password" className="block text-label-md text-on-surface-variant mb-space-sm">密码</label>
             <div className="relative">
               <Icon name="lock" size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-outline" />
               <input
+                id="login-password"
+                name="password"
+                autoComplete="current-password"
+                disabled={loading}
                 type={showPwd ? 'text' : 'password'}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
@@ -103,7 +108,8 @@ export function LoginPage() {
                 type="button"
                 onClick={() => setShowPwd((v) => !v)}
                 className="absolute right-3 top-1/2 -translate-y-1/2 text-outline hover:text-on-surface"
-                aria-label="Toggle password visibility"
+                aria-label={showPwd ? '隐藏密码' : '显示密码'}
+                disabled={loading}
               >
                 <Icon name={showPwd ? 'visibility_off' : 'visibility'} size={16} />
               </button>
@@ -111,25 +117,26 @@ export function LoginPage() {
           </div>
 
           {error && (
-            <div className="flex items-center gap-space-sm text-body-sm text-error bg-error/10 rounded px-space-lg py-space-md">
+            <div role="alert" className="flex items-center gap-space-sm text-body-sm text-error bg-error/10 rounded px-space-lg py-space-md">
               <Icon name="error" size={14} />
               {error}
             </div>
           )}
 
-          <div className="flex items-center justify-between text-body-sm">
+          <div className="space-y-space-sm text-body-sm">
             <label className="flex items-center gap-space-sm text-on-surface-variant cursor-pointer select-none">
               <input
                 type="checkbox"
+                name="remember"
+                disabled={loading}
                 checked={remember}
                 onChange={(e) => setRemember(e.target.checked)}
                 className="accent-primary"
               />
-              记住此会话 (30 天)
+              保持登录（最长30天，受服务端配置限制）
             </label>
-            <button type="button" className="text-primary hover:underline" onClick={() => alert('请联系管理员重置（演示）')}>
-              忘记密码?
-            </button>
+            <p className="text-label-sm text-outline">不勾选时使用会话 Cookie；浏览器恢复会话时可能保留 Cookie，关闭浏览器不保证注销，请主动退出登录。</p>
+            <p className="text-label-sm text-outline">忘记密码请联系管理员。</p>
           </div>
 
           <Button type="submit" className="w-full justify-center" disabled={loading}>
@@ -146,13 +153,10 @@ export function LoginPage() {
             type="button"
             variant="secondary"
             className="w-full justify-center"
-            onClick={() => {
-              setPassword('ldap')
-              setError('提示：输入密码为 "ldap" 可体验 LDAP 分支的失败提示（当前未配置）')
-            }}
+            disabled
           >
             <Icon name="domain" size={16} />
-            使用 LDAP 登录
+            LDAP 暂未配置
           </Button>
         </form>
 
