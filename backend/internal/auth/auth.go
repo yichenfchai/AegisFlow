@@ -91,59 +91,6 @@ func (s *Service) valid() error {
 	return nil
 }
 
-// Migrate applies versioned PostgreSQL migrations under a transaction-scoped lock.
-// Refresh history is retained so replay can revoke a session.
-func (s *Service) Migrate(ctx context.Context) error {
-	if err := s.valid(); err != nil {
-		return err
-	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err = advisoryLock(ctx, tx, "migrate"); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
- version BIGINT PRIMARY KEY, applied_at BIGINT NOT NULL)`); err != nil {
-		return fmt.Errorf("create migration ledger: %w", err)
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT version FROM schema_migrations ORDER BY version`)
-	if err != nil {
-		return err
-	}
-	var version int64
-	for rows.Next() {
-		var found int64
-		if err = rows.Scan(&found); err != nil {
-			rows.Close()
-			return err
-		}
-		if found != version+1 || found > int64(len(authMigrations)) {
-			rows.Close()
-			return fmt.Errorf("unsupported auth schema migration version %d", found)
-		}
-		version = found
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return err
-	}
-	for i := int(version); i < len(authMigrations); i++ {
-		for _, stmt := range authMigrations[i] {
-			if _, err = tx.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("migrate auth version %d: %w", i+1, err)
-			}
-		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES($1,$2)`, i+1, time.Now().Unix()); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
 func validateUser(username, password, displayName, role string) error {
 	if !usernamePattern.MatchString(username) {
 		return fmt.Errorf("%w: username must be 3-64 ASCII letters, digits, dots, underscores or hyphens and begin with a letter or digit", ErrValidation)

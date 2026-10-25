@@ -2,9 +2,9 @@
 
 轻量交付治理平台。前端使用 React + TypeScript + Vite，Go 后端公共设施与本地账号鉴权已加入 `backend/`。
 
-后端启动、环境变量、接口及验证命令见 [Go 后端文档](backend/README.md)。前端登录已接入真实鉴权：access token 仅存内存，refresh token 使用 HttpOnly Cookie，支持恢复、自动刷新及退出撤销。账号管理已提供真实接口与页面：自助修改密码、活跃会话查看与撤销（/account），以及管理员的用户/角色/禁用/重置密码与审计查询（/settings）。
+后端启动、环境变量、接口及验证命令见 [Go 后端文档](backend/README.md)。前端登录已接入真实鉴权：access token 仅存内存，refresh token 使用 HttpOnly Cookie，支持恢复、自动刷新及退出撤销。账号管理提供真实接口与页面（自助修改密码、会话管理、管理员用户/角色/禁用与审计查询）；项目管理（P2）已接入真实接口：首页为项目列表，支持创建、修改、归档与恢复，按全局角色授权。
 
-面向多人、多实例部署，采用 PostgreSQL 共享存储、Redis 共享限流与同源负载均衡；双实例联调样例见 [部署说明](deploy/README.md) 和 [Compose](compose.yaml)。角色矩阵与会话安全约定见 [鉴权契约](docs/auth-contract.md)，机器可读接口见 [OpenAPI](backend/openapi.yaml)。业务接口尚未实现；项目/构建主线的演示 UI 仅在显式启用时开放，其余业务页面明确标记未实现，真实鉴权没有 mock 回退。
+面向多人、多实例部署，采用 PostgreSQL 共享存储、Redis 共享限流与同源负载均衡；双实例联调样例见 [部署说明](deploy/README.md) 和 [Compose](compose.yaml)。角色矩阵与会话安全约定见 [鉴权契约](docs/auth-contract.md)，机器可读接口见 [OpenAPI](backend/openapi.yaml)。构建等其余业务接口尚未实现：构建链路演示仅在显式启用时开放，其余页面明确标记未实现，真实鉴权没有 mock 回退。
 
 ## 本地联调
 

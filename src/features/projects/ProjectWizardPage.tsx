@@ -1,240 +1,97 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
-import { PageHeader, Button, Field, Input, Select } from '@/components/ui/DataTable'
-import { Icon } from '@/components/ui/Icon'
-import { Stepper } from '@/components/ui/DataTable'
+import { useQueryClient } from '@tanstack/react-query'
+import { Button, Field, Input, PageHeader, Select } from '@/components/ui/DataTable'
+import { projectsAPI } from '@/api/projects'
+import { ApiError } from '@/api/http'
 
-/** 项目接入向导（_12 稿）：仓库来源与触发 → 构建配置 → 部署目标 */
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).length
+}
+
+function opError(cause: unknown): string {
+  if (cause instanceof ApiError) {
+    if (cause.status === 409) return '同名项目已存在（不区分大小写）'
+    if (cause.status === 400) return '字段不合法：名称 3-64 字节且不含路径字符；仓库地址须为 https/git@ URL 或绝对路径；分支为普通 git 引用名'
+    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
+  }
+  return cause instanceof Error ? cause.message : '创建失败，请稍后重试'
+}
+
+/** 创建项目（真实接口）：P2 落地后替代原三步演示向导。 */
 export function ProjectWizardPage() {
   const nav = useNavigate()
-  const [step, setStep] = useState(1)
+  const queryClient = useQueryClient()
   const [name, setName] = useState('')
-  const [repo, setRepo] = useState('~/workspace/web-api')
-  const [branch, setBranch] = useState('main')
-  const [trigger, setTrigger] = useState<'webhook' | 'cron' | 'manual'>('webhook')
-  const [targets, setTargets] = useState<string[]>(['dt-1'])
-  const [secretsLinked, setSecretsLinked] = useState<string[]>(['sk-1', 'sk-2'])
-  const [buildCmd, setBuildCmd] = useState('pnpm build')
-  const [keepTags, setKeepTags] = useState(5)
+  const [description, setDescription] = useState('')
+  const [repoUrl, setRepoUrl] = useState('')
+  const [defaultBranch, setDefaultBranch] = useState('main')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
 
-  const webhookVerified = name.length > 0 && repo.length > 0
-
-  const canNext = step === 1 ? name.trim().length > 0 && repo.trim().length > 0 : step === 2 ? buildCmd.trim().length > 0 : targets.length > 0
+  const submit = async (e?: React.FormEvent) => {
+    e?.preventDefault()
+    if (busy) return
+    setError('')
+    if (byteLength(name.trim()) < 3 || byteLength(name) > 64) {
+      setError('项目名称需为 3-64 字节')
+      return
+    }
+    if (name !== name.trim() || /^[.-\s]/.test(name) || /[\\/:?!*"<>|]/.test(name)) {
+      setError('项目名称不能以点、连字符或空白开头，且不含路径与特殊字符')
+      return
+    }
+    setBusy(true)
+    try {
+      await projectsAPI.create({
+        name: name.trim(),
+        description: description.trim() || undefined,
+        repoUrl: repoUrl.trim() || undefined,
+        defaultBranch: defaultBranch.trim() || undefined,
+      })
+      await queryClient.invalidateQueries({ queryKey: ['projects'] })
+      nav('/', { replace: true })
+    } catch (cause) {
+      setError(opError(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   return (
     <>
-      <PageHeader title="项目接入向导" subtitle="三步完成项目接入 · 完成后立即可触发构建" />
-
-      {/* 步骤条 */}
-      <div className="flex items-center gap-space-lg mb-space-xl max-w-[880px]">
-        {['仓库来源', '构建配置', '部署目标'].map((label, i) => {
-          const n = i + 1
-          return (
-            <div key={label} className="flex items-center gap-space-lg flex-1 last:flex-none">
-              <div className="flex items-center gap-space-md">
-                <span
-                  className={`w-6 h-6 rounded-full flex items-center justify-center font-mono text-label-md ${
-                    step > n
-                      ? 'bg-secondary text-on-secondary'
-                      : step === n
-                        ? 'bg-primary text-on-primary font-semibold'
-                        : 'bg-surface-container-high text-outline'
-                  }`}
-                >
-                  {step > n ? <Icon name="check" size={14} /> : n}
-                </span>
-                <span className={`text-body-md ${step === n ? 'text-on-surface font-medium' : 'text-outline'}`}>{label}</span>
-              </div>
-              {i < 2 && <span className="flex-1 h-px bg-surface-container-highest" />}
-            </div>
-          )
-        })}
-      </div>
-
-      <div className="max-w-[880px] bg-surface-container rounded-lg border border-surface-container-highest p-space-xl space-y-space-lg">
-        {step === 1 && (
-          <>
-            <h2 className="text-headline-md font-semibold">仓库来源</h2>
-            <div className="grid grid-cols-2 gap-gutter">
-              <Field label="项目名称" hint="全局唯一，用于构建号与审计">
-                <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="web-api" />
-              </Field>
-              <Field label="仓库来源" hint="支持本地路径或 Git URL">
-                <Input mono value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="~/workspace/web-api" />
-              </Field>
-            </div>
-            <div className="grid grid-cols-2 gap-gutter">
-              <Field label="默认分支">
-                <Select value={branch} onChange={(e) => setBranch(e.target.value)}>
-                  <option>main</option>
-                  <option>master</option>
-                  <option>develop</option>
-                </Select>
-              </Field>
-              <Field label="分支与触发 · 触发方式">
-                <Select value={trigger} onChange={(e) => setTrigger(e.target.value as typeof trigger)}>
-                  <option value="webhook">Webhook 推送</option>
-                  <option value="cron">定时构建 (Cron)</option>
-                  <option value="manual">手动分发</option>
-                </Select>
-              </Field>
-            </div>
-            {trigger === 'webhook' && (
-              <div
-                className={`flex items-center gap-space-md rounded p-space-lg text-body-sm ${
-                  webhookVerified ? 'bg-secondary/10 text-secondary' : 'bg-surface-container-low text-outline'
-                }`}
-              >
-                <Icon name={webhookVerified ? 'check_circle' : 'radio_button_unchecked'} size={16} fill={webhookVerified} />
-                {webhookVerified ? (
-                  <>
-                    已验证握手 ✓ · Payload 回调终结点已就绪
-                    <span className="ml-auto font-mono text-label-sm text-outline">POST /api/v1/hooks/github/…</span>
-                  </>
-                ) : (
-                  '填写项目名称与仓库来源后自动生成 Webhook 端点'
-                )}
-              </div>
-            )}
-            {trigger === 'cron' && (
-              <Field label="Cron 表达式">
-                <Input mono defaultValue="0 2 * * *" />
-              </Field>
-            )}
-          </>
+      <PageHeader title="创建项目" subtitle="登记仓库地址或本地路径；构建与部署将以项目为单位组织" />
+      <form onSubmit={submit} className="max-w-[640px] space-y-space-xl" aria-busy={busy}>
+        <Field label="项目名称" hint="3-64 字节，全局唯一（不区分大小写）" htmlFor="project-name">
+          <Input id="project-name" value={name} onChange={(e) => setName(e.target.value)} disabled={busy} placeholder="web-api" />
+        </Field>
+        <Field label="描述" hint="选填，最多 512 字节" htmlFor="project-description">
+          <Input id="project-description" value={description} onChange={(e) => setDescription(e.target.value)} disabled={busy} placeholder="主服务" />
+        </Field>
+        <Field label="仓库地址 / 本地路径" hint="https:// 或 git@ 的 git 地址，或部署机上的绝对路径；选填" htmlFor="project-repo">
+          <Input id="project-repo" mono value={repoUrl} onChange={(e) => setRepoUrl(e.target.value)} disabled={busy} placeholder="https://github.com/example/web-api.git" />
+        </Field>
+        <Field label="默认分支" hint="普通 git 引用名；选填" htmlFor="project-branch">
+          <Select id="project-branch" value={defaultBranch} onChange={(e) => setDefaultBranch(e.target.value)} disabled={busy}>
+            <option value="main">main</option>
+            <option value="master">master</option>
+            <option value="">（不设置）</option>
+          </Select>
+        </Field>
+        {error && (
+          <p role="alert" className="text-body-sm text-error bg-error/10 rounded px-space-lg py-space-md">
+            {error}
+          </p>
         )}
-
-        {step === 2 && (
-          <>
-            <h2 className="text-headline-md font-semibold">构建配置</h2>
-            <div className="grid grid-cols-2 gap-gutter">
-              <Field label="构建命令" hint="在容器内执行的工作目录命令">
-                <Input mono value={buildCmd} onChange={(e) => setBuildCmd(e.target.value)} />
-              </Field>
-              <Field label="容器镜像" hint="构建执行环境">
-                <Select>
-                  <option>node:22-bookworm (pnpm 预装)</option>
-                  <option>golang:1.22</option>
-                  <option>自定义镜像</option>
-                </Select>
-              </Field>
-            </div>
-            <Field label="产物类型">
-              <Select>
-                <option>Docker 镜像 (Image Artifact)</option>
-                <option>静态文件</option>
-              </Select>
-            </Field>
-            <div className="bg-surface-container-low rounded p-space-lg font-mono text-[12px] text-outline leading-relaxed">
-              <div className="text-primary mb-1">流水线预览（自动编排）</div>
-              1. Checkout — 检出代码 ({branch}){'\n'}
-              2. Install — 安装依赖{'\n'}
-              3. Build — {buildCmd || '…'}{'\n'}
-              4. Deploy — 自动化部署 (LOA 6 预授权)
-            </div>
-          </>
-        )}
-
-        {step === 3 && (
-          <>
-            <h2 className="text-headline-md font-semibold">部署目标</h2>
-            <div className="space-y-space-md">
-              {[
-                { id: 'dt-1', name: 'prod-vps-01', addr: '10.0.0.8:22', health: '5/5 全部通过' },
-                { id: 'dt-2', name: 'staging-vps', addr: '10.0.0.12:22', health: '5/5 全部通过' },
-                { id: 'dt-3', name: 'backup-nas', addr: '192.168.1.50:22', health: '0/5 超时未响应' },
-              ].map((t) => (
-                <label
-                  key={t.id}
-                  className={`flex items-center gap-space-lg rounded border p-space-lg cursor-pointer transition-colors ${
-                    targets.includes(t.id) ? 'border-primary bg-primary/5' : 'border-surface-container-highest hover:border-outline-variant'
-                  }`}
-                >
-                  <input
-                    type="checkbox"
-                    checked={targets.includes(t.id)}
-                    onChange={(e) => setTargets((prev) => (e.target.checked ? [...prev, t.id] : prev.filter((x) => x !== t.id)))}
-                    className="accent-primary"
-                  />
-                  <div className="flex-1">
-                    <div className="text-body-md font-medium">{t.name}</div>
-                    <div className="text-label-sm text-outline font-mono">{t.addr}</div>
-                  </div>
-                  <span className={`text-label-sm ${t.health.includes('超时') ? 'text-error' : 'text-secondary'}`}>{t.health}</span>
-                </label>
-              ))}
-            </div>
-
-            <Field label="凭据关联" hint="从密钥库选择（Registry 凭据 · SSH 私钥）">
-              <div className="flex flex-wrap gap-space-md">
-                {[
-                  { id: 'sk-1', name: 'SSH 私钥 (1)', fp: 'SHA256:9f3a…c1de' },
-                  { id: 'sk-2', name: 'Registry 凭据', fp: 'SHA256:b7e2…44aa' },
-                ].map((s) => (
-                  <button
-                    key={s.id}
-                    type="button"
-                    onClick={() => setSecretsLinked((p) => (p.includes(s.id) ? p.filter((x) => x !== s.id) : [...p, s.id]))}
-                    className={`flex items-center gap-space-md rounded border px-space-lg py-space-md text-body-sm transition-colors ${
-                      secretsLinked.includes(s.id) ? 'border-primary text-on-surface bg-primary/5' : 'border-surface-container-highest text-on-surface-variant'
-                    }`}
-                  >
-                    <Icon name={secretsLinked.includes(s.id) ? 'check_box' : 'check_box_outline_blank'} size={16} />
-                    {s.name}
-                    <span className="font-mono text-label-sm text-outline">{s.fp}</span>
-                  </button>
-                ))}
-                <button
-                  type="button"
-                  className="rounded border border-dashed border-outline-variant px-space-lg py-space-md text-body-sm text-outline hover:text-on-surface-variant"
-                  onClick={() => alert('跳转密钥管理（演示）')}
-                >
-                  管理凭据库 ↗
-                </button>
-              </div>
-            </Field>
-
-            <div className="grid grid-cols-2 gap-gutter">
-              <Field label="镜像 Tag 保留数">
-                <div className="pt-1">
-                  <Stepper value={keepTags} onChange={setKeepTags} min={1} max={20} />
-                </div>
-              </Field>
-              <Field label="网络模式">
-                <Select defaultValue="bridge">
-                  <option value="bridge">bridge</option>
-                  <option value="host">host</option>
-                </Select>
-              </Field>
-            </div>
-          </>
-        )}
-
-        {/* 底部操作 */}
-        <div className="flex items-center justify-between pt-space-lg border-t border-surface-container-highest">
-          <Button variant="ghost" onClick={() => (step > 1 ? setStep(step - 1) : nav('/'))}>
-            {step > 1 ? '上一步' : '取消'}
+        <div className="flex gap-space-md">
+          <Button type="submit" disabled={busy || !name.trim()}>
+            {busy ? '创建中...' : '创建项目'}
           </Button>
-          <div className="flex items-center gap-space-md">
-            {step < 3 ? (
-              <Button disabled={!canNext} onClick={() => setStep(step + 1)}>
-                下一步：{['构建配置', '部署目标'][step - 1]}
-              </Button>
-            ) : (
-              <Button
-                icon="check"
-                disabled={!canNext}
-                onClick={() => {
-                  alert(`项目「${name}」已创建（演示）\n已选 ${targets.length} 个部署目标 · ${secretsLinked.length} 个凭据`)
-                  nav('/')
-                }}
-              >
-                确认创建
-              </Button>
-            )}
-          </div>
+          <Button type="button" variant="secondary" disabled={busy} onClick={() => nav(-1)}>
+            返回
+          </Button>
         </div>
-      </div>
+      </form>
     </>
   )
 }

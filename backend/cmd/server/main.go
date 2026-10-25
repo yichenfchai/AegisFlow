@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/config"
 	"github.com/yichenfchai/AegisFlow/backend/internal/httpapi"
+	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 )
 
@@ -73,7 +75,7 @@ func run(logger *slog.Logger) error {
 			return err
 		}
 	}
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.New(cache, cfg.RedisNamespace), TrustedProxies: cfg.TrustedProxies})
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.New(cache, cfg.RedisNamespace), TrustedProxies: cfg.TrustedProxies, Projects: projects.New(db)})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -104,7 +106,16 @@ func run(logger *slog.Logger) error {
 		}
 	}()
 	result := make(chan error, 1)
-	go func() { logger.Info("server listening", "address", cfg.Address); result <- server.ListenAndServe() }()
+	listener, err := net.Listen("tcp", cfg.Address)
+	if err != nil {
+		return err
+	}
+	// Log the bound address: with a :0 config port this is the only place the
+	// real port is reported.
+	go func() {
+		logger.Info("server listening", "address", listener.Addr().String())
+		result <- server.Serve(listener)
+	}()
 	select {
 	case err = <-result:
 		if errors.Is(err, http.ErrServerClosed) {
