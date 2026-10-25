@@ -16,7 +16,7 @@ func TestRememberAndAbsoluteDeadline(t *testing.T) {
 	s, db := testService(t)
 	ctx := context.Background()
 	for _, remember := range []bool{false, true} {
-		first, err := s.LoginWithRemember(ctx, "admin", testPassword, remember)
+		first, err := s.LoginWithRemember(ctx, "admin", testPassword, remember, "")
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -66,7 +66,10 @@ func TestOpenAPIContractReferencesAndRoutes(t *testing.T) {
 	}
 	for _, route := range []struct{ path, method string }{
 		{"/healthz", "get"}, {"/readyz", "get"}, {"/api/v1/auth/login", "post"}, {"/api/v1/auth/refresh", "post"},
-		{"/api/v1/auth/logout", "post"}, {"/api/v1/auth/me", "get"}, {"/api/v1/users", "get"}, {"/api/v1/users", "post"},
+		{"/api/v1/auth/logout", "post"}, {"/api/v1/auth/me", "get"}, {"/api/v1/auth/password", "post"},
+		{"/api/v1/auth/sessions", "get"}, {"/api/v1/auth/sessions", "delete"}, {"/api/v1/auth/sessions/{sessionId}", "delete"},
+		{"/api/v1/users", "get"}, {"/api/v1/users", "post"}, {"/api/v1/users/{userId}", "patch"},
+		{"/api/v1/users/{userId}/password-reset", "post"}, {"/api/v1/audit", "get"},
 	} {
 		item, ok := paths[route.path].(map[string]any)
 		if !ok || item[route.method] == nil {

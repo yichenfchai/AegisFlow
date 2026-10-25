@@ -175,21 +175,25 @@ export function Button({
   )
 }
 
-/** 表单字段壳：label + 说明 + 控件 */
+/** 表单字段壳：label + 说明 + 控件（htmlFor 需与控件 id 配对） */
 export function Field({
   label,
   hint,
   children,
   className = '',
+  htmlFor,
 }: {
   label: string
   hint?: string
   children: React.ReactNode
   className?: string
+  htmlFor?: string
 }) {
   return (
     <div className={className}>
-      <label className="block text-label-md text-on-surface-variant mb-space-sm">{label}</label>
+      <label htmlFor={htmlFor} className="block text-label-md text-on-surface-variant mb-space-sm">
+        {label}
+      </label>
       {children}
       {hint && <p className="text-label-sm text-outline mt-space-xs">{hint}</p>}
     </div>

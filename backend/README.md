@@ -63,8 +63,15 @@ server: {
 | POST | /api/v1/auth/refresh | **`{}`** + Cookie；Origin 必需 | `{user,accessToken,expiresIn}` |
 | POST | /api/v1/auth/logout | **`{}`** + Cookie（可缺省）；Origin 必需 | `{loggedOut:true}` |
 | GET | /api/v1/auth/me | `Authorization: Bearer <accessToken>` | User |
-| GET | /api/v1/users | Bearer + admin | User[] |
+| POST | /api/v1/auth/password | Bearer；`{currentPassword,newPassword}`；Origin 必需 | `{changed:true}`，撤销其他会话 |
+| GET | /api/v1/auth/sessions | Bearer | SessionInfo[]（标记当前会话，不含令牌） |
+| DELETE | /api/v1/auth/sessions | Bearer | `{revoked:N}`（撤销除当前外全部） |
+| DELETE | /api/v1/auth/sessions/{id} | Bearer，仅自己的会话；未知 404 | `{revoked:true}` |
+| GET | /api/v1/users | Bearer + admin；`?limit=&offset=`（1-100，默认 20） | `{items,total,limit,offset}` |
 | POST | /api/v1/users | Bearer + admin；`{username,password,displayName?,role}` | User，201 |
+| PATCH | /api/v1/users/{id} | Bearer + admin；`{role?,disabled?}` 至少一项 | `{updated:true}` |
+| POST | /api/v1/users/{id}/password-reset | Bearer + admin；`{password}` | `{reset:true}`，撤销目标全部会话 |
+| GET | /api/v1/audit | Bearer + admin；`?limit=&offset=` | `{items,total,limit,offset}`，最新在前 |
 
 **所有 auth POST（包括 login）强制恰好一个 Origin，且精确匹配允许列表**；缺失、不匹配、`null` 或跨站请求返回 `403 origin_denied`，在登录、轮换和退出之前拦截。非浏览器 curl/脚本也必须带该 Origin。其他请求如果携带 Origin 也须符合允许列表。全局拒绝 `Sec-Fetch-Site: cross-site`。允许来源响应包含 `Access-Control-Allow-Origin: <原始允许源>`、`Access-Control-Allow-Credentials: true`，`Vary: Origin, Sec-Fetch-Site`；OPTIONS 额外 Vary 请求方法与请求头，允许 GET/POST/OPTIONS 和 Authorization/Content-Type。
 
@@ -109,7 +116,7 @@ Invoke-RestMethod 'http://127.0.0.1:8080/api/v1/auth/refresh' -Method Post -Head
 Invoke-RestMethod 'http://127.0.0.1:8080/api/v1/auth/logout' -Method Post -Headers $origin -ContentType 'application/json' -Body '{}' -WebSession $browser
 ```
 
-User 字段为 `id/username/displayName/role`，无密码或哈希。用户名为 3–64 个 ASCII 字母、数字、下划线、点、短横线，首字符须为字母或数字；匹配不区分大小写。密码为 12–72 UTF-8 字节；displayName 最多 256 字节，省略/空串回退 username。角色为 admin/member/viewer；只有 admin 能创建/列出用户，其他角色可读自己的资料。当前没有公共注册接口。
+User 字段为 `id/username/displayName/role/disabled/createdAt`，无密码或哈希。用户名为 3–64 个 ASCII 字母、数字、下划线、点、短横线，首字符须为字母或数字；匹配不区分大小写。密码为 12–72 UTF-8 字节；displayName 最多 256 字节，省略/空串回退 username。角色为 admin/member/viewer；只有 admin 能管理用户与查询审计，所有角色可修改自己的密码并管理自己的会话。禁用账号会立即撤销其全部会话，且只有密码正确时登录才返回 403 `account_disabled`，不会向无凭据者泄露禁用状态。禁用或降级最后一个可用管理员返回 400，角色变更对既有会话即时生效（每次请求读取数据库角色）。当前没有公共注册接口。
 
 常见错误：400 `invalid_request`/`validation_failed`；401 `unauthorized`；403 `origin_denied`/`forbidden`；409 `conflict`；415 `unsupported_media_type`；429 `rate_limited`（Retry-After 为窗口剩余秒数，向上取整）；503 `not_ready`/`dependencies_unavailable`；500 `internal_error`。未知路径、错误方法和额外尾斜杠均为统一 404 `not_found`，不自动重定向。Origin/CSRF 拦截优先于正文与身份验证。
 
@@ -121,7 +128,9 @@ User 字段为 `id/username/displayName/role`，无密码或哈希。用户名�
 - Refresh/Logout 统一锁定 session 行，再读取 token 状态；同一会话跨多个实例串行化刷新与撤销，重放撤销会提交到共享数据库。数据库事务使用 READ COMMITTED。
 - SQLite 开发库不会自动导入 PostgreSQL。现阶段开发数据可重新初始化；如有需要保留的用户，必须先备份并单独编写审核过的离线迁移，保留 bcrypt 哈希、校验用户名大小写唯一性并撤销旧会话，不能直接复制文件或将 SQLite 挂共享盘。
 - /readyz 同时检查 PostgreSQL 和 Redis；Redis 故障使就绪返回 503，登录也 503。已存在 Bearer 会话在 PostgreSQL 正常时仍可鉴权；负载均衡是否摘除整个实例取决于运维策略。
-- 请求 ID、slog JSON 访问日志、鉴权操作日志、panic 恢复、安全响应头、HTTP 超时、信号触发优雅退出；日志不记录密码、Cookie、令牌、正文。审计输出为日志，不是持久化审计查询服务。
+- 请求 ID、slog JSON 访问日志、鉴权操作日志、panic 恢复、安全响应头、HTTP 超时、信号触发优雅退出；日志不记录密码、Cookie、令牌、正文。
+- 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），保留策略待业务审计里程碑设计。
+- 过期会话与 refresh 历史由后台任务每小时清理（启动时先执行一次）：删除超过绝对期限的会话及其全部 refresh 令牌记录。重放检测只需保留到会话有效期，这与文档化的保留边界一致。
 
 ## 验证
 
@@ -136,7 +145,7 @@ go build ./cmd/server
 go test -race ./...
 ```
 
-分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移和多连接池会话互通）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装）以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
+分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理端点与分页）以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
 
 ## 架构
 

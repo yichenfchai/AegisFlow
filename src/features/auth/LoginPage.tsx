@@ -64,9 +64,9 @@ function LoginForm() {
               <path d="M2 18 H12 L15 12 L19 24 L22 8 L25 22 L28 18 H34" stroke="var(--brand)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
               <path d="M28 14 L34 18 L28 22" stroke="var(--success)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
             </svg>
-            <span className="text-[24px] font-semibold text-on-surface tracking-tight">GoPulse</span>
+            <span className="text-[24px] font-semibold text-on-surface tracking-tight">AegisFlow</span>
           </div>
-          <p className="text-body-md text-outline">轻量交付治理平台 · v2.4</p>
+          <p className="text-body-md text-outline">轻量交付治理平台</p>
         </div>
 
         {/* 登录卡片 */}
@@ -161,7 +161,7 @@ function LoginForm() {
         </form>
 
         <p className="text-center text-label-sm text-outline mt-space-xl font-mono">
-          GoPulse v2.4 · © 2026 · solo-server
+          AegisFlow · © 2026
         </p>
       </div>
     </div>

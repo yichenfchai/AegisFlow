@@ -43,16 +43,12 @@ export function CommandPalette() {
 
   const RESULTS = useMemo(
     () => [
+      { group: '页面', label: '项目列表', to: '/' },
+      { group: '页面', label: '构建流水线', to: '/builds' },
       { group: '构建', label: '#1092 · 运行中 · web-api', to: '/builds/1092' },
       { group: '构建', label: '#1091 · 失败 · AI 诊断', to: '/builds/1091/diagnosis' },
-      { group: '审查', label: 'RR-118 · 待批准 · 代码一致性优化', to: '/reviews/rr-118' },
-      { group: '部署', label: 'DP-312 · 进行中 · prod-vps-01', to: '/deploys' },
-      { group: '知识库', label: 'kb-082 · TokenParser 索引越界修复', to: '/knowledge' },
-      { group: '防御', label: '45.132.28.117 · AS49505 · 封禁 24h', to: '/defense' },
-      { group: '审计', label: '自动封禁 · LOA 7 · 近 24h', to: '/audit' },
-      { group: '页面', label: '自动化策略 · LOA 档位选择器', to: '/policies' },
-      { group: '页面', label: '密钥管理', to: '/secrets' },
-      { group: '页面', label: '设置 · AI Provider', to: '/settings' },
+      { group: '页面', label: '账号安全 · 修改密码与管理会话', to: '/account' },
+      { group: '页面', label: '用户与审计 · 管理员', to: '/settings' },
     ],
     [],
   )
@@ -86,7 +82,7 @@ export function CommandPalette() {
               if (e.key === 'ArrowUp') setIdx((i) => Math.max(0, i - 1))
               if (e.key === 'Enter' && filtered[idx]) go(filtered[idx].to)
             }}
-            placeholder="搜索构建号、RR、IP、知识条目..."
+            placeholder="搜索页面与构建..."
             className="flex-1 bg-transparent text-body-lg text-on-surface placeholder:text-text-3 focus:outline-none"
           />
           <span className="font-mono text-label-sm text-outline border border-outline-variant rounded px-1">ESC</span>
@@ -115,7 +111,7 @@ export function CommandPalette() {
         <div className="px-space-xl py-space-md border-t border-surface-container-highest text-label-sm text-outline flex gap-space-xl">
           <span>↑↓ 导航</span>
           <span>↳ 跳转</span>
-          <span className="ml-auto font-mono">GoPulse ⌘K</span>
+          <span className="ml-auto font-mono">AegisFlow ⌘K</span>
         </div>
       </div>
     </div>

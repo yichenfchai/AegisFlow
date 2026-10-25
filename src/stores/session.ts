@@ -87,6 +87,7 @@ function clearSession() {
   useSession.setState({ user: null, accessToken: null, status: 'anonymous', error: null })
 }
 export function errorMessage(error: unknown): string {
+  if (error instanceof ApiError && error.code === 'account_disabled') return '账号已被禁用，请联系管理员'
   if (error instanceof ApiError && error.status === 401) return '账号、密码错误或会话已过期，请重新登录'
   return error instanceof Error ? error.message : '请求失败，请稍后重试'
 }

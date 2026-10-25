@@ -77,6 +77,32 @@ func run(logger *slog.Logger) error {
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Expired sessions and their refresh history are pruned hourly; replay
+	// detection never needs history beyond the session deadline.
+	cleanupCtx, stopCleanup := context.WithCancel(signalCtx)
+	defer stopCleanup()
+	go func() {
+		run := func() {
+			removed, err := service.CleanupExpired(cleanupCtx)
+			switch {
+			case err != nil && cleanupCtx.Err() == nil:
+				logger.Error("session cleanup failed", "error", err)
+			case removed > 0:
+				logger.Info("expired sessions cleaned", "count", removed)
+			}
+		}
+		run()
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-cleanupCtx.Done():
+				return
+			case <-ticker.C:
+				run()
+			}
+		}
+	}()
 	result := make(chan error, 1)
 	go func() { logger.Info("server listening", "address", cfg.Address); result <- server.ListenAndServe() }()
 	select {

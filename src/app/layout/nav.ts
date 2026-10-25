@@ -10,7 +10,10 @@ export interface NavGroup {
   items: NavItem[]
 }
 
-/** 侧边栏导航（新版 13 项口径，源自 _14_settings 稿） */
+/**
+ * 侧边栏导航。除项目/构建主线为 BusinessGate 演示外，其余业务页面当前为
+ * 明确的未实现占位；账号安全与用户管理（管理员）为真实接口。
+ */
 export const NAV_GROUPS: NavGroup[] = [
   {
     title: '交付',

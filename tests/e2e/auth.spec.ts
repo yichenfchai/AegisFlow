@@ -100,3 +100,80 @@ test('会话 Cookie、失效刷新及非管理员限制', async ({ page, context
   await page.reload()
   await expect(page).toHaveURL(/\/login/)
 })
+
+test('账号管理：创建、重置、禁用、审计与自助安全', async ({ page }) => {
+  await login(page)
+  // 管理员通过真实 UI 创建成员（唯一用户名，避免数据库残留导致冲突）。
+  const memberName = `acct-${Date.now()}`
+  await page.goto('/settings')
+  await page.getByRole('button', { name: '创建用户' }).click()
+  await page.getByLabel('用户名').fill(memberName)
+  await page.getByLabel('显示名').fill('账号测试')
+  await page.getByLabel('初始密码').fill('Acct-password-2026')
+  await page.getByLabel('角色').selectOption('member')
+  await page.getByRole('button', { name: '创建', exact: true }).click()
+  const row = page.getByRole('row', { name: new RegExp(memberName) })
+  await expect(row).toBeVisible()
+  // 变更角色。
+  await row.getByRole('combobox').selectOption('viewer')
+  await expect(row.getByRole('combobox')).toHaveValue('viewer')
+  // 重置密码并禁用。
+  await row.getByRole('button', { name: '重置密码' }).click()
+  await page.getByLabel('新密码').fill('Acct-newpass-2026')
+  await page.getByRole('button', { name: '确认重置' }).click()
+  await expect(row.getByRole('button', { name: '禁用', exact: true })).toBeVisible()
+  await row.getByRole('button', { name: '禁用', exact: true }).click()
+  await page.getByRole('button', { name: '确认禁用' }).click()
+  await expect(row.getByText('已禁用')).toBeVisible()
+  // 审计页可查询全部管理操作。
+  await page.getByRole('button', { name: '审计', exact: true }).click()
+  for (const action of ['创建用户', '变更角色', '重置密码', '禁用账号']) {
+    await expect(page.getByText(action).first()).toBeVisible()
+  }
+  // 禁用账号即使密码正确也无法登录（403 account_disabled）。
+  const denied = await page.request.post('/api/v1/auth/login', {
+    data: { username: memberName, password: 'Acct-newpass-2026' },
+    headers: { Origin: 'http://localhost:5173' },
+  })
+  expect(denied.status()).toBe(403)
+  // 重新启用后成员可登录，但无权访问管理页。
+  await page.getByRole('button', { name: '用户管理' }).click()
+  await row.getByRole('button', { name: '启用', exact: true }).click()
+  await page.getByRole('button', { name: '确认启用' }).click()
+  await expect(row.getByText('正常', { exact: true })).toBeVisible()
+
+  const browser = page.context().browser()!
+  const memberCtx = await browser.newContext()
+  const member = await memberCtx.newPage()
+  await member.goto('/login')
+  await member.getByLabel('用户名', { exact: true }).fill(memberName)
+  await member.getByLabel('密码', { exact: true }).fill('Acct-newpass-2026')
+  await member.getByRole('button', { name: '登录', exact: true }).click()
+  await expect(member).toHaveURL('/')
+  await member.goto('/settings')
+  await expect(member.getByText('无权访问')).toBeVisible()
+  // 自助修改密码：保留当前会话。
+  await member.goto('/account')
+  await member.getByLabel('当前密码').fill('Acct-newpass-2026')
+  await member.getByLabel('新密码', { exact: true }).fill('Acct-final-2026')
+  await member.getByLabel('确认新密码').fill('Acct-final-2026')
+  await member.getByRole('button', { name: '更新密码' }).click()
+  await expect(member.getByText('密码已更新')).toBeVisible()
+  // 第二个成员会话登录后，撤销其他全部会话立即踢出。
+  const ctx2 = await browser.newContext()
+  const member2 = await ctx2.newPage()
+  await member2.goto('/login')
+  await member2.getByLabel('用户名', { exact: true }).fill(memberName)
+  await member2.getByLabel('密码', { exact: true }).fill('Acct-final-2026')
+  await member2.getByRole('button', { name: '登录', exact: true }).click()
+  await expect(member2).toHaveURL('/')
+  await member.reload()
+  await expect(member.locator('tbody tr')).toHaveCount(2)
+  await member.getByRole('button', { name: '撤销其他全部会话' }).click()
+  await member.getByRole('button', { name: '确认撤销' }).click()
+  await expect(member.locator('tbody tr')).toHaveCount(1)
+  await member2.reload()
+  await expect(member2).toHaveURL(/\/login/)
+  await memberCtx.close()
+  await ctx2.close()
+})
