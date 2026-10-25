@@ -27,6 +27,10 @@
 | PATCH /api/v1/users/{id} | 管理员 Bearer，JSON role/disabled 至少一项 | 变更角色或禁用状态；禁用立即撤销该用户全部会话 |
 | POST /api/v1/users/{id}/password-reset | 管理员 Bearer，JSON password | 重置密码并撤销该用户全部会话 |
 | GET /api/v1/audit | 管理员 Bearer，limit/offset | 审计分页查询，最新在前 |
+| GET /api/v1/projects | Bearer（所有角色），limit/offset/status? | 项目分页，按名称排序 |
+| POST /api/v1/projects | admin/member Bearer，JSON 项目字段 | 创建项目（active 状态），201 |
+| GET /api/v1/projects/{id} | Bearer（所有角色） | 项目详情 |
+| PATCH /api/v1/projects/{id} | admin/member Bearer，JSON 至少一字段 | 修改字段或归档/恢复；归档项目只接受恢复 |
 
 accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh token 不返回 JSON，由 HttpOnly、SameSite=Strict、Path=/api/v1/auth 的 Cookie 保存，无 Domain。勾选保持登录时 Cookie 持久化到绝对会话期限，未勾选使用 session Cookie；浏览器恢复会话可能保留 session Cookie，因此不承诺关闭窗口立即退出。主动退出以服务端撤销为准。默认绝对期限 30 天，由后端配置决定，刷新不延长。
 
@@ -57,8 +61,10 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 | --- | --- | --- | --- | --- |
 | 读取自己的资料、退出、修改自己密码、查看/撤销自己的会话 | 允许 | 允许 | 允许 | 已实现 |
 | 创建/查询用户、重置密码、禁用/启用、变更角色、查询审计 | 允许 | 禁止 | 禁止 | 已实现 |
-| 读取项目/构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 后续业务接口落实 |
-| 创建/修改项目、发起/取消构建、发起审查 | 允许 | 允许 | 禁止 | 后续业务接口落实 |
+| 读取项目 | 允许 | 允许 | 允许 | 已实现（全局角色） |
+| 创建/修改项目、归档与恢复 | 允许 | 允许 | 禁止 | 已实现（全局角色；项目级成员权限留待后续） |
+| 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 后续业务接口落实 |
+| 发起/取消构建、发起审查 | 允许 | 允许 | 禁止 | 后续业务接口落实 |
 | 发起部署、回滚及执行审批 | 允许 | 禁止 | 禁止 | 后续业务接口落实 |
 | 管理部署目标、密钥、策略、设置、防御及业务审计 | 允许 | 禁止 | 禁止 | 页面明确标记未实现，业务服务待实现 |
 
