@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
@@ -64,10 +65,10 @@ func TestConcurrentMigrateAndUnknownVersion(t *testing.T) {
 		}
 	}
 	var count int
-	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&count); err != nil || count != len(authMigrations) {
+	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&count); err != nil || count != len(dbmigrate.Migrations) {
 		t.Fatalf("migration count=%d err=%v", count, err)
 	}
-	if _, err := db.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES($1,$2)`, len(authMigrations)+1, time.Now().Unix()); err != nil {
+	if _, err := db.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES($1,$2)`, len(dbmigrate.Migrations)+1, time.Now().Unix()); err != nil {
 		t.Fatal(err)
 	}
 	if err := New(db2, testSecret, time.Minute, time.Hour).Migrate(ctx); err == nil || !strings.Contains(err.Error(), "unsupported") {

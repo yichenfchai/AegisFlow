@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 )
 
@@ -39,6 +40,7 @@ func requestID(c *gin.Context) string {
 
 type Server struct {
 	auth         *auth.Service
+	projects     *projects.Service
 	logger       *slog.Logger
 	ready        func(context.Context) error
 	origins      map[string]bool
@@ -54,6 +56,9 @@ type Options struct {
 	CookieSecure   bool
 	Limiter        ratelimit.Limiter
 	TrustedProxies []string
+	// Projects enables the project registry routes; when nil they fail closed
+	// with 503 like any other missing shared dependency.
+	Projects *projects.Service
 }
 
 // New builds an isolated Gin engine; business services depend only on context.Context.
@@ -62,7 +67,7 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	if len(options) > 0 {
 		opts = options[0]
 	}
-	s := &Server{auth: service, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure}
+	s := &Server{auth: service, projects: opts.Projects, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure}
 	for _, o := range origins {
 		s.origins[o] = true
 	}
@@ -103,6 +108,11 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	users.POST("/:id/password-reset", s.resetPassword)
 	audit := api.Group("/audit", s.authenticate(), s.requireAdmin())
 	audit.GET("", s.listAudit)
+	projectRoutes := api.Group("/projects", s.authenticate())
+	projectRoutes.GET("", s.listProjects)
+	projectRoutes.POST("", s.requireRole("admin", "member"), s.createProject)
+	projectRoutes.GET("/:id", s.getProject)
+	projectRoutes.PATCH("/:id", s.requireRole("admin", "member"), s.updateProject)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }
@@ -221,12 +231,21 @@ func (s *Server) authenticate() gin.HandlerFunc {
 	}
 }
 func (s *Server) requireAdmin() gin.HandlerFunc {
+	return s.requireRole("admin")
+}
+
+// requireRole restricts a route to the listed global roles; page guards are
+// advisory and never replace this server-side check.
+func (s *Server) requireRole(roles ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if currentUser(c).Role != "admin" {
-			s.fail(c, 403, "forbidden", "administrator role required")
-			return
+		role := currentUser(c).Role
+		for _, allowed := range roles {
+			if role == allowed {
+				c.Next()
+				return
+			}
 		}
-		c.Next()
+		s.fail(c, 403, "forbidden", "insufficient role for this operation")
 	}
 }
 func currentUser(c *gin.Context) *auth.User { return c.MustGet(userKey).(*auth.User) }
@@ -349,6 +368,101 @@ func (s *Server) listAudit(c *gin.Context) {
 		return
 	}
 	s.respond(c, 200, gin.H{"items": entries, "total": total, "limit": limit, "offset": offset})
+}
+
+// projectError maps registry errors to the shared error envelope.
+func (s *Server) projectError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, projects.ErrValidation):
+		s.fail(c, 400, "validation_failed", "name 3-64 bytes without path or meta characters; repoUrl https://, git@, file:/// URL or absolute path; defaultBranch a plain git ref")
+	case errors.Is(err, projects.ErrConflict):
+		s.fail(c, 409, "conflict", "project name already exists or the project is archived")
+	case errors.Is(err, projects.ErrNotFound):
+		s.fail(c, 404, "not_found", "resource not found")
+	default:
+		s.logger.ErrorContext(c.Request.Context(), "project request failed", "requestId", requestID(c), "error", err)
+		s.fail(c, 500, "internal_error", "internal server error")
+	}
+}
+
+func (s *Server) listProjects(c *gin.Context) {
+	if s.projects == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	limit, offset, ok := s.page(c)
+	if !ok {
+		return
+	}
+	status := c.Query("status")
+	list, total, err := s.projects.List(c.Request.Context(), status, limit, offset)
+	if err != nil {
+		s.projectError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": list, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *Server) createProject(c *gin.Context) {
+	if s.projects == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	var input struct {
+		Name          string `json:"name"`
+		Description   string `json:"description"`
+		RepoURL       string `json:"repoUrl"`
+		DefaultBranch string `json:"defaultBranch"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	project, err := s.projects.Create(c.Request.Context(), actorFrom(c), projects.Input{Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch})
+	if err != nil {
+		s.projectError(c, err)
+		return
+	}
+	s.respond(c, 201, project)
+}
+
+func (s *Server) getProject(c *gin.Context) {
+	if s.projects == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	project, err := s.projects.Get(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		s.projectError(c, err)
+		return
+	}
+	s.respond(c, 200, project)
+}
+
+func (s *Server) updateProject(c *gin.Context) {
+	if s.projects == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	var input struct {
+		Name          *string `json:"name"`
+		Description   *string `json:"description"`
+		RepoURL       *string `json:"repoUrl"`
+		DefaultBranch *string `json:"defaultBranch"`
+		Archived      *bool   `json:"archived"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	if input.Name == nil && input.Description == nil && input.RepoURL == nil && input.DefaultBranch == nil && input.Archived == nil {
+		s.fail(c, 400, "invalid_request", "at least one project field is required")
+		return
+	}
+	project, err := s.projects.Update(c.Request.Context(), actorFrom(c), c.Param("id"), projects.Patch{Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, Archived: input.Archived})
+	if err != nil {
+		s.projectError(c, err)
+		return
+	}
+	s.respond(c, 200, project)
 }
 
 func (s *Server) changePassword(c *gin.Context) {

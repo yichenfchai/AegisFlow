@@ -70,6 +70,8 @@ func TestOpenAPIContractReferencesAndRoutes(t *testing.T) {
 		{"/api/v1/auth/sessions", "get"}, {"/api/v1/auth/sessions", "delete"}, {"/api/v1/auth/sessions/{sessionId}", "delete"},
 		{"/api/v1/users", "get"}, {"/api/v1/users", "post"}, {"/api/v1/users/{userId}", "patch"},
 		{"/api/v1/users/{userId}/password-reset", "post"}, {"/api/v1/audit", "get"},
+		{"/api/v1/projects", "get"}, {"/api/v1/projects", "post"}, {"/api/v1/projects/{projectId}", "get"},
+		{"/api/v1/projects/{projectId}", "patch"},
 	} {
 		item, ok := paths[route.path].(map[string]any)
 		if !ok || item[route.method] == nil {

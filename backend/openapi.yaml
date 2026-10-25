@@ -40,6 +40,8 @@ tags:
     description: Browser Cookie session lifecycle and Bearer identity
   - name: Users
     description: Administrator-only local user management
+  - name: Projects
+    description: Project registry with global-role authorization
   - name: Audit
     description: Persistent authentication and account-management audit trail
   - name: Health
@@ -514,6 +516,144 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/projects:
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      summary: List projects (all roles)
+      description: Ordered by name case-insensitively, then id. Authorization uses global roles only; per-project membership is not implemented.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: status
+          in: query
+          required: false
+          description: Filter by lifecycle status; omit for all
+          schema: { type: string, enum: [active, archived] }
+      responses:
+        '200':
+          description: Projects page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ProjectPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Projects]
+      operationId: createProject
+      summary: Create a project (admin or member)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectInput' }
+      responses:
+        '201':
+          description: Project created in the active state
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Project' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Project name already exists case-insensitively; error.code is conflict
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/projects/{projectId}:
+    get:
+      tags: [Projects]
+      operationId: getProject
+      summary: Get one project (all roles)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Project
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Project' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      tags: [Projects]
+      operationId: updateProject
+      summary: Update fields or archive/restore (admin or member)
+      description: |
+        At least one field is required. Names stay unique case-insensitively.
+        Archived projects are read-only except for archived:false (restore);
+        repeating the archive is an idempotent no-op. Archive and field edits
+        each write one audit row in the same transaction.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectPatch' }
+      responses:
+        '200':
+          description: Updated project (or unchanged for a no-op patch)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Project' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Duplicate name, or editing an archived project; error.code is conflict
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
 components:
   securitySchemes:
     bearerAuth:
@@ -674,6 +814,60 @@ components:
         total: { type: integer, minimum: 0 }
         limit: { type: integer, minimum: 1, maximum: 100 }
         offset: { type: integer, minimum: 0 }
+    Project:
+      type: object
+      additionalProperties: false
+      required: [id, name, description, repoUrl, defaultBranch, status, createdBy, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        name:
+          type: string
+          description: 3-64 UTF-8 bytes, unique case-insensitively; no path or shell meta characters
+        description:
+          type: string
+          description: At most 512 bytes
+        repoUrl:
+          type: string
+          description: https:// or git@ git URL, file:/// URL, or an absolute local path; empty allowed
+        defaultBranch:
+          type: string
+          description: Plain git ref name; empty allowed
+        status: { type: string, enum: [active, archived] }
+        createdBy: { type: string, description: Actor id snapshot of the creating user }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+        updatedAt: { type: integer, format: int64, description: Unix seconds }
+    ProjectInput:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: { type: string }
+        description: { type: string }
+        repoUrl: { type: string }
+        defaultBranch: { type: string }
+    ProjectPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name: { type: string }
+        description: { type: string }
+        repoUrl: { type: string }
+        defaultBranch: { type: string }
+        archived:
+          type: boolean
+          description: true archives (idempotent); false restores an archived project
+    ProjectPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Project' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
     AuditEntry:
       type: object
       additionalProperties: false
@@ -683,8 +877,8 @@ components:
         createdAt: { type: integer, format: int64, description: Unix seconds }
         actorId: { type: string, description: Empty for system rows }
         actorUsername: { type: string }
-        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all] }
-        objectType: { type: string, enum: [user, session] }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive] }
+        objectType: { type: string, enum: [user, session, project] }
         objectId: { type: string }
         result: { type: string, enum: [success, failure] }
         detail: { type: string, description: Safe context such as role transitions or revoked counts; never secrets }
