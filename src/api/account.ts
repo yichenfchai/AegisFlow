@@ -76,4 +76,8 @@ export const AUDIT_ACTION_TEXT: Record<string, string> = {
   'user.role_change': '变更角色',
   'session.revoke': '撤销会话',
   'session.revoke_all': '撤销其他会话',
+  'project.create': '创建项目',
+  'project.update': '更新项目',
+  'project.archive': '归档项目',
+  'project.unarchive': '恢复项目',
 }

@@ -177,3 +177,60 @@ test('账号管理：创建、重置、禁用、审计与自助安全', async ({
   await memberCtx.close()
   await ctx2.close()
 })
+
+test('项目管理：创建、归档恢复与角色限制', async ({ page }) => {
+  await login(page)
+  // 通过真实 UI 创建项目（唯一名称，避免跨运行残留）。
+  await page.goto('/')
+  await page.getByRole('link', { name: '创建项目' }).click()
+  const name = `e2e-proj-${Date.now()}`
+  await page.getByLabel('项目名称').fill(name)
+  await page.getByLabel('描述').fill('E2E 验证项目')
+  await page.getByLabel('仓库地址 / 本地路径').fill('https://github.com/example/e2e.git')
+  await page.getByLabel('默认分支').selectOption('main')
+  await page.getByRole('button', { name: '创建项目', exact: true }).click()
+  await expect(page).toHaveURL('/')
+  const row = page.getByRole('row', { name: new RegExp(name) })
+  await expect(row.getByText('活跃')).toBeVisible()
+  // 归档后只读，恢复后回到活跃。
+  await row.getByRole('button', { name: '归档', exact: true }).click()
+  await page.getByRole('button', { name: '确认归档' }).click()
+  await expect(row.getByText('已归档')).toBeVisible()
+  await row.getByRole('button', { name: '恢复', exact: true }).click()
+  await page.getByRole('button', { name: '确认恢复' }).click()
+  await expect(row.getByText('活跃')).toBeVisible()
+  // 管理操作进入审计。
+  await page.goto('/settings')
+  await page.getByRole('button', { name: '审计', exact: true }).click()
+  await expect(page.getByText('创建项目').first()).toBeVisible()
+  await expect(page.getByText('归档项目').first()).toBeVisible()
+  await expect(page.getByText('恢复项目').first()).toBeVisible()
+  // viewer 可读列表但没有创建入口，直连 API 也被拒绝。
+  const username = `proj-viewer-${Date.now()}`
+  await page.getByRole('button', { name: '用户管理' }).click()
+  await page.evaluate(async ({ username }) => {
+    const { apiRequest } = await import('/src/stores/session.ts')
+    return apiRequest('/users', { method: 'POST', body: JSON.stringify({ username, password: 'Viewer-pass-2026', displayName: 'Proj Viewer', role: 'viewer' }) })
+  }, { username })
+  const browser = page.context().browser()!
+  const viewerCtx = await browser.newContext()
+  const viewer = await viewerCtx.newPage()
+  await viewer.goto('/login')
+  await viewer.getByLabel('用户名', { exact: true }).fill(username)
+  await viewer.getByLabel('密码', { exact: true }).fill('Viewer-pass-2026')
+  await viewer.getByRole('button', { name: '登录', exact: true }).click()
+  await expect(viewer).toHaveURL('/')
+  await expect(viewer.getByRole('link', { name: '创建项目' })).toHaveCount(0)
+  await expect(viewer.getByText(name)).toBeVisible()
+  const status = await viewer.evaluate(async () => {
+    const { apiRequest } = await import('/src/stores/session.ts')
+    try {
+      await apiRequest('/projects', { method: 'POST', body: JSON.stringify({ name: 'viewer-denied-x' }) })
+      return 201
+    } catch (error) {
+      return (error as { status: number }).status
+    }
+  })
+  expect(status).toBe(403)
+  await viewerCtx.close()
+})

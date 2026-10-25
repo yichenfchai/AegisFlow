@@ -6,15 +6,16 @@ import { BuildListPage } from '@/features/builds/BuildListPage'
 import { BuildDetailPage } from '@/features/builds/BuildDetailPage'
 import { DiagnosisPage } from '@/features/builds/DiagnosisPage'
 import { SettingsPage } from '@/features/settings/SettingsPages'
-import { DashboardPage } from '@/features/dashboard/DashboardPage'
 import { LoginPage } from '@/features/auth/LoginPage'
 import { SessionGate } from '@/features/auth/SessionGate'
 import { ProjectWizardPage } from '@/features/projects/ProjectWizardPage'
+import { ProjectsPage } from '@/features/projects/ProjectsPage'
 import { AccountSecurityPage } from '@/features/account/AccountSecurityPage'
 
 /**
- * 主线业务演示页（项目/构建）保留在 BusinessGate 后：mock 显式开启才展示。
- * 非主线页面恒定显示 UnimplementedPage；账号与设置页使用真实接口、不进 Gate。
+ * 真实页面（项目列表/创建、账号、用户与审计）不进 Gate。
+ * 构建链路仍是演示页，保留在 BusinessGate 后：mock 显式开启才展示。
+ * 非主线页面恒定显示 UnimplementedPage。
  */
 function demo(element: React.ReactElement): React.ReactElement {
   return <BusinessGate>{element}</BusinessGate>
@@ -25,10 +26,11 @@ export const router = createBrowserRouter([
   {
     element: <SessionGate><AppShell /></SessionGate>,
     children: [
-      { path: '/', element: demo(<DashboardPage />) },
+      // 真实项目注册表（P2）
+      { path: '/', element: <ProjectsPage /> },
+      { path: '/projects/new', element: <ProjectWizardPage /> },
 
-      // 主线演示：项目 / 构建
-      { path: '/projects/new', element: demo(<ProjectWizardPage />) },
+      // 构建演示（待 P3 接入真实接口）
       { path: '/builds', element: demo(<BuildListPage />) },
       { path: '/builds/:id', element: demo(<BuildDetailPage />) },
       { path: '/builds/:id/diagnosis', element: demo(<DiagnosisPage />) },
