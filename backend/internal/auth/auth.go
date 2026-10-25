@@ -21,10 +21,12 @@ import (
 )
 
 var (
-	ErrUnauthorized = errors.New("unauthorized")
-	ErrForbidden    = errors.New("forbidden")
-	ErrConflict     = errors.New("conflict")
-	ErrValidation   = errors.New("validation failed")
+	ErrUnauthorized    = errors.New("unauthorized")
+	ErrForbidden       = errors.New("forbidden")
+	ErrConflict        = errors.New("conflict")
+	ErrValidation      = errors.New("validation failed")
+	ErrNotFound        = errors.New("not found")
+	ErrAccountDisabled = errors.New("account disabled")
 )
 
 const (
@@ -34,11 +36,27 @@ const (
 
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$`)
 
+// IDs are base64url tokens from randomToken; reject other shapes before queries.
+var idPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
+
+func ValidID(id string) bool { return idPattern.MatchString(id) }
+
+// Actor identifies who performed an auditable operation. RequestID links the
+// audit row to the structured request log.
+type Actor struct {
+	ID        string
+	Username  string
+	RequestID string
+}
+
 type User struct {
 	ID          string `json:"id"`
 	Username    string `json:"username"`
 	DisplayName string `json:"displayName"`
 	Role        string `json:"role"`
+	Disabled    bool   `json:"disabled"`
+	// Zero means unknown for rows created before the timestamp migration.
+	CreatedAt int64 `json:"createdAt"`
 }
 
 type Tokens struct {
@@ -130,8 +148,8 @@ func validateUser(username, password, displayName, role string) error {
 	if !usernamePattern.MatchString(username) {
 		return fmt.Errorf("%w: username must be 3-64 ASCII letters, digits, dots, underscores or hyphens and begin with a letter or digit", ErrValidation)
 	}
-	if len(password) < 12 || len(password) > 72 {
-		return fmt.Errorf("%w: password must be 12-72 bytes", ErrValidation)
+	if err := validatePassword(password); err != nil {
+		return err
 	}
 	if role != "admin" && role != "member" && role != "viewer" {
 		return fmt.Errorf("%w: unknown role", ErrValidation)
@@ -166,8 +184,8 @@ func (s *Service) Bootstrap(ctx context.Context, username, password string) erro
 	if err = advisoryLock(ctx, tx, "bootstrap"); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO auth_users(id,username,password_hash,display_name,role)
- SELECT $1,$2,$3,$4,'admin' WHERE NOT EXISTS(SELECT 1 FROM auth_users)`, id, username, string(hash), username)
+	_, err = tx.ExecContext(ctx, `INSERT INTO auth_users(id,username,password_hash,display_name,role,disabled,created_at)
+	 SELECT $1,$2,$3,$4,'admin',0,$5 WHERE NOT EXISTS(SELECT 1 FROM auth_users)`, id, username, string(hash), username, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("bootstrap: %w", err)
 	}
@@ -175,7 +193,7 @@ func (s *Service) Bootstrap(ctx context.Context, username, password string) erro
 }
 
 // CreateUser does not authorize the caller; the HTTP layer must require an admin.
-func (s *Service) CreateUser(ctx context.Context, username, password, displayName, role string) (*User, error) {
+func (s *Service) CreateUser(ctx context.Context, actor Actor, username, password, displayName, role string) (*User, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
 	}
@@ -193,7 +211,14 @@ func (s *Service) CreateUser(ctx context.Context, username, password, displayNam
 	if err != nil {
 		return nil, err
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO auth_users(id,username,password_hash,display_name,role) VALUES($1,$2,$3,$4,$5) ON CONFLICT (lower(username)) DO NOTHING`, id, username, string(hash), displayName, role)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	result, err := tx.ExecContext(ctx, `INSERT INTO auth_users(id,username,password_hash,display_name,role,disabled,created_at)
+	 VALUES($1,$2,$3,$4,$5,0,$6) ON CONFLICT (lower(username)) DO NOTHING`, id, username, string(hash), displayName, role, now)
 	if err != nil {
 		return nil, err
 	}
@@ -204,41 +229,60 @@ func (s *Service) CreateUser(ctx context.Context, username, password, displayNam
 	if n == 0 {
 		return nil, fmt.Errorf("%w: username already exists", ErrConflict)
 	}
-	return &User{ID: id, Username: username, DisplayName: displayName, Role: role}, nil
+	if err = s.writeAudit(ctx, tx, actor, ActionUserCreate, "user", id, ResultSuccess, username); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &User{ID: id, Username: username, DisplayName: displayName, Role: role, CreatedAt: now}, nil
 }
+
+func scanUser(row interface{ Scan(dest ...any) error }) (*User, error) {
+	var u User
+	var disabled int
+	if err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &disabled, &u.CreatedAt); err != nil {
+		return nil, err
+	}
+	u.Disabled = disabled != 0
+	return &u, nil
+}
+
+const userColumns = `id,username,display_name,role,disabled,created_at`
 
 func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,username,display_name,role FROM auth_users ORDER BY lower(username),id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+userColumns+` FROM auth_users ORDER BY lower(username),id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	users := make([]User, 0)
 	for rows.Next() {
-		var u User
-		if err := rows.Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role); err != nil {
+		u, err := scanUser(rows)
+		if err != nil {
 			return nil, err
 		}
-		users = append(users, u)
+		users = append(users, *u)
 	}
 	return users, rows.Err()
 }
 
 // Login keeps the original Go API for non-HTTP callers; sessions default to non-persistent.
 func (s *Service) Login(ctx context.Context, username, password string) (*Tokens, error) {
-	return s.LoginWithRemember(ctx, username, password, false)
+	return s.LoginWithRemember(ctx, username, password, false, "")
 }
 
-func (s *Service) LoginWithRemember(ctx context.Context, username, password string, remember bool) (*Tokens, error) {
+func (s *Service) LoginWithRemember(ctx context.Context, username, password string, remember bool, requestID string) (*Tokens, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
 	}
 	var u User
 	var hash string
-	err := s.db.QueryRowContext(ctx, `SELECT id,username,display_name,role,password_hash FROM auth_users WHERE lower(username)=lower($1)`, username).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &hash)
+	var disabled int
+	err := s.db.QueryRowContext(ctx, `SELECT id,username,display_name,role,password_hash,disabled FROM auth_users WHERE lower(username)=lower($1)`, username).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &hash, &disabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		// A fixed valid bcrypt hash keeps unknown-user failures comparable to bad passwords.
 		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"), []byte(password))
@@ -250,6 +294,10 @@ func (s *Service) LoginWithRemember(ctx context.Context, username, password stri
 	if len(password) > 72 || bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
 		return nil, ErrUnauthorized
 	}
+	// Only report the disabled state once the caller proved knowledge of the password.
+	if disabled != 0 {
+		return nil, ErrAccountDisabled
+	}
 	sid, err := randomToken(18)
 	if err != nil {
 		return nil, err
@@ -258,7 +306,8 @@ func (s *Service) LoginWithRemember(ctx context.Context, username, password stri
 	if err != nil {
 		return nil, err
 	}
-	expires := time.Now().Add(s.refreshTTL).Unix()
+	now := time.Now().Unix()
+	expires := now + int64(s.refreshTTL/time.Second)
 	tokens, err := s.issue(u, sid, refresh, expires, remember)
 	if err != nil {
 		return nil, err
@@ -272,10 +321,13 @@ func (s *Service) LoginWithRemember(ctx context.Context, username, password stri
 	if remember {
 		rememberInt = 1
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_sessions(id,user_id,expires_at,remember) VALUES($1,$2,$3,$4)`, sid, u.ID, expires, rememberInt); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_sessions(id,user_id,expires_at,remember,created_at) VALUES($1,$2,$3,$4,$5)`, sid, u.ID, expires, rememberInt, now); err != nil {
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_refresh_tokens(token_hash,session_id) VALUES($1,$2)`, hashToken(refresh), sid); err != nil {
+		return nil, err
+	}
+	if err = s.writeAudit(ctx, tx, Actor{ID: u.ID, Username: u.Username, RequestID: requestID}, ActionLogin, "user", u.ID, ResultSuccess, ""); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -389,8 +441,15 @@ func lockRefreshSession(ctx context.Context, tx *sql.Tx, hash string) (string, e
 }
 
 func (s *Service) Authenticate(ctx context.Context, accessToken string) (*User, error) {
+	user, _, err := s.InspectToken(ctx, accessToken)
+	return user, err
+}
+
+// InspectToken additionally returns the session id so callers can identify the
+// current session when listing or selectively revoking sessions.
+func (s *Service) InspectToken(ctx context.Context, accessToken string) (*User, string, error) {
 	if err := s.valid(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	claims := &accessClaims{}
 	token, err := jwt.ParseWithClaims(accessToken, claims, func(token *jwt.Token) (any, error) {
@@ -400,18 +459,18 @@ func (s *Service) Authenticate(ctx context.Context, accessToken string) (*User, 
 		return s.secret, nil
 	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithIssuer(Issuer), jwt.WithAudience(Audience), jwt.WithExpirationRequired(), jwt.WithIssuedAt())
 	if err != nil || !token.Valid || claims.Subject == "" || claims.SessionID == "" {
-		return nil, ErrUnauthorized
+		return nil, "", ErrUnauthorized
 	}
 	var u User
 	err = s.db.QueryRowContext(ctx, `SELECT u.id,u.username,u.display_name,u.role FROM auth_sessions s
- JOIN auth_users u ON u.id=s.user_id WHERE s.id=$1 AND s.user_id=$2 AND s.revoked=0 AND s.expires_at>$3`, claims.SessionID, claims.Subject, time.Now().Unix()).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role)
+	 JOIN auth_users u ON u.id=s.user_id WHERE s.id=$1 AND s.user_id=$2 AND s.revoked=0 AND s.expires_at>$3 AND u.disabled=0`, claims.SessionID, claims.Subject, time.Now().Unix()).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrUnauthorized
+		return nil, "", ErrUnauthorized
 	}
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return &u, nil
+	return &u, claims.SessionID, nil
 }
 
 func (s *Service) issue(u User, sid, refresh string, sessionExpires int64, remember bool) (*Tokens, error) {

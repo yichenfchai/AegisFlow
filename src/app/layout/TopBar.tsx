@@ -29,10 +29,7 @@ export function TopBar({ onOpenPalette }: { onOpenPalette?: () => void }) {
     <header className="fixed top-0 left-0 right-0 h-12 z-50 bg-surface border-b border-surface-container-highest flex items-center px-space-lg gap-space-lg">
       <div className="flex items-baseline gap-space-sm">
         <span className="text-headline-md font-semibold text-on-surface tracking-tight">
-          GoPulse
-        </span>
-        <span className="font-mono text-label-sm text-outline bg-surface-container rounded px-1">
-          v2.4
+          AegisFlow
         </span>
       </div>
 

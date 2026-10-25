@@ -17,6 +17,8 @@ import (
 const testPassword = "correct-horse-battery"
 const testSecret = "integration-test-secret-at-least-32-bytes"
 
+var testActor = Actor{ID: "actor-000000000000001", Username: "tester", RequestID: "req-test"}
+
 func testService(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()
 	db := testutil.OpenPostgres(t)
@@ -280,12 +282,12 @@ func TestUsersValidationAndCurrentRole(t *testing.T) {
 		{"valid-user", testPassword, "owner"}, {"valid-user", testPassword, "ADMIN"},
 	}
 	for _, tc := range cases {
-		if _, err := s.CreateUser(ctx, tc.username, tc.password, "", tc.role); !errors.Is(err, ErrValidation) {
+		if _, err := s.CreateUser(ctx, testActor, tc.username, tc.password, "", tc.role); !errors.Is(err, ErrValidation) {
 			t.Fatalf("CreateUser(%q,%q) error = %v", tc.username, tc.role, err)
 		}
 	}
 	for _, role := range []string{"admin", "member", "viewer"} {
-		u, err := s.CreateUser(ctx, "user-"+role, testPassword, "Display "+role, role)
+		u, err := s.CreateUser(ctx, testActor, "user-"+role, testPassword, "Display "+role, role)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -293,14 +295,14 @@ func TestUsersValidationAndCurrentRole(t *testing.T) {
 			t.Fatalf("role = %s", u.Role)
 		}
 	}
-	if _, err := s.CreateUser(ctx, "ADMIN", testPassword, "", "admin"); !errors.Is(err, ErrConflict) {
+	if _, err := s.CreateUser(ctx, testActor, "ADMIN", testPassword, "", "admin"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("duplicate error = %v", err)
 	}
 	// Length is in bytes, including multibyte passwords.
-	if _, err := s.CreateUser(ctx, "utf8-password", strings.Repeat("密", 25), "", "member"); !errors.Is(err, ErrValidation) {
+	if _, err := s.CreateUser(ctx, testActor, "utf8-password", strings.Repeat("密", 25), "", "member"); !errors.Is(err, ErrValidation) {
 		t.Fatalf("multibyte password: %v", err)
 	}
-	if _, err := s.CreateUser(ctx, "max-password", strings.Repeat("a", 72), "", "viewer"); err != nil {
+	if _, err := s.CreateUser(ctx, testActor, "max-password", strings.Repeat("a", 72), "", "viewer"); err != nil {
 		t.Fatalf("72 byte password rejected: %v", err)
 	}
 	tokens := loginTest(t, s)

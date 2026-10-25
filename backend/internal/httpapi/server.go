@@ -24,6 +24,18 @@ type contextKey int
 
 const requestIDKey contextKey = 0
 const userKey = "authenticatedUser"
+const sessionIDKey = "authenticatedSessionID"
+
+func currentSessionID(c *gin.Context) string {
+	value, _ := c.Get(sessionIDKey)
+	id, _ := value.(string)
+	return id
+}
+
+func requestID(c *gin.Context) string {
+	id, _ := c.Request.Context().Value(requestIDKey).(string)
+	return id
+}
 
 type Server struct {
 	auth         *auth.Service
@@ -80,9 +92,17 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	authRoutes.POST("/refresh", s.refresh)
 	authRoutes.POST("/logout", s.logout)
 	authRoutes.GET("/me", s.authenticate(), s.me)
+	authRoutes.POST("/password", s.authenticate(), s.changePassword)
+	authRoutes.GET("/sessions", s.authenticate(), s.listSessions)
+	authRoutes.DELETE("/sessions", s.authenticate(), s.revokeOtherSessions)
+	authRoutes.DELETE("/sessions/:id", s.authenticate(), s.revokeSession)
 	users := api.Group("/users", s.authenticate(), s.requireAdmin())
 	users.GET("", s.listUsers)
 	users.POST("", s.createUser)
+	users.PATCH("/:id", s.updateUser)
+	users.POST("/:id/password-reset", s.resetPassword)
+	audit := api.Group("/audit", s.authenticate(), s.requireAdmin())
+	audit.GET("", s.listAudit)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }
@@ -119,7 +139,7 @@ func (s *Server) login(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	tokens, err := s.auth.LoginWithRemember(ctx, input.Username, input.Password, input.Remember)
+	tokens, err := s.auth.LoginWithRemember(ctx, input.Username, input.Password, input.Remember, requestID(c))
 	s.logger.InfoContext(ctx, "auth.login", "requestId", ctx.Value(requestIDKey), "success", err == nil)
 	if err != nil {
 		s.authError(c, err)
@@ -190,12 +210,13 @@ func (s *Server) authenticate() gin.HandlerFunc {
 			s.fail(c, 401, "unauthorized", "valid bearer token required")
 			return
 		}
-		user, err := s.auth.Authenticate(c.Request.Context(), parts[1])
+		user, sid, err := s.auth.InspectToken(c.Request.Context(), parts[1])
 		if err != nil {
 			s.authError(c, err)
 			return
 		}
 		c.Set(userKey, user)
+		c.Set(sessionIDKey, sid)
 		c.Next()
 	}
 }
@@ -210,13 +231,46 @@ func (s *Server) requireAdmin() gin.HandlerFunc {
 }
 func currentUser(c *gin.Context) *auth.User { return c.MustGet(userKey).(*auth.User) }
 func (s *Server) me(c *gin.Context)         { s.respond(c, 200, currentUser(c)) }
+
+// actorFrom builds the audit actor of the authenticated caller.
+func actorFrom(c *gin.Context) auth.Actor {
+	user := currentUser(c)
+	return auth.Actor{ID: user.ID, Username: user.Username, RequestID: requestID(c)}
+}
+
+// page parses shared limit/offset pagination; the response reports it back.
+func (s *Server) page(c *gin.Context) (int, int, bool) {
+	limit, offset := 20, 0
+	if value := c.Query("limit"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 100 {
+			s.fail(c, 400, "invalid_request", "limit must be an integer between 1 and 100")
+			return 0, 0, false
+		}
+		limit = n
+	}
+	if value := c.Query("offset"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 {
+			s.fail(c, 400, "invalid_request", "offset must be a non-negative integer")
+			return 0, 0, false
+		}
+		offset = n
+	}
+	return limit, offset, true
+}
+
 func (s *Server) listUsers(c *gin.Context) {
-	users, err := s.auth.ListUsers(c.Request.Context())
+	limit, offset, ok := s.page(c)
+	if !ok {
+		return
+	}
+	users, total, err := s.auth.ListUsersPage(c.Request.Context(), limit, offset)
 	if err != nil {
 		s.authError(c, err)
 		return
 	}
-	s.respond(c, 200, users)
+	s.respond(c, 200, gin.H{"items": users, "total": total, "limit": limit, "offset": offset})
 }
 func (s *Server) createUser(c *gin.Context) {
 	var input struct {
@@ -229,13 +283,121 @@ func (s *Server) createUser(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	user, err := s.auth.CreateUser(ctx, input.Username, input.Password, input.DisplayName, input.Role)
+	user, err := s.auth.CreateUser(ctx, actorFrom(c), input.Username, input.Password, input.DisplayName, input.Role)
 	s.logger.InfoContext(ctx, "auth.create_user", "actorId", currentUser(c).ID, "requestId", ctx.Value(requestIDKey), "success", err == nil)
 	if err != nil {
 		s.authError(c, err)
 		return
 	}
 	s.respond(c, 201, user)
+}
+
+func (s *Server) updateUser(c *gin.Context) {
+	id := c.Param("id")
+	if !auth.ValidID(id) {
+		s.fail(c, 400, "invalid_request", "invalid user id")
+		return
+	}
+	var input struct {
+		Role     *string `json:"role"`
+		Disabled *bool   `json:"disabled"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	if input.Role == nil && input.Disabled == nil {
+		s.fail(c, 400, "invalid_request", "at least one of role or disabled is required")
+		return
+	}
+	ctx := c.Request.Context()
+	actor := actorFrom(c)
+	// Role and disabled change together in one transaction; a rejection leaves both unchanged.
+	if err := s.auth.UpdateUser(ctx, actor, id, input.Role, input.Disabled); err != nil {
+		s.authError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"updated": true})
+}
+
+func (s *Server) resetPassword(c *gin.Context) {
+	id := c.Param("id")
+	if !auth.ValidID(id) {
+		s.fail(c, 400, "invalid_request", "invalid user id")
+		return
+	}
+	var input struct {
+		Password string `json:"password"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	if err := s.auth.ResetPassword(c.Request.Context(), actorFrom(c), id, input.Password); err != nil {
+		s.authError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"reset": true})
+}
+
+func (s *Server) listAudit(c *gin.Context) {
+	limit, offset, ok := s.page(c)
+	if !ok {
+		return
+	}
+	entries, total, err := s.auth.ListAudit(c.Request.Context(), limit, offset)
+	if err != nil {
+		s.authError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": entries, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *Server) changePassword(c *gin.Context) {
+	var input struct {
+		CurrentPassword string `json:"currentPassword"`
+		NewPassword     string `json:"newPassword"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	user := currentUser(c)
+	if err := s.auth.ChangePassword(c.Request.Context(), actorFrom(c), user.ID, input.CurrentPassword, input.NewPassword, currentSessionID(c)); err != nil {
+		s.authError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"changed": true})
+}
+
+func (s *Server) listSessions(c *gin.Context) {
+	user := currentUser(c)
+	sessions, err := s.auth.ListSessions(c.Request.Context(), user.ID, currentSessionID(c))
+	if err != nil {
+		s.authError(c, err)
+		return
+	}
+	s.respond(c, 200, sessions)
+}
+
+func (s *Server) revokeSession(c *gin.Context) {
+	id := c.Param("id")
+	if !auth.ValidID(id) {
+		s.fail(c, 400, "invalid_request", "invalid session id")
+		return
+	}
+	if err := s.auth.RevokeSession(c.Request.Context(), actorFrom(c), currentUser(c).ID, id); err != nil {
+		s.authError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"revoked": true})
+}
+
+func (s *Server) revokeOtherSessions(c *gin.Context) {
+	user := currentUser(c)
+	revoked, err := s.auth.RevokeOtherSessions(c.Request.Context(), actorFrom(c), user.ID, currentSessionID(c))
+	if err != nil {
+		s.authError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"revoked": revoked})
 }
 
 // Keep strict per-request decoding rather than changing Gin's global binding settings.
@@ -291,6 +453,10 @@ func (s *Server) authError(c *gin.Context, err error) {
 		s.fail(c, 409, "conflict", "username already exists")
 	case errors.Is(err, auth.ErrValidation):
 		s.fail(c, 400, "validation_failed", "username must be 3-64 ASCII letters, digits, underscore, dot or hyphen; password 12-72 bytes; role admin/member/viewer")
+	case errors.Is(err, auth.ErrNotFound):
+		s.fail(c, 404, "not_found", "resource not found")
+	case errors.Is(err, auth.ErrAccountDisabled):
+		s.fail(c, 403, "account_disabled", "account is disabled; contact an administrator")
 	default:
 		s.logger.ErrorContext(c.Request.Context(), "request failed", "requestId", c.Request.Context().Value(requestIDKey), "error", err)
 		s.fail(c, 500, "internal_error", "internal server error")

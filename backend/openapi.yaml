@@ -40,6 +40,8 @@ tags:
     description: Browser Cookie session lifecycle and Bearer identity
   - name: Users
     description: Administrator-only local user management
+  - name: Audit
+    description: Persistent authentication and account-management audit trail
   - name: Health
     description: Process liveness and database readiness
 paths:
@@ -105,7 +107,7 @@ paths:
       tags: [Auth]
       operationId: login
       summary: Authenticate credentials and set refresh cookie
-      description: Username lookup is case-insensitive. All attempts count toward the Redis shared IP limit (10/minute across instances). Only configured trusted proxy CIDRs may supply X-Forwarded-For. Redis failure returns 503 without local fallback. Invalid credentials return the same 401. No public registration.
+      description: Username lookup is case-insensitive. All attempts count toward the Redis shared IP limit (10/minute across instances). Only configured trusted proxy CIDRs may supply X-Forwarded-For. Redis failure returns 503 without local fallback. Invalid credentials return the same 401. A correct password for a disabled account returns 403 account_disabled (state is never revealed without password knowledge). No public registration.
       parameters:
         - { $ref: '#/components/parameters/AuthOrigin' }
       requestBody:
@@ -212,17 +214,58 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '500': { $ref: '#/components/responses/InternalError' }
-  /api/v1/users:
+  /api/v1/auth/password:
+    post:
+      tags: [Auth]
+      operationId: changePassword
+      summary: Change the caller's own password
+      description: |
+        Verifies currentPassword against the stored bcrypt hash. On success the
+        hash is replaced and every session except the caller's current session
+        is revoked; the current session stays usable and is audited. Wrong
+        current password returns 401 and is recorded as a failure audit row.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/AuthOrigin' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePasswordInput' }
+      responses:
+        '200':
+          description: Password changed; other sessions revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [changed]
+                    properties:
+                      changed: { type: boolean, enum: [true] }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/auth/sessions:
     get:
-      tags: [Users]
-      operationId: listUsers
-      summary: List users (admin only)
-      description: Ordered by username case-insensitively, then id; empty list is []. Password hashes are never included.
+      tags: [Auth]
+      operationId: listSessions
+      summary: List the caller's active sessions
+      description: Active (non-revoked, unexpired) sessions with the current one marked. Token hashes are never exposed.
       security:
         - bearerAuth: []
       responses:
         '200':
-          description: Users
+          description: Sessions, newest first
           content:
             application/json:
               schema:
@@ -232,8 +275,96 @@ paths:
                 properties:
                   data:
                     type: array
-                    items: { $ref: '#/components/schemas/User' }
+                    items: { $ref: '#/components/schemas/SessionInfo' }
                   requestId: { $ref: '#/components/schemas/RequestID' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Auth]
+      operationId: revokeOtherSessions
+      summary: Revoke all of the caller's sessions except the current one
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Count of revoked sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [revoked]
+                    properties:
+                      revoked: { type: integer, minimum: 0 }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/auth/sessions/{sessionId}:
+    delete:
+      tags: [Auth]
+      operationId: revokeSession
+      summary: Revoke one of the caller's own sessions
+      description: Unknown or foreign session ids return 404. Revoking an already-revoked own session is an idempotent 200.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Session revoked (or already inactive)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [revoked]
+                    properties:
+                      revoked: { type: boolean, enum: [true] }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/users:
+    get:
+      tags: [Users]
+      operationId: listUsers
+      summary: List users (admin only)
+      description: Ordered by username case-insensitively, then id; empty list is []. Password hashes are never included.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: Users page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/UserPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '500': { $ref: '#/components/responses/InternalError' }
@@ -261,6 +392,128 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/users/{userId}:
+    patch:
+      tags: [Users]
+      operationId: updateUser
+      summary: Change role or disabled state (admin only)
+      description: |
+        At least one of role or disabled is required. Disabling revokes all of
+        the target's sessions immediately; the disabled state is only revealed
+        by login after a correct password. Role changes apply to existing
+        sessions immediately because roles are read live per request. Disabling
+        or demoting the last enabled administrator returns 400. No-op updates
+        (same role, same state) return 200 without an audit row. Both fields
+        may be supplied; role is applied first.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateUserInput' }
+      responses:
+        '200':
+          description: Updated (or already in the requested state)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [updated]
+                    properties:
+                      updated: { type: boolean, enum: [true] }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/users/{userId}/password-reset:
+    post:
+      tags: [Users]
+      operationId: resetPassword
+      summary: Set a new password for any user (admin only)
+      description: Replaces the password and revokes every session of the target user, including the caller's own sessions when targeting self.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResetPasswordInput' }
+      responses:
+        '200':
+          description: Password reset; target sessions revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [reset]
+                    properties:
+                      reset: { type: boolean, enum: [true] }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/audit:
+    get:
+      tags: [Audit]
+      operationId: listAudit
+      summary: Query the persistent audit trail (admin only)
+      description: |
+        Newest first. Records actor, action, object, result, detail and the
+        X-Request-ID of audited operations: login success, user create,
+        password change (including wrong-current-password failures), password
+        reset, disable/enable, role change, and session revocation. Failed
+        logins are rate-limited and stay in structured logs only. Retention
+        policy arrives with the business audit milestone.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: Audit page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/AuditPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
 components:
   securitySchemes:
     bearerAuth:
@@ -280,6 +533,18 @@ components:
       required: true
       description: Exactly one browser Origin, matching AEGIS_ALLOWED_ORIGINS exactly; required on all auth POSTs even same-origin and scripts
       schema: { type: string, example: 'http://localhost:5173' }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size, default 20, between 1 and 100
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Offset:
+      name: offset
+      in: query
+      required: false
+      description: Zero-based page offset
+      schema: { type: integer, minimum: 0, default: 0 }
   requestBodies:
     EmptyObject:
       required: true
@@ -312,7 +577,7 @@ components:
     User:
       type: object
       additionalProperties: false
-      required: [id, username, displayName, role]
+      required: [id, username, displayName, role, disabled, createdAt]
       properties:
         id: { type: string }
         username: { $ref: '#/components/schemas/Username' }
@@ -320,6 +585,13 @@ components:
           type: string
           description: Valid UTF-8, at most 256 bytes
         role: { type: string, enum: [admin, member, viewer] }
+        disabled:
+          type: boolean
+          description: Disabled accounts cannot log in and have no active sessions
+        createdAt:
+          type: integer
+          format: int64
+          description: Unix seconds; 0 means unknown for rows created before the account-management migration
     Username:
       type: string
       minLength: 3
@@ -358,6 +630,76 @@ components:
         user: { $ref: '#/components/schemas/User' }
         accessToken: { type: string, description: Short-lived Bearer JWT; keep in memory }
         expiresIn: { type: integer, format: int64, minimum: 1, description: 'Access lifetime in seconds, capped by the absolute session deadline' }
+    ChangePasswordInput:
+      type: object
+      additionalProperties: false
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword: { type: string, format: password, writeOnly: true }
+        newPassword: { $ref: '#/components/schemas/Password' }
+    UpdateUserInput:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        role: { type: string, enum: [admin, member, viewer] }
+        disabled: { type: boolean }
+    ResetPasswordInput:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password: { $ref: '#/components/schemas/Password' }
+    SessionInfo:
+      type: object
+      additionalProperties: false
+      required: [id, createdAt, expiresAt, remember, current]
+      properties:
+        id: { type: string, description: 'Opaque session identifier, not a token' }
+        createdAt:
+          type: integer
+          format: int64
+          description: Unix seconds; 0 means unknown for pre-migration sessions
+        expiresAt: { type: integer, format: int64, description: 'Absolute Unix deadline, never extended by rotation' }
+        remember: { type: boolean }
+        current: { type: boolean, description: True for the session that issued the request }
+    UserPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/User' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
+    AuditEntry:
+      type: object
+      additionalProperties: false
+      required: [id, createdAt, actorId, actorUsername, action, objectType, objectId, result, detail, requestId]
+      properties:
+        id: { type: string }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+        actorId: { type: string, description: Empty for system rows }
+        actorUsername: { type: string }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all] }
+        objectType: { type: string, enum: [user, session] }
+        objectId: { type: string }
+        result: { type: string, enum: [success, failure] }
+        detail: { type: string, description: Safe context such as role transitions or revoked counts; never secrets }
+        requestId: { type: string, description: Links to the structured request log }
+    AuditPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AuditEntry' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
     ErrorEnvelope:
       type: object
       additionalProperties: false
@@ -370,7 +712,7 @@ components:
           properties:
             code:
               type: string
-              enum: [invalid_request, validation_failed, unauthorized, forbidden, origin_denied, conflict, unsupported_media_type, rate_limited, not_found, not_ready, dependencies_unavailable, internal_error]
+              enum: [invalid_request, validation_failed, unauthorized, forbidden, account_disabled, origin_denied, conflict, unsupported_media_type, rate_limited, not_found, not_ready, dependencies_unavailable, internal_error]
             message: { type: string, description: Human-readable safe detail; clients should branch on code/status }
         requestId: { $ref: '#/components/schemas/RequestID' }
   responses:
@@ -412,7 +754,12 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
     Forbidden:
-      description: Missing/disallowed auth Origin or cross-site request (origin_denied), or non-admin user (forbidden)
+      description: Missing/disallowed auth Origin or cross-site request (origin_denied), non-admin user (forbidden), or disabled account login (account_disabled)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    NotFound:
+      description: Unknown resource id; error.code is not_found
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }

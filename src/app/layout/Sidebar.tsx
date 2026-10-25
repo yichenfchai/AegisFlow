@@ -1,8 +1,10 @@
 import { NavLink } from 'react-router'
 import { NAV_GROUPS } from './nav'
 import { Icon } from '@/components/ui/Icon'
+import { useSession } from '@/stores/session'
 
 export function Sidebar() {
+  const { user } = useSession()
   return (
     <aside className="fixed left-0 top-12 bottom-7 w-[200px] z-40 bg-surface-container-low border-r border-surface-container-highest flex flex-col justify-between overflow-y-auto">
       <div className="py-space-md px-space-xs space-y-space-md">
@@ -40,7 +42,7 @@ export function Sidebar() {
       </div>
       <div className="py-space-md px-space-xs border-t border-surface-container-highest">
         <NavLink
-          to="/settings"
+          to="/account"
           className={({ isActive }) =>
             `flex items-center gap-space-md px-space-sm py-[5px] mx-space-xs rounded text-body-md transition-colors ${
               isActive
@@ -49,16 +51,24 @@ export function Sidebar() {
             }`
           }
         >
-          <Icon name="settings" size={16} />
-          设置
+          <Icon name="shield_lock" size={16} />
+          账号安全
         </NavLink>
-        <a
-          href="#"
-          className="flex items-center gap-space-md px-space-sm py-[5px] mx-space-xs rounded text-body-md text-on-surface-variant hover:bg-surface-container hover:text-on-surface"
-        >
-          <Icon name="terminal" size={16} />
-          CLI
-        </a>
+        {user?.role === 'admin' && (
+          <NavLink
+            to="/settings"
+            className={({ isActive }) =>
+              `flex items-center gap-space-md px-space-sm py-[5px] mx-space-xs rounded text-body-md transition-colors ${
+                isActive
+                  ? 'bg-surface-container-high text-on-surface font-medium'
+                  : 'text-on-surface-variant hover:bg-surface-container hover:text-on-surface'
+              }`
+            }
+          >
+            <Icon name="settings" size={16} />
+            用户与审计
+          </NavLink>
+        )}
       </div>
     </aside>
   )

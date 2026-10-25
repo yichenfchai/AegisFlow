@@ -14,12 +14,19 @@
 
 | 接口 | 请求 | 响应及效果 |
 | --- | --- | --- |
-| POST /api/v1/auth/login | JSON username/password/remember | data.user/accessToken/expiresIn；设置 refresh Cookie |
+| POST /api/v1/auth/login | JSON username/password/remember | data.user/accessToken/expiresIn；设置 refresh Cookie；禁用账号密码正确时 403 account_disabled |
 | POST /api/v1/auth/refresh | JSON {}，携带 Cookie | 轮换 Cookie，返回新 accessToken 和服务端用户 |
 | POST /api/v1/auth/logout | JSON {}，携带 Cookie | 撤销整个会话并删除 Cookie；幂等 |
 | GET /api/v1/auth/me | Bearer accessToken | 读取数据库会话与用户当前角色 |
-| GET /api/v1/users | 管理员 Bearer | 用户列表，不返回密码哈希 |
+| POST /api/v1/auth/password | Bearer，JSON currentPassword/newPassword | 修改自己密码；撤销除当前会话外的全部会话；当前密码错误返回 401 并记入审计 |
+| GET /api/v1/auth/sessions | Bearer | 自己的活跃会话列表，标记当前会话；不返回任何令牌 |
+| DELETE /api/v1/auth/sessions | Bearer | 撤销除当前会话外的全部会话，返回撤销数量 |
+| DELETE /api/v1/auth/sessions/{id} | Bearer | 撤销自己的指定会话；未知或他人会话 404，重复撤销幂等成功 |
+| GET /api/v1/users | 管理员 Bearer，limit/offset | 用户分页 {items,total,limit,offset}，不返回密码哈希 |
 | POST /api/v1/users | 管理员 Bearer，JSON 用户字段 | 创建用户，返回 201 |
+| PATCH /api/v1/users/{id} | 管理员 Bearer，JSON role/disabled 至少一项 | 变更角色或禁用状态；禁用立即撤销该用户全部会话 |
+| POST /api/v1/users/{id}/password-reset | 管理员 Bearer，JSON password | 重置密码并撤销该用户全部会话 |
+| GET /api/v1/audit | 管理员 Bearer，limit/offset | 审计分页查询，最新在前 |
 
 accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh token 不返回 JSON，由 HttpOnly、SameSite=Strict、Path=/api/v1/auth 的 Cookie 保存，无 Domain。勾选保持登录时 Cookie 持久化到绝对会话期限，未勾选使用 session Cookie；浏览器恢复会话可能保留 session Cookie，因此不承诺关闭窗口立即退出。主动退出以服务端撤销为准。默认绝对期限 30 天，由后端配置决定，刷新不延长。
 
@@ -34,18 +41,26 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 5. refresh 返回 401 时清空内存并回到登录。网络失败可重试，不把断网误判为账号失效。
 6. 退出等待服务端撤销成功才清理状态；网络失败提示重试，不显示虚假退出成功。账号切换和退出清理 React Query 缓存。
 
+## 账号管理、审计与过期清理
+
+- 修改自己密码需验证当前密码，成功后仅保留当前会话；管理员重置密码会撤销目标用户全部会话。两者都要求新密码 12-72 字节。
+- 禁用账号立即撤销其全部会话并阻止登录；禁用状态只在密码正确时通过 403 account_disabled 透露，不会成为账号枚举信号。重新启用不恢复旧会话。
+- 角色为全局角色，每次鉴权实时读取数据库，角色变更对既有会话即时生效，无需撤销会话。禁用或降级最后一个可用管理员被拒绝（400），防止系统失去管理入口。
+- 持久化审计记录操作人（ID/用户名）、时间、动作、对象、结果、详情与请求 ID：登录成功、创建用户、修改密码（含当前密码错误的失败记录）、重置密码、禁用/启用、角色变更、会话撤销。失败登录受 Redis 限流约束，只进结构化日志不进审计表；审计保留策略待业务审计里程碑（P4）设计。审计查询仅管理员。
+- 过期会话及其 refresh 令牌历史由后台任务每小时清理（启动时先执行一次）。重放检测只需保留到会话绝对期限，到期即删；清理不影响活跃会话。
+
 ## 角色矩阵
 
-下面是首版权限约定。除已提供的鉴权与用户接口，其他服务尚未实现；页面守卫用于交互，不能代替后端对象级授权。项目级成员与多租户暂不支持，首版角色为全局角色。
+下面是首版权限约定。除已提供的鉴权、账号管理与审计接口，其他服务尚未实现；页面守卫用于交互，不能代替后端对象级授权。项目级成员与多租户暂不支持，首版角色为全局角色。
 
 | 操作 | admin | member | viewer | 实现状态 |
 | --- | --- | --- | --- | --- |
-| 读取自己的资料、退出 | 允许 | 允许 | 允许 | 已实现 |
-| 创建/查询用户 | 允许 | 禁止 | 禁止 | 已实现 |
+| 读取自己的资料、退出、修改自己密码、查看/撤销自己的会话 | 允许 | 允许 | 允许 | 已实现 |
+| 创建/查询用户、重置密码、禁用/启用、变更角色、查询审计 | 允许 | 禁止 | 禁止 | 已实现 |
 | 读取项目/构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 后续业务接口落实 |
 | 创建/修改项目、发起/取消构建、发起审查 | 允许 | 允许 | 禁止 | 后续业务接口落实 |
 | 发起部署、回滚及执行审批 | 允许 | 禁止 | 禁止 | 后续业务接口落实 |
-| 管理部署目标、密钥、策略、设置、防御及查询审计 | 允许 | 禁止 | 禁止 | 当前页面守卫，业务服务待实现 |
+| 管理部署目标、密钥、策略、设置、防御及业务审计 | 允许 | 禁止 | 禁止 | 页面明确标记未实现，业务服务待实现 |
 
 后续对象涉及具体项目时，需在服务端查询对象所属项目并校验访问权限。不要根据客户端提交的 role 或隐藏按钮决定授权。
 
@@ -53,6 +68,6 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 VITE_ENABLE_BUSINESS_MOCKS=false 是默认：业务服务未接入时明确显示状态；只有显式设 true 才显示业务演示数据。两种模式的登录都是真实鉴权，mock 从来不是认证回退。
 
-后端验证：go test ./...、go vet ./...。前端验证：npm run build、npm run lint。浏览器验证：先 npx playwright install chromium，再 npm run test:e2e；先设置 AEGIS_TEST_DATABASE_URL/AEGIS_TEST_REDIS_URL 运行后端真实集成测试；浏览器测试需另设置 AEGIS_E2E_DATABASE_URL/AEGIS_E2E_REDIS_URL 指向专用可丢弃服务，测试启动本地前后端，要求 8080、5173 端口空闲。测试账号仅存在测试临时库；端到端配置使用随机 JWT 密钥，不使用生产数据。
+后端验证：go test ./...、go vet ./...。前端验证：npm run build、npm run lint、npm test（session store 单元测试）。浏览器验证：先 npx playwright install chromium，再 npm run test:e2e；先设置 AEGIS_TEST_DATABASE_URL/AEGIS_TEST_REDIS_URL 运行后端真实集成测试；浏览器测试需另设置 AEGIS_E2E_DATABASE_URL/AEGIS_E2E_REDIS_URL 指向专用可丢弃服务，测试启动本地前后端，要求 8080、5173 端口空闲。测试账号仅存在测试临时库；端到端配置使用随机 JWT 密钥，不使用生产数据。
 
-验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫。剩余构建执行、生产备份、持久审计及账户管理见 [TODO](../TODO.md)。
+验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出。剩余构建执行、生产备份及业务审计见 [TODO](../TODO.md)。
