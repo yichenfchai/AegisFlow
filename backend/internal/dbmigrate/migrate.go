@@ -60,6 +60,34 @@ var Migrations = [][]string{{
 	 updated_at BIGINT NOT NULL)`,
 	`CREATE UNIQUE INDEX projects_name_lower_idx ON projects(lower(name))`,
 	`CREATE INDEX projects_status_name_idx ON projects(status, lower(name))`,
+}, {
+	// Build pipeline (P3 first slice): per-project build counter and command
+	// snapshot, build records with an interrupted terminal state for restart
+	// recovery, and log events whose global monotonic id doubles as the
+	// client resume cursor. Single-instance worker boundary documented in the
+	// builds package; SKIP LOCKED claiming already serializes instances.
+	`ALTER TABLE projects ADD COLUMN build_count BIGINT NOT NULL DEFAULT 0`,
+	`ALTER TABLE projects ADD COLUMN build_command TEXT NOT NULL DEFAULT ''`,
+	`CREATE TABLE builds (
+	 id TEXT PRIMARY KEY,
+	 project_id TEXT NOT NULL REFERENCES projects(id),
+	 build_number BIGINT NOT NULL,
+	 status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed','cancelled','interrupted')),
+	 branch TEXT NOT NULL DEFAULT '',
+	 command TEXT NOT NULL,
+	 triggered_by TEXT NOT NULL DEFAULT '',
+	 created_at BIGINT NOT NULL,
+	 started_at BIGINT NOT NULL DEFAULT 0,
+	 finished_at BIGINT NOT NULL DEFAULT 0)`,
+	`CREATE UNIQUE INDEX builds_project_number_idx ON builds(project_id, build_number)`,
+	`CREATE INDEX builds_created_idx ON builds(created_at DESC, id)`,
+	`CREATE TABLE build_log_events (
+	 id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+	 build_id TEXT NOT NULL REFERENCES builds(id),
+	 stream TEXT NOT NULL CHECK(stream IN ('stdout','stderr','system')),
+	 message TEXT NOT NULL,
+	 created_at BIGINT NOT NULL)`,
+	`CREATE INDEX build_log_events_build_idx ON build_log_events(build_id, id)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped

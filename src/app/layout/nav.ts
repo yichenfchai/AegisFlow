@@ -11,8 +11,8 @@ export interface NavGroup {
 }
 
 /**
- * 侧边栏导航。除项目/构建主线为 BusinessGate 演示外，其余业务页面当前为
- * 明确的未实现占位；账号安全与用户管理（管理员）为真实接口。
+ * 侧边栏导航。项目、构建、账号安全与用户管理（管理员）为真实接口；其余业务
+ * 页面当前为明确的未实现占位。
  */
 export const NAV_GROUPS: NavGroup[] = [
   {

@@ -98,6 +98,24 @@ func TestRedisSharedQuotaAtomicTTLAndHashedKey(t *testing.T) {
 	}
 }
 
+func TestRedisConfiguredQuota(t *testing.T) {
+	a, _, namespace := redisClients(t)
+	const limit = 3
+	l := NewWithLimit(a, namespace, limit)
+	ctx := context.Background()
+	ip := "203.0.113.9"
+	key := l.redisKey(ip)
+	t.Cleanup(func() { a.Del(context.Background(), key) })
+	for i := 0; i < limit; i++ {
+		if ok, _, err := l.Allow(ctx, ip); err != nil || !ok {
+			t.Fatalf("admission %d: %v %v", i, ok, err)
+		}
+	}
+	if ok, _, err := l.Allow(ctx, ip); ok || err != nil {
+		t.Fatalf("configured quota not enforced: %v %v", ok, err)
+	}
+}
+
 func TestRedisErrorsFailClosed(t *testing.T) {
 	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	client.Close()

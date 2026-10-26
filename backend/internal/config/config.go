@@ -15,10 +15,10 @@ import (
 
 type Config struct {
 	Address, DatabaseURL, RedisURL, RedisNamespace, JWTSecret, BootstrapUsername, BootstrapPassword string
-	DBMaxOpen, DBMaxIdle                                                                            int
+	DBMaxOpen, DBMaxIdle, LoginRateLimit                                                            int
 	TrustedProxies                                                                                  []string
 	AllowedOrigins                                                                                  []string
-	AccessTTL, RefreshTTL                                                                           time.Duration
+	AccessTTL, RefreshTTL, BuildTimeout                                                             time.Duration
 	CookieSecure                                                                                    bool
 }
 
@@ -49,6 +49,13 @@ func Load() (Config, error) {
 	}
 	if c.DBMaxIdle > c.DBMaxOpen {
 		return c, errors.New("AEGIS_DB_MAX_IDLE must not exceed AEGIS_DB_MAX_OPEN")
+	}
+	// Login quota per client address and minute. The default stays at the
+	// production value; test environments with several accounts on one
+	// address raise it explicitly instead of bypassing the shared limiter.
+	c.LoginRateLimit, poolErr = positiveInt("AEGIS_LOGIN_RATE_LIMIT", "10")
+	if poolErr != nil {
+		return c, poolErr
 	}
 	for _, cidr := range strings.Split(os.Getenv("AEGIS_TRUSTED_PROXIES"), ",") {
 		cidr = strings.TrimSpace(cidr)
@@ -90,6 +97,14 @@ func Load() (Config, error) {
 	}
 	if c.AccessTTL > time.Hour || c.RefreshTTL <= c.AccessTTL {
 		return c, errors.New("access TTL must be <= 1h and refresh TTL must exceed access TTL")
+	}
+	// Build execution bound; the worker kills processes past it.
+	c.BuildTimeout, err = duration("AEGIS_BUILD_TIMEOUT", "10m")
+	if err != nil {
+		return c, err
+	}
+	if c.BuildTimeout > 24*time.Hour {
+		return c, errors.New("AEGIS_BUILD_TIMEOUT must be at most 24h")
 	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {
 		origin = strings.TrimSpace(origin)

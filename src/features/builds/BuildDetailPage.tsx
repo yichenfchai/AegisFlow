@@ -1,113 +1,263 @@
-import { useEffect, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useEffect, useRef, useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router'
-import { api } from '@/api'
-import { startLogStream } from '@/api/mock/logSimulator'
-import { PageHeader, Button } from '@/components/ui/DataTable'
-import { StatusBadge, ConfidenceMeter } from '@/components/ui/Badge'
-import { Icon } from '@/components/ui/Icon'
+import { Button, PageHeader } from '@/components/ui/DataTable'
+import { StatusBadge } from '@/components/ui/Badge'
 import { LogViewer } from '@/components/domain/LogViewer'
-import { StageTimeline } from '@/components/domain/StageTimeline'
+import {
+  buildsAPI,
+  BUILD_STATUS_TEXT,
+  BUILD_STATUS_TONE,
+  type BuildStatus,
+} from '@/api/builds'
+import { projectsAPI } from '@/api/projects'
+import { ApiError } from '@/api/http'
 import { fmtRel } from '@/api/format'
-import type { BuildStage, LogLine } from '@/api/types'
+import { useSession } from '@/stores/session'
+import type { LogLine } from '@/api/types'
 
-/** 薄 hook：mock 层日志流的 React 绑定（接真实后端后改走 useSSE） */
-function useLogSimulator(buildId: string, failed: boolean) {
-  const [lines, setLines] = useState<LogLine[]>([])
+const TERMINAL_STATUSES: BuildStatus[] = ['succeeded', 'failed', 'cancelled', 'interrupted']
+/** 未结束的构建（排队/运行）用短周期刷新；终态停止。 */
+const STATUS_POLL_MS = 1500
+const LOG_POLL_MS = 1000
+/**
+ * 终态先落库、最后一批日志随后 flush（后端用独立的 5s 背景上下文），
+ * 所以状态结束后仍以固定上限继续读一段日志，避免丢掉收尾行。
+ */
+const LOG_TAIL_GRACE_MS = 6000
 
-  useEffect(() => {
-    setLines([])
-    return startLogStream(failed, (line) => setLines((prev) => [...prev, line]))
-  }, [buildId, failed])
+const isTerminal = (status: BuildStatus) => TERMINAL_STATUSES.includes(status)
 
-  return lines
+function opError(cause: unknown): string {
+  if (cause instanceof ApiError) {
+    if (cause.status === 409) return '构建已结束，无法取消'
+    if (cause.status === 403) return '当前角色没有取消构建的权限'
+    if (cause.status === 404) return '构建不存在或已被清理'
+    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
+  }
+  return cause instanceof Error ? cause.message : '操作失败，请稍后重试'
 }
 
+const emptyLogs: LogLine[] = []
+
+interface LogState {
+  buildID: string
+  lines: LogLine[]
+  error: string
+}
+
+/**
+ * 按游标累积构建日志：after 取上一条事件 id，只追加新事件，不整页重刷。
+ * cursor 用 ref 保存，轮询循环不因状态变化重启；终态后继续读满宽限期。
+ */
+function useBuildLogs(buildID: string, terminal: boolean) {
+  const [state, setState] = useState<LogState>({ buildID, lines: emptyLogs, error: '' })
+  const cursor = useRef(0)
+  const terminalRef = useRef(terminal)
+
+  useEffect(() => {
+    terminalRef.current = terminal
+  }, [terminal])
+
+  useEffect(() => {
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let tailDeadline = 0
+    cursor.current = 0
+
+    const poll = async () => {
+      try {
+        const page = await buildsAPI.logs(buildID, cursor.current)
+        if (cancelled) return
+        if (page.items.length > 0) cursor.current = page.items[page.items.length - 1].id
+        setState((prev) => {
+          // 切换构建时直接以空列表重建，不依赖 effect 里的同步重置。
+          const lines = prev.buildID === buildID ? prev.lines : emptyLogs
+          const added = page.items.map((event, index) => ({
+            seq: lines.length + index + 1,
+            stream: event.stream,
+            content: event.message,
+            ts: event.createdAt,
+          }))
+          return { buildID, lines: [...lines, ...added], error: '' }
+        })
+      } catch (cause) {
+        if (cancelled) return
+        setState((prev) => ({
+          buildID,
+          lines: prev.buildID === buildID ? prev.lines : emptyLogs,
+          error: cause instanceof Error ? cause.message : '日志加载失败',
+        }))
+      }
+      if (cancelled) return
+      if (!terminalRef.current) {
+        tailDeadline = 0
+      } else {
+        if (tailDeadline === 0) tailDeadline = Date.now() + LOG_TAIL_GRACE_MS
+        if (Date.now() >= tailDeadline) return
+      }
+      timer = setTimeout(poll, LOG_POLL_MS)
+    }
+
+    void poll()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [buildID])
+
+  return state.buildID === buildID
+    ? { lines: state.lines, error: state.error }
+    : { lines: emptyLogs, error: '' }
+}
+
+/** 构建详情（真实接口）：状态、命令快照、触发信息与游标累积的日志流。 */
 export function BuildDetailPage() {
-  const { id } = useParams()
-  const { data: builds = [] } = useQuery({ queryKey: ['builds'], queryFn: api.builds })
-  const build = builds.find((b) => b.number === Number(id)) ?? builds[0]
-  const failed = build?.status === 'failed'
+  const { id = '' } = useParams<{ id: string }>()
+  const { user } = useSession()
+  const canWrite = user?.role === 'admin' || user?.role === 'member'
+  const queryClient = useQueryClient()
+  const [actionError, setActionError] = useState('')
+  const [cancelling, setCancelling] = useState(false)
 
-  const lines = useLogSimulator(build?.id ?? '', failed)
+  const { data: build, isLoading, error } = useQuery({
+    queryKey: ['build', id],
+    queryFn: () => buildsAPI.build(id),
+    enabled: id !== '',
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status && !isTerminal(status) ? STATUS_POLL_MS : false
+    },
+  })
+  const projectID = build?.projectId
+  const { data: project } = useQuery({
+    queryKey: ['project', projectID],
+    queryFn: () => {
+      if (!projectID) throw new Error('missing project id')
+      return projectsAPI.project(projectID)
+    },
+    enabled: Boolean(projectID),
+    staleTime: 60_000,
+  })
 
-  if (!build) return null
+  const terminal = build ? isTerminal(build.status) : false
+  const { lines, error: logError } = useBuildLogs(id, terminal)
+
+  const cancel = async () => {
+    if (!build) return
+    setActionError('')
+    setCancelling(true)
+    try {
+      await buildsAPI.cancel(build.id)
+      await queryClient.invalidateQueries({ queryKey: ['build', build.id] })
+      await queryClient.invalidateQueries({ queryKey: ['builds'] })
+    } catch (cause) {
+      setActionError(opError(cause))
+    } finally {
+      setCancelling(false)
+    }
+  }
+
+  if (error && !build) {
+    return (
+      <>
+        <PageHeader title="构建详情" />
+        <p role="alert" className="text-body-md text-error py-space-lg">
+          {opError(error)}
+        </p>
+        <Link to="/builds" className="text-body-md text-primary hover:underline">
+          返回构建列表
+        </Link>
+      </>
+    )
+  }
+  if (isLoading || !build) {
+    return (
+      <>
+        <PageHeader title="构建详情" subtitle="加载中..." />
+        <p className="text-body-md text-outline py-space-lg">加载中...</p>
+      </>
+    )
+  }
+
+  const duration =
+    build.startedAt && build.finishedAt ? `${build.finishedAt - build.startedAt}s` : '—'
 
   return (
     <>
       <PageHeader
-        title={`构建 #${build.number}`}
-        subtitle={`${build.triggerDetail} · 分支 ${build.branch} · ${fmtRel(build.createdAt)}`}
+        title={`构建 #${build.buildNumber}`}
+        subtitle={`${project?.name ?? build.projectId.slice(0, 8)} · 分支 ${build.branch || '—'} · ${fmtRel(build.createdAt * 1000)}`}
         actions={
           <>
-            {failed && (
-              <Button icon="play_arrow" onClick={() => alert('重试构建 · 走 Governor 裁决（演示）')}>
-                重新构建 (Retry)
-              </Button>
-            )}
-            <Button variant="secondary" icon="code">
-              查看提交 {build.commitSha}
-            </Button>
+            <StatusBadge tone={BUILD_STATUS_TONE[build.status]}>{BUILD_STATUS_TEXT[build.status]}</StatusBadge>
+            {build.status === 'queued' || build.status === 'running' ? (
+              canWrite ? (
+                <Button variant="danger" icon="stop_circle" disabled={cancelling} onClick={() => void cancel()}>
+                  {cancelling ? '取消中...' : '取消构建'}
+                </Button>
+              ) : null
+            ) : null}
           </>
         }
       />
 
-      <div className="grid grid-cols-[340px_1fr] gap-gutter">
-        {/* 左列：状态 + Stage 时间线 */}
-        <div className="space-y-gutter">
-          <div className="bg-surface-container rounded-lg border border-surface-container-highest p-space-xl space-y-space-lg">
-            <div className="flex items-center justify-between">
-              <StatusBadge
-                tone={build.status === 'success' ? 'success' : build.status === 'failed' ? 'error' : 'running'}
-              >
-                {build.status === 'success' ? '运行中 #' + build.number : build.status === 'failed' ? `#${build.number} (失败)` : `运行中 #${build.number}`}
-              </StatusBadge>
-              <span className="font-mono text-label-sm text-outline">{build.commitSha}</span>
-            </div>
-            <StageTimeline stages={failed ? failedStages : runningStages} />
-          </div>
+      {actionError && (
+        <p role="alert" className="mb-space-md text-body-sm text-error bg-error/10 rounded px-space-lg py-space-md">
+          {actionError}
+        </p>
+      )}
 
-          {failed && (
-            <div className="bg-surface-container rounded-lg border border-surface-container-highest p-space-xl">
-              <div className="flex items-center gap-space-sm mb-space-md">
-                <Icon name="smart_toy" size={16} className="text-brand" />
-                <span className="text-headline-sm font-semibold">AI 诊断</span>
-                <span className="text-label-sm bg-brand/12 text-brand rounded px-1">
-                  LOA 1 仅建议
-                </span>
-              </div>
-              <ConfidenceMeter value={0.75} className="mb-space-md" />
-              <p className="text-body-sm text-on-surface-variant leading-relaxed mb-space-lg">
-                TokenParser 索引越界：<span className="text-error font-mono text-[12px]">client.ts:12</span> 处
-                payload.claims 在缺失 kid 头时为 undefined，未做空值防护。命中规则库候选条目，置信度 75%。
-              </p>
-              <Link
-                to={`/builds/${build.number}/diagnosis`}
-                className="flex items-center justify-center gap-space-sm rounded border border-brand/40 text-brand py-space-md text-body-md hover:bg-brand/10 transition-colors"
-              >
-                <Icon name="smart_toy" size={16} />
-                查看 AI 诊断
-              </Link>
-            </div>
-          )}
+      <div className="grid grid-cols-[340px_1fr] gap-gutter">
+        <div className="bg-surface-container rounded-lg border border-surface-container-highest p-space-xl space-y-space-lg self-start">
+          <MetaRow label="项目">
+            <Link to="/" className="hover:underline">
+              {project?.name ?? build.projectId.slice(0, 8)}
+            </Link>
+          </MetaRow>
+          <MetaRow label="分支">
+            <span className="font-mono">{build.branch || '—'}</span>
+          </MetaRow>
+          <MetaRow label="构建命令">
+            <span className="font-mono break-all">{build.command}</span>
+          </MetaRow>
+          <MetaRow label="触发者">
+            <span className="font-mono" title={build.triggeredBy}>
+              {build.triggeredBy.slice(0, 8)}
+            </span>
+          </MetaRow>
+          <MetaRow label="触发时间">{fmtRel(build.createdAt * 1000)}</MetaRow>
+          <MetaRow label="开始时间">{build.startedAt ? fmtRel(build.startedAt * 1000) : '—'}</MetaRow>
+          <MetaRow label="结束时间">{build.finishedAt ? fmtRel(build.finishedAt * 1000) : '—'}</MetaRow>
+          <MetaRow label="耗时">{duration}</MetaRow>
+          <p className="text-label-sm text-outline pt-space-md border-t border-surface-container-highest">
+            命令快照在触发时固化，之后修改项目命令不影响本次构建。
+          </p>
         </div>
 
-        {/* 右列：日志流 */}
-        <LogViewer lines={lines} running={!failed} highlightSeq={failed ? 13 : undefined} maxHeight={560} />
+        <div className="space-y-space-sm">
+          <LogViewer lines={lines} running={!terminal} title={build.command} maxHeight={560} />
+          {logError && (
+            <p role="alert" className="text-body-sm text-error">
+              {logError}
+            </p>
+          )}
+          {lines.length === 0 && !logError && (
+            <p className="text-body-sm text-outline">
+              {build.status === 'queued' ? '构建排队中，日志会在开始执行后出现。' : '暂时没有日志输出。'}
+            </p>
+          )}
+        </div>
       </div>
     </>
   )
 }
 
-const runningStages: BuildStage[] = [
-  { seq: 1, name: 'Checkout', status: 'success', startedAt: 0, endedAt: 8000 },
-  { seq: 2, name: 'Install', status: 'success', startedAt: 8000, endedAt: 42000 },
-  { seq: 3, name: 'Build', status: 'running', startedAt: 42000 },
-  { seq: 4, name: 'Deploy', status: 'pending' },
-]
-const failedStages: BuildStage[] = [
-  { seq: 1, name: 'Checkout', status: 'success', startedAt: 0, endedAt: 8000 },
-  { seq: 2, name: 'Install', status: 'success', startedAt: 8000, endedAt: 41000 },
-  { seq: 3, name: 'Build', status: 'failed', startedAt: 41000, endedAt: 184000 },
-  { seq: 4, name: 'Deploy', status: 'skipped' },
-]
+function MetaRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-start justify-between gap-space-lg text-body-sm">
+      <span className="text-outline shrink-0">{label}</span>
+      <span className="text-on-surface text-right min-w-0">{children}</span>
+    </div>
+  )
+}

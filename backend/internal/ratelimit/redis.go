@@ -50,6 +50,7 @@ type RedisLimiter struct {
 	client    redis.UniversalClient
 	namespace string
 	window    time.Duration
+	limit     int
 }
 
 var _ Limiter = (*RedisLimiter)(nil)
@@ -60,10 +61,17 @@ func New(client redis.UniversalClient, namespace string) *RedisLimiter {
 	return NewWithWindow(client, namespace, LoginWindow)
 }
 
+// NewWithLimit overrides the quota while keeping the production window. The
+// entrypoint lowers or raises it from configuration; an out-of-range value is
+// rejected by Allow rather than silently disabling the limiter.
+func NewWithLimit(client redis.UniversalClient, namespace string, limit int) *RedisLimiter {
+	return &RedisLimiter{client: client, namespace: namespace, window: LoginWindow, limit: limit}
+}
+
 // NewWithWindow permits short windows in integration tests; the quota remains
 // ten. Invalid configuration is rejected by Allow rather than disabling limits.
 func NewWithWindow(client redis.UniversalClient, namespace string, window time.Duration) *RedisLimiter {
-	return &RedisLimiter{client: client, namespace: namespace, window: window}
+	return &RedisLimiter{client: client, namespace: namespace, window: window, limit: LoginLimit}
 }
 
 func (l *RedisLimiter) redisKey(key string) string {
@@ -72,10 +80,10 @@ func (l *RedisLimiter) redisKey(key string) string {
 }
 
 func (l *RedisLimiter) Allow(ctx context.Context, key string) (bool, time.Duration, error) {
-	if l == nil || l.client == nil || l.namespace == "" || l.window < time.Millisecond {
+	if l == nil || l.client == nil || l.namespace == "" || l.window < time.Millisecond || l.limit < 1 || l.limit > 1000 {
 		return false, 0, errors.New("invalid Redis rate limiter configuration")
 	}
-	result, err := fixedWindow.Run(ctx, l.client, []string{l.redisKey(key)}, l.window.Milliseconds(), LoginLimit).Slice()
+	result, err := fixedWindow.Run(ctx, l.client, []string{l.redisKey(key)}, l.window.Milliseconds(), l.limit).Slice()
 	if err != nil {
 		return false, 0, fmt.Errorf("Redis rate limiter unavailable: %w", err)
 	}

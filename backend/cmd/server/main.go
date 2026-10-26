@@ -15,6 +15,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/redis/go-redis/v9"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/builds"
 	"github.com/yichenfchai/AegisFlow/backend/internal/config"
 	"github.com/yichenfchai/AegisFlow/backend/internal/httpapi"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
@@ -75,10 +76,24 @@ func run(logger *slog.Logger) error {
 			return err
 		}
 	}
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.New(cache, cfg.RedisNamespace), TrustedProxies: cfg.TrustedProxies, Projects: projects.New(db)})
+	registry := projects.New(db)
+	pipeline := builds.New(db, registry)
+	// A crash leaves running rows; the single-instance worker marks them
+	// interrupted before serving traffic so no build looks stuck.
+	if recovered, err := pipeline.RecoverInterrupted(ctx); err != nil {
+		return err
+	} else if recovered > 0 {
+		logger.Info("interrupted builds recovered", "count", recovered)
+	}
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// The worker finalizes its in-flight build as interrupted when this
+	// context is cancelled by the shutdown path.
+	workerCtx, stopWorker := context.WithCancel(signalCtx)
+	defer stopWorker()
+	go pipeline.Run(workerCtx)
 	// Expired sessions and their refresh history are pruned hourly; replay
 	// detection never needs history beyond the session deadline.
 	cleanupCtx, stopCleanup := context.WithCancel(signalCtx)
