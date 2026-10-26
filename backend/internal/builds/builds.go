@@ -40,6 +40,17 @@ const (
 	StatusInterrupted = "interrupted"
 )
 
+// Terminal reports whether a status is final, so streaming readers know when a
+// build can no longer change.
+func Terminal(status string) bool {
+	switch status {
+	case StatusSucceeded, StatusFailed, StatusCancelled, StatusInterrupted:
+		return true
+	default:
+		return false
+	}
+}
+
 type Build struct {
 	ID          string `json:"id"`
 	ProjectID   string `json:"projectId"`
