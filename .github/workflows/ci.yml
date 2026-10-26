@@ -84,3 +84,50 @@ jobs:
         run: npm test
       - name: Lint
         run: npm run lint
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          # Disposable per-run database; tests bootstrap and migrate it.
+          POSTGRES_DB: aegis_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d aegis_e2e"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-retries 20
+    env:
+      AEGIS_E2E_DATABASE_URL: postgres://test:test@localhost:5432/aegis_e2e?sslmode=disable
+      AEGIS_E2E_REDIS_URL: redis://localhost:6379/3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      # Playwright starts the real Go backend and Vite dev server itself.
+      - name: Browser tests (real backend, frontend, PostgreSQL, Redis)
+        run: npm run test:e2e
