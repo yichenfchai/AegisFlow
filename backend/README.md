@@ -1,6 +1,6 @@
 # AegisFlow Go 后端
 
-Go 1.23+，Gin 1.11 + slog，PostgreSQL（pgx）+ Redis 共享限流，多应用实例部署，bcrypt，HS256 JWT。浏览器鉴权采用短期 Bearer access token + HttpOnly refresh Cookie；推荐前后端通过**同源代理**部署。构建、发布等业务接口及 LDAP 尚未实现。完整接口契约见 [openapi.yaml](openapi.yaml)。
+Go 1.23+，Gin 1.11 + slog，PostgreSQL（pgx）+ Redis 共享限流，多应用实例部署，bcrypt，HS256 JWT。浏览器鉴权采用短期 Bearer access token + HttpOnly refresh Cookie；推荐前后端通过**同源代理**部署。项目注册表与最小构建闭环（触发、列表、详情、取消、游标日志）已实现；部署、审批等其余业务接口及 LDAP 尚未实现。完整接口契约见 [openapi.yaml](openapi.yaml)。
 
 ## 本地启动（PowerShell）
 
@@ -29,7 +29,7 @@ go run ./cmd/server
 
 默认监听 http://127.0.0.1:8080。PostgreSQL 数据库须预先创建，服务自动执行版本化表迁移；advisory 事务锁保证多实例并发启动安全。首次空库原子创建一位管理员；已有用户时不覆盖。初始化后移除 bootstrap 环境变量。JWT 密钥至少 32 字节，所有实例必须使用同一密钥、issuer/audience、Cookie 与来源配置；通过部署密钥管理保存并保持一致，重启无需粘性会话。
 
-环境配置见 [.env.example](.env.example)。AEGIS_DATABASE_URL 和 AEGIS_REDIS_URL 均必填，无 SQLite/进程内限流自动回退；旧 AEGIS_DATABASE_PATH 会使启动失败。每个实例默认最多 20 个数据库连接、空闲 5 个，可通过 AEGIS_DB_MAX_OPEN/IDLE 调整，连接总数需按副本数控制。数据库和 Redis 应使用隔离网络、访问控制、TLS 与备份保护。
+环境配置见 [.env.example](.env.example)。AEGIS_DATABASE_URL 和 AEGIS_REDIS_URL 均必填，无 SQLite/进程内限流自动回退；旧 AEGIS_DATABASE_PATH 会使启动失败。每个实例默认最多 20 个数据库连接、空闲 5 个，可通过 AEGIS_DB_MAX_OPEN/IDLE 调整，连接总数需按副本数控制。AEGIS_BUILD_TIMEOUT 是单次构建的执行上限（默认 10m，最大 24h）；AEGIS_LOGIN_RATE_LIMIT 是每 IP 每分钟的登录配额（默认 10，取值 1-1000，仅供测试环境在单地址多账号时放宽）。数据库和 Redis 应使用隔离网络、访问控制、TLS 与备份保护。
 
 ## 推荐部署：同源代理
 
@@ -49,7 +49,7 @@ server: {
 
 生产在 TLS 反向代理后运行，后端绑定回环或受控内部网络；**显式设 `AEGIS_COOKIE_SECURE=true`**。本地默认 false，服务不会根据 X-Forwarded-Proto、Host 等可伪造头推断 Secure，也没有隐含的“生产环境检测”。代理需要透传 Cookie/Set-Cookie/Origin，不能缓存 auth 响应。请勿用明文 HTTP 传输账号和令牌。
 
-`SameSite=Strict` 拒绝跨站发送 Cookie；即使配置允许某源，`Sec-Fetch-Site: cross-site` 仍拒绝。CORS 仅兼容受控同站/调试源，不是跨站部署方案。Gin 默认不信任转发地址；AEGIS_TRUSTED_PROXIES 可配置实际入口代理的精确 CIDR，只在来自可信代理时解析 X-Forwarded-For，忽略 X-Real-IP。代理必须覆盖客户端传入的转发头，不可开放所有地址。登录使用 Redis Lua 原子共享限流，每 IP 固定一分钟最多 10 次，所有副本共享同一 AEGIS_REDIS_NAMESPACE；Redis 故障登录返回 503，不回退本地计数。
+`SameSite=Strict` 拒绝跨站发送 Cookie；即使配置允许某源，`Sec-Fetch-Site: cross-site` 仍拒绝。CORS 仅兼容受控同站/调试源，不是跨站部署方案。Gin 默认不信任转发地址；AEGIS_TRUSTED_PROXIES 可配置实际入口代理的精确 CIDR，只在来自可信代理时解析 X-Forwarded-For，忽略 X-Real-IP。代理必须覆盖客户端传入的转发头，不可开放所有地址。登录使用 Redis Lua 原子共享限流，每 IP 固定一分钟最多 10 次（AEGIS_LOGIN_RATE_LIMIT 可调），所有副本共享同一 AEGIS_REDIS_NAMESPACE；Redis 故障登录返回 503，不回退本地计数。
 
 ## HTTP 契约
 
@@ -73,11 +73,25 @@ server: {
 | POST | /api/v1/users/{id}/password-reset | Bearer + admin；`{password}` | `{reset:true}`，撤销目标全部会话 |
 | GET | /api/v1/audit | Bearer + admin；`?limit=&offset=` | `{items,total,limit,offset}`，最新在前 |
 | GET | /api/v1/projects | Bearer（所有角色）；`?limit=&offset=&status=active\|archived` | `{items,total,limit,offset}`，按名称排序 |
-| POST | /api/v1/projects | Bearer + admin/member；`{name,description?,repoUrl?,defaultBranch?}` | Project，201 |
+| POST | /api/v1/projects | Bearer + admin/member；`{name,description?,repoUrl?,defaultBranch?,buildCommand?}` | Project，201 |
 | GET | /api/v1/projects/{id} | Bearer（所有角色） | Project |
-| PATCH | /api/v1/projects/{id} | Bearer + admin/member；`{name?,description?,repoUrl?,defaultBranch?,archived?}` 至少一项 | Project；归档项目只接受恢复 |
+| PATCH | /api/v1/projects/{id} | Bearer + admin/member；`{name?,description?,repoUrl?,defaultBranch?,buildCommand?,archived?}` 至少一项 | Project；归档项目只接受恢复 |
+| POST | /api/v1/projects/{id}/builds | Bearer + admin/member；`{branch?}`；项目须活跃且已配置 buildCommand | Build，201（queued） |
+| GET | /api/v1/builds | Bearer（所有角色）；`?limit=&offset=&projectId=` | `{items,total,limit,offset}`，最新在前 |
+| GET | /api/v1/builds/{id} | Bearer（所有角色） | Build |
+| GET | /api/v1/builds/{id}/logs | Bearer（所有角色）；`?after=&limit=`（after 为事件 id 游标，limit 1-1000，默认 200） | `{items}`，按事件 id 升序 |
+| POST | /api/v1/builds/{id}/cancel | Bearer + admin/member；**`{}`** | Build；重复取消幂等 200，终态构建 409 |
 
 **所有 auth POST（包括 login）强制恰好一个 Origin，且精确匹配允许列表**；缺失、不匹配、`null` 或跨站请求返回 `403 origin_denied`，在登录、轮换和退出之前拦截。非浏览器 curl/脚本也必须带该 Origin。其他请求如果携带 Origin 也须符合允许列表。全局拒绝 `Sec-Fetch-Site: cross-site`。允许来源响应包含 `Access-Control-Allow-Origin: <原始允许源>`、`Access-Control-Allow-Credentials: true`，`Vary: Origin, Sec-Fetch-Site`；OPTIONS 额外 Vary 请求方法与请求头，允许 GET/POST/OPTIONS 和 Authorization/Content-Type。
+
+### 构建执行（P3 第一批）
+
+- 状态机六态：`queued → running → succeeded/failed/cancelled`，服务启动时把遗留的 `running` 统一转为 `interrupted`。`interrupted` 表示进程被打断而不是业务失败，需要重新触发。该恢复逻辑按单实例设计，跨实例 lease/heartbeat 明确推迟。
+- 触发时固化命令快照与分支（默认取项目 defaultBranch），构建号在每个项目内自增；之后修改项目命令不影响已触发的构建。命令在系统临时目录执行（Unix `sh -c`、Windows `cmd /c`），结束后删除目录。
+- worker 随服务进程启动、单并发运行，用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取任务，避免多个实例重复执行同一构建；`AEGIS_BUILD_TIMEOUT` 到期或收到取消请求时终止子进程。取消通过 300ms 状态看门狗传播到正在运行的命令。
+- 日志按行写入 `build_log_events`，批量 500ms 落库；单行超过 4096 字节按 rune 边界截断，单构建最多记录 5000 条事件，超限后追加一条 system 截断说明。当前读取使用 `after` 游标轮询，SSE 推送在后续批次。
+- 本批边界（明确不做）：受控执行身份与资源上限、输出脱敏、仓库 clone。构建只执行项目配置的命令，不下载代码。
+
 
 ### Cookie 与前端对齐
 
@@ -153,10 +167,10 @@ $env:AEGIS_OPS_REDIS_URL = 'redis://localhost:6379/2'
 go test ./cmd/server/ -run TestRealProcessLifecycle -count=1
 ```
 
-分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
+分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计）、构建流水线（触发校验与每项目编号、成功与失败退出码、超时、取消与幂等、重启恢复为 interrupted、游标日志分页与截断、RBAC 与未接线 503）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目/构建端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
 
 ## 架构
 
-cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；进程生命周期验收测试见 cmd/server/ops_test.go）；internal/config 校验连接 URL、连接数与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、分页与事务内审计，全局角色授权，不依赖 Gin）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.11 与 Go 1.23 兼容。
+cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；启动时恢复遗留构建，worker 随信号上下文退出；进程生命周期验收测试见 cmd/server/ops_test.go）；internal/config 校验连接 URL、连接数、登录配额与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、分页与事务内审计，全局角色授权，不依赖 Gin）；internal/builds 是构建流水线（触发与编号、SKIP LOCKED 领取、临时目录执行、取消看门狗、批量日志与重启恢复，不依赖 Gin；worker 进程内单并发）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.11 与 Go 1.23 兼容。
 
 本地双实例样例见 [compose.yaml](../compose.yaml) 与 [部署说明](../deploy/README.md)。应用副本可横向扩展，但数据库、Redis、入口网关的高可用需另行部署；样例单节点依赖不等于整套服务高可用。数据库集成测试未配置 URL 会明确 Skip，不能将跳过当作生产验证通过。
