@@ -29,13 +29,15 @@ func testServer(t *testing.T) (http.Handler, *auth.Service) {
 	if err := s.Bootstrap(context.Background(), "admin", "a-strong-password"); err != nil {
 		t.Fatal(err)
 	}
-	// The pipeline worker runs in-process so build routes reach terminal states.
+	// The pipeline worker runs in-process so build routes reach terminal states;
+	// it takes the single-worker lease on this test schema immediately.
 	registry := projects.New(db)
 	pipeline := builds.New(db, registry)
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	workerCtx, stopWorker := context.WithCancel(context.Background())
-	go pipeline.Run(workerCtx)
+	go pipeline.RunWorker(workerCtx, logger)
 	t.Cleanup(stopWorker)
-	return New(s, slog.New(slog.NewJSONHandler(io.Discard, nil)), db.PingContext, []string{"http://localhost:5173"}, Options{Limiter: newTestLimiter(), Projects: registry, Builds: pipeline}), s
+	return New(s, logger, db.PingContext, []string{"http://localhost:5173"}, Options{Limiter: newTestLimiter(), Projects: registry, Builds: pipeline}), s
 }
 func request(h http.Handler, method, path, body, token string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))

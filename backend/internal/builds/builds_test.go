@@ -26,11 +26,12 @@ func testService(t *testing.T) (*Service, *projects.Service) {
 	return New(db, registry), registry
 }
 
-// startWorker runs the worker until the test ends.
+// startWorker runs the worker loop directly; lease behaviour is covered by
+// lease_test.go, so these execution tests do not contend for the lease.
 func startWorker(t *testing.T, s *Service) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	go s.Run(ctx)
+	go s.run(ctx)
 	t.Cleanup(cancel)
 	return cancel
 }

@@ -14,11 +14,12 @@ import (
 	"time"
 )
 
-// Run is the in-process worker: it waits for a wake signal (or a slow poll),
-// claims queued builds one at a time with FOR UPDATE SKIP LOCKED, and executes
-// them. Cancel the context to stop; main cancels it on shutdown so a running
-// build is finalized as interrupted.
-func (s *Service) Run(ctx context.Context) {
+// run is the in-process worker loop: it waits for a wake signal (or a slow
+// poll), claims queued builds one at a time with FOR UPDATE SKIP LOCKED, and
+// executes them. Only the lease holder may call it (see RunWorker): a standby
+// replica must never claim or recover another replica's builds. Cancel the
+// context to stop; a running build is finalized as interrupted on shutdown.
+func (s *Service) run(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {

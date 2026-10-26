@@ -2,7 +2,7 @@
 
 ## 范围和部署决定
 
-产品目标已明确为多人使用、多实例部署。采用 PostgreSQL 共享用户与会话、Redis 共享登录限流，多个 Go/Gin 应用副本通过负载均衡提供同源接口，无需粘性会话。SQLite 不再作为运行存储，旧开发数据不自动导入。业务数据访问按模块逐步抽出 Repository，Gin Context 不进入业务服务。构建 worker 为进程内单并发，领取用 SKIP LOCKED 防止重复执行，但启动恢复按单实例设计（运行中的构建在重启后标记 interrupted）；跨实例 lease/heartbeat 推迟。多租户和项目成员权限尚未实现。
+产品目标已明确为多人使用、多实例部署。采用 PostgreSQL 共享用户与会话、Redis 共享登录限流，多个 Go/Gin 应用副本通过负载均衡提供同源接口，无需粘性会话。SQLite 不再作为运行存储，旧开发数据不自动导入。业务数据访问按模块逐步抽出 Repository，Gin Context 不进入业务服务。构建 worker 为进程内单并发；副本之间用 PostgreSQL 会话级 advisory lock 竞争同一 worker 租约，只有持锁副本恢复中断构建并领取任务，其余副本待命并在锁释放后接管；领取继续使用 SKIP LOCKED 兜底。该租约保证同一时刻只有一个 worker，不提供并行吞吐。多租户和项目成员权限尚未实现。
 
 数据库迁移与首次管理员创建使用 advisory 事务锁；刷新与退出锁定共享 session 行，跨实例并发消费旧令牌会触发一致撤销。所有实例须使用一致 JWT 密钥、会话配置与 Redis namespace。登录限流失败返回503，无进程内fallback。入口代理CIDR由 AEGIS_TRUSTED_PROXIES 明确指定，默认不信任转发头。部署样例和运维边界见 [部署说明](../deploy/README.md)。
 
@@ -43,7 +43,7 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 ### 构建执行边界（P3 第一批）
 
-- 构建状态为 queued/running/succeeded/failed/cancelled/interrupted；interrupted 只由服务启动恢复产生，表示进程中断而非业务失败。
+- 构建状态为 queued/running/succeeded/failed/cancelled/interrupted；interrupted 由持有 worker 租约的实例在启动恢复时产生，表示进程中断而非业务失败。
 - 触发时固化命令、分支与触发人快照，构建号在项目内自增；仓储地址不参与本批执行（不 clone），命令在临时目录用系统 shell 执行，超时由 AEGIS_BUILD_TIMEOUT 控制。
 - 构建不改变账号/权限数据，也不写审计表；触发、取消与日志读取沿用全局角色授权（admin/member 可写，viewer 只读），每次请求由服务端校验，不依赖前端隐藏按钮。
 - 执行环境尚非受控环境：以服务进程身份执行，没有专用执行账号、资源上限或输出脱敏；不要把不可信仓库命令接入本批执行器。
@@ -88,4 +88,4 @@ VITE_ENABLE_BUSINESS_MOCKS=false 是默认。项目、构建与账号管理始�
 
 后端验证：go test ./...、go vet ./...。前端验证：npm run build、npm run lint、npm test（session store 单元测试）。浏览器验证：先 npx playwright install chromium，再 npm run test:e2e；先设置 AEGIS_TEST_DATABASE_URL/AEGIS_TEST_REDIS_URL 运行后端真实集成测试；浏览器测试需另设置 AEGIS_E2E_DATABASE_URL/AEGIS_E2E_REDIS_URL 指向专用可丢弃服务，测试启动本地前后端，要求 8080、5173 端口空闲。E2E 后端显式设置 AEGIS_LOGIN_RATE_LIMIT=100，因为同一地址在一分钟内驱动多个账号登录；生产默认配额仍是 10。测试账号仅存在测试临时库；端到端配置使用随机 JWT 密钥，不使用生产数据。
 
-验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出；构建闭环覆盖 UI 创建带构建命令的项目、触发构建、列表与详情、轮询日志中出现进程输出与 build succeeded、viewer 只读且触发 403。剩余能力（SSE 推送、受控执行环境、仓库 clone、跨实例 worker）、生产备份及业务审计见 [TODO](../TODO.md)。
+验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出；构建闭环覆盖 UI 创建带构建命令的项目、触发构建、列表与详情、轮询日志中出现进程输出与 build succeeded、viewer 只读且触发 403。剩余能力（SSE 推送、受控执行环境、仓库 clone、多 worker 并行吞吐）、生产备份及业务审计见 [TODO](../TODO.md)。
