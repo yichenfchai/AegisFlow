@@ -31,6 +31,9 @@ export default defineConfig({
         AEGIS_REFRESH_TTL: '1h',
         AEGIS_COOKIE_SECURE: 'false',
         AEGIS_ALLOWED_ORIGINS: 'http://localhost:5173',
+        // The suite drives many accounts from one address inside a minute; the
+        // production default quota of 10 would reject valid logins mid-run.
+        AEGIS_LOGIN_RATE_LIMIT: '100',
       },
     },
     { command: 'npm run dev -- --host localhost --strictPort', url: 'http://localhost:5173', reuseExistingServer: false, env: { VITE_ENABLE_BUSINESS_MOCKS: 'false' } },
