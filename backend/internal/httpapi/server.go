@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/builds"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 )
@@ -41,6 +42,7 @@ func requestID(c *gin.Context) string {
 type Server struct {
 	auth         *auth.Service
 	projects     *projects.Service
+	builds       *builds.Service
 	logger       *slog.Logger
 	ready        func(context.Context) error
 	origins      map[string]bool
@@ -59,6 +61,9 @@ type Options struct {
 	// Projects enables the project registry routes; when nil they fail closed
 	// with 503 like any other missing shared dependency.
 	Projects *projects.Service
+	// Builds enables the build pipeline routes the same way; the caller owns
+	// starting the worker.
+	Builds *builds.Service
 }
 
 // New builds an isolated Gin engine; business services depend only on context.Context.
@@ -67,7 +72,7 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	if len(options) > 0 {
 		opts = options[0]
 	}
-	s := &Server{auth: service, projects: opts.Projects, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure}
+	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure}
 	for _, o := range origins {
 		s.origins[o] = true
 	}
@@ -113,6 +118,12 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	projectRoutes.POST("", s.requireRole("admin", "member"), s.createProject)
 	projectRoutes.GET("/:id", s.getProject)
 	projectRoutes.PATCH("/:id", s.requireRole("admin", "member"), s.updateProject)
+	projectRoutes.POST("/:id/builds", s.requireRole("admin", "member"), s.triggerBuild)
+	buildRoutes := api.Group("/builds", s.authenticate())
+	buildRoutes.GET("", s.listBuilds)
+	buildRoutes.GET("/:id", s.getBuild)
+	buildRoutes.GET("/:id/logs", s.getBuildLogs)
+	buildRoutes.POST("/:id/cancel", s.requireRole("admin", "member"), s.cancelBuild)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }
@@ -413,11 +424,12 @@ func (s *Server) createProject(c *gin.Context) {
 		Description   string `json:"description"`
 		RepoURL       string `json:"repoUrl"`
 		DefaultBranch string `json:"defaultBranch"`
+		BuildCommand  string `json:"buildCommand"`
 	}
 	if !s.decode(c, &input) {
 		return
 	}
-	project, err := s.projects.Create(c.Request.Context(), actorFrom(c), projects.Input{Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch})
+	project, err := s.projects.Create(c.Request.Context(), actorFrom(c), projects.Input{Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, BuildCommand: input.BuildCommand})
 	if err != nil {
 		s.projectError(c, err)
 		return
@@ -448,21 +460,139 @@ func (s *Server) updateProject(c *gin.Context) {
 		Description   *string `json:"description"`
 		RepoURL       *string `json:"repoUrl"`
 		DefaultBranch *string `json:"defaultBranch"`
+		BuildCommand  *string `json:"buildCommand"`
 		Archived      *bool   `json:"archived"`
 	}
 	if !s.decode(c, &input) {
 		return
 	}
-	if input.Name == nil && input.Description == nil && input.RepoURL == nil && input.DefaultBranch == nil && input.Archived == nil {
+	if input.Name == nil && input.Description == nil && input.RepoURL == nil && input.DefaultBranch == nil && input.BuildCommand == nil && input.Archived == nil {
 		s.fail(c, 400, "invalid_request", "at least one project field is required")
 		return
 	}
-	project, err := s.projects.Update(c.Request.Context(), actorFrom(c), c.Param("id"), projects.Patch{Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, Archived: input.Archived})
+	project, err := s.projects.Update(c.Request.Context(), actorFrom(c), c.Param("id"), projects.Patch{Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, BuildCommand: input.BuildCommand, Archived: input.Archived})
 	if err != nil {
 		s.projectError(c, err)
 		return
 	}
 	s.respond(c, 200, project)
+}
+
+// buildError maps pipeline errors; the pipeline is optional infrastructure
+// and fails closed when not wired.
+func (s *Server) buildError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, builds.ErrValidation):
+		s.fail(c, 400, "validation_failed", "project has no build command configured, or invalid ids or branch")
+	case errors.Is(err, builds.ErrConflict):
+		s.fail(c, 409, "conflict", "archived project cannot start builds, or only queued/running builds can be cancelled")
+	case errors.Is(err, builds.ErrNotFound):
+		s.fail(c, 404, "not_found", "resource not found")
+	default:
+		s.logger.ErrorContext(c.Request.Context(), "build request failed", "requestId", requestID(c), "error", err)
+		s.fail(c, 500, "internal_error", "internal server error")
+	}
+}
+
+func (s *Server) triggerBuild(c *gin.Context) {
+	if s.builds == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	var input struct {
+		Branch string `json:"branch"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	build, err := s.builds.Trigger(c.Request.Context(), actorFrom(c), c.Param("id"), input.Branch)
+	if err != nil {
+		s.buildError(c, err)
+		return
+	}
+	s.respond(c, 201, build)
+}
+
+func (s *Server) listBuilds(c *gin.Context) {
+	if s.builds == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	limit, offset, ok := s.page(c)
+	if !ok {
+		return
+	}
+	list, total, err := s.builds.List(c.Request.Context(), c.Query("projectId"), limit, offset)
+	if err != nil {
+		s.buildError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": list, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *Server) getBuild(c *gin.Context) {
+	if s.builds == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	build, err := s.builds.Get(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		s.buildError(c, err)
+		return
+	}
+	s.respond(c, 200, build)
+}
+
+func (s *Server) getBuildLogs(c *gin.Context) {
+	if s.builds == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	after := int64(0)
+	if value := c.Query("after"); value != "" {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || parsed < 0 {
+			s.fail(c, 400, "invalid_request", "after must be a non-negative integer")
+			return
+		}
+		after = parsed
+	}
+	limit := 200
+	if value := c.Query("limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > 1000 {
+			s.fail(c, 400, "invalid_request", "limit must be an integer between 1 and 1000")
+			return
+		}
+		limit = parsed
+	}
+	buildID := c.Param("id")
+	if _, err := s.builds.Get(c.Request.Context(), buildID); err != nil {
+		s.buildError(c, err)
+		return
+	}
+	events, err := s.builds.Logs(c.Request.Context(), buildID, after, limit)
+	if err != nil {
+		s.buildError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": events})
+}
+
+func (s *Server) cancelBuild(c *gin.Context) {
+	if s.builds == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	if !s.decode(c, &struct{}{}) {
+		return
+	}
+	build, err := s.builds.Cancel(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		s.buildError(c, err)
+		return
+	}
+	s.respond(c, 200, build)
 }
 
 func (s *Server) changePassword(c *gin.Context) {

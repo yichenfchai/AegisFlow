@@ -42,6 +42,8 @@ tags:
     description: Administrator-only local user management
   - name: Projects
     description: Project registry with global-role authorization
+  - name: Builds
+    description: Build pipeline (trigger, list, detail, logs, cancel)
   - name: Audit
     description: Persistent authentication and account-management audit trail
   - name: Health
@@ -654,6 +656,207 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/projects/{projectId}/builds:
+    post:
+      tags: [Builds]
+      operationId: triggerBuild
+      summary: Enqueue a build for the project (admin or member)
+      description: |
+        The project must be active and have a buildCommand configured. The
+        build number is a per-project monotonic sequence; branch defaults to
+        the project defaultBranch. Execution starts in-process (single worker,
+        SKIP LOCKED claiming); a restart marks running builds interrupted.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                branch:
+                  type: string
+                  maxLength: 128
+                  description: Optional branch snapshot; defaults to the project defaultBranch
+      responses:
+        '201':
+          description: Build enqueued
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Build' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400':
+          description: Project has no build command, or invalid branch (validation_failed)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Archived project cannot start builds; error.code is conflict
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/builds:
+    get:
+      tags: [Builds]
+      operationId: listBuilds
+      summary: List builds newest first (all roles)
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: projectId
+          in: query
+          required: false
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Builds page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/BuildPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/builds/{buildId}:
+    get:
+      tags: [Builds]
+      operationId: getBuild
+      summary: Build detail (all roles)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Build
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Build' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/builds/{buildId}/logs:
+    get:
+      tags: [Builds]
+      operationId: getBuildLogs
+      summary: Build log events after a cursor (all roles)
+      description: |
+        Polling endpoint; SSE streaming arrives in a later batch. The cursor
+        `after` is the last event id the client saw and doubles as the future
+        resume sequence. Output is capped server-side (line length and total
+        events) with a system line marking truncation.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - name: after
+          in: query
+          required: false
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+      responses:
+        '200':
+          description: Log events, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [items]
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/LogEvent' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/builds/{buildId}/cancel:
+    post:
+      tags: [Builds]
+      operationId: cancelBuild
+      summary: Cancel a queued or running build (admin or member)
+      description: The executing worker terminates the process within its watchdog interval. Repeating on an already-cancelled build is an idempotent 200; terminal builds return 409.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200':
+          description: Build cancelled (or already cancelled)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Build' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Build already finished; error.code is conflict
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
 components:
   securitySchemes:
     bearerAuth:
@@ -832,6 +1035,9 @@ components:
         defaultBranch:
           type: string
           description: Plain git ref name; empty allowed
+        buildCommand:
+          type: string
+          description: Single-line shell command executed in a temporary workdir; builds require it
         status: { type: string, enum: [active, archived] }
         createdBy: { type: string, description: Actor id snapshot of the creating user }
         createdAt: { type: integer, format: int64, description: Unix seconds }
@@ -845,6 +1051,7 @@ components:
         description: { type: string }
         repoUrl: { type: string }
         defaultBranch: { type: string }
+        buildCommand: { type: string, maxLength: 512 }
     ProjectPatch:
       type: object
       additionalProperties: false
@@ -854,6 +1061,7 @@ components:
         description: { type: string }
         repoUrl: { type: string }
         defaultBranch: { type: string }
+        buildCommand: { type: string, maxLength: 512 }
         archived:
           type: boolean
           description: true archives (idempotent); false restores an archived project
@@ -865,6 +1073,42 @@ components:
         items:
           type: array
           items: { $ref: '#/components/schemas/Project' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
+    Build:
+      type: object
+      additionalProperties: false
+      required: [id, projectId, buildNumber, status, branch, command, triggeredBy, createdAt, startedAt, finishedAt]
+      properties:
+        id: { type: string }
+        projectId: { type: string }
+        buildNumber: { type: integer, format: int64, minimum: 1 }
+        status: { type: string, enum: [queued, running, succeeded, failed, cancelled, interrupted], description: interrupted marks builds cut off by a restart }
+        branch: { type: string }
+        command: { type: string, description: Command snapshot at trigger time }
+        triggeredBy: { type: string, description: Actor id snapshot }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+        startedAt: { type: integer, format: int64, description: Unix seconds; 0 while queued }
+        finishedAt: { type: integer, format: int64, description: Unix seconds; 0 while unfinished }
+    LogEvent:
+      type: object
+      additionalProperties: false
+      required: [id, buildId, stream, message, createdAt]
+      properties:
+        id: { type: integer, format: int64, description: Monotonic event id; the polling cursor and future SSE resume sequence }
+        buildId: { type: string }
+        stream: { type: string, enum: [stdout, stderr, system] }
+        message: { type: string, description: At most 4096 bytes per line, rune-boundary truncated }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+    BuildPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Build' }
         total: { type: integer, minimum: 0 }
         limit: { type: integer, minimum: 1, maximum: 100 }
         offset: { type: integer, minimum: 0 }

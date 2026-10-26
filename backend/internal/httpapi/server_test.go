@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/builds"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
@@ -28,7 +29,13 @@ func testServer(t *testing.T) (http.Handler, *auth.Service) {
 	if err := s.Bootstrap(context.Background(), "admin", "a-strong-password"); err != nil {
 		t.Fatal(err)
 	}
-	return New(s, slog.New(slog.NewJSONHandler(io.Discard, nil)), db.PingContext, []string{"http://localhost:5173"}, Options{Limiter: newTestLimiter(), Projects: projects.New(db)}), s
+	// The pipeline worker runs in-process so build routes reach terminal states.
+	registry := projects.New(db)
+	pipeline := builds.New(db, registry)
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	go pipeline.Run(workerCtx)
+	t.Cleanup(stopWorker)
+	return New(s, slog.New(slog.NewJSONHandler(io.Discard, nil)), db.PingContext, []string{"http://localhost:5173"}, Options{Limiter: newTestLimiter(), Projects: registry, Builds: pipeline}), s
 }
 func request(h http.Handler, method, path, body, token string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))

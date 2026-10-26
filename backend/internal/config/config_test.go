@@ -14,7 +14,7 @@ func setup(t *testing.T) {
 	t.Setenv("AEGIS_JWT_SECRET", strings.Repeat("s", 32))
 	t.Setenv("AEGIS_DATABASE_URL", "postgres://test:test@localhost:5432/aegis_test?sslmode=disable")
 	t.Setenv("AEGIS_REDIS_URL", "redis://localhost:6379/0")
-	for _, key := range []string{"AEGIS_DB_MAX_OPEN", "AEGIS_DB_MAX_IDLE", "AEGIS_TRUSTED_PROXIES", "AEGIS_REDIS_NAMESPACE"} {
+	for _, key := range []string{"AEGIS_DB_MAX_OPEN", "AEGIS_DB_MAX_IDLE", "AEGIS_TRUSTED_PROXIES", "AEGIS_REDIS_NAMESPACE", "AEGIS_LOGIN_RATE_LIMIT"} {
 		t.Setenv(key, "")
 	}
 }
@@ -24,7 +24,7 @@ func TestLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.CookieSecure || c.AccessTTL != 15*time.Minute || c.Address != "127.0.0.1:8080" {
+	if c.CookieSecure || c.AccessTTL != 15*time.Minute || c.Address != "127.0.0.1:8080" || c.LoginRateLimit != 10 {
 		t.Fatalf("unexpected config: %+v", c)
 	}
 }
@@ -48,7 +48,7 @@ func TestCookieSecureConfig(t *testing.T) {
 	}
 }
 func TestRejectUnsafeConfig(t *testing.T) {
-	for _, tc := range []struct{ key, value string }{{"AEGIS_DATABASE_URL", ""}, {"AEGIS_DATABASE_URL", "sqlite://data/file.db"}, {"AEGIS_DATABASE_URL", "postgres://localhost"}, {"AEGIS_DATABASE_PATH", "data/old.db"}, {"AEGIS_REDIS_URL", ""}, {"AEGIS_REDIS_URL", "https://localhost"}, {"AEGIS_DB_MAX_OPEN", "0"}, {"AEGIS_DB_MAX_IDLE", "1001"}, {"AEGIS_DB_MAX_IDLE", "30"}, {"AEGIS_TRUSTED_PROXIES", "any"}, {"AEGIS_JWT_SECRET", "short"}, {"AEGIS_ACCESS_TTL", "0s"}, {"AEGIS_ACCESS_TTL", "2h"}, {"AEGIS_REFRESH_TTL", "1m"}, {"AEGIS_BOOTSTRAP_USERNAME", "admin"}, {"AEGIS_ALLOWED_ORIGINS", "*"}, {"AEGIS_ALLOWED_ORIGINS", "https://example.com/path"}, {"AEGIS_HTTP_ADDR", "bad"}} {
+	for _, tc := range []struct{ key, value string }{{"AEGIS_DATABASE_URL", ""}, {"AEGIS_DATABASE_URL", "sqlite://data/file.db"}, {"AEGIS_DATABASE_URL", "postgres://localhost"}, {"AEGIS_DATABASE_PATH", "data/old.db"}, {"AEGIS_REDIS_URL", ""}, {"AEGIS_REDIS_URL", "https://localhost"}, {"AEGIS_DB_MAX_OPEN", "0"}, {"AEGIS_DB_MAX_IDLE", "1001"}, {"AEGIS_DB_MAX_IDLE", "30"}, {"AEGIS_LOGIN_RATE_LIMIT", "0"}, {"AEGIS_LOGIN_RATE_LIMIT", "1001"}, {"AEGIS_LOGIN_RATE_LIMIT", "ten"}, {"AEGIS_TRUSTED_PROXIES", "any"}, {"AEGIS_JWT_SECRET", "short"}, {"AEGIS_ACCESS_TTL", "0s"}, {"AEGIS_ACCESS_TTL", "2h"}, {"AEGIS_REFRESH_TTL", "1m"}, {"AEGIS_BOOTSTRAP_USERNAME", "admin"}, {"AEGIS_ALLOWED_ORIGINS", "*"}, {"AEGIS_ALLOWED_ORIGINS", "https://example.com/path"}, {"AEGIS_HTTP_ADDR", "bad"}} {
 		t.Run(tc.key+tc.value, func(t *testing.T) {
 			setup(t)
 			t.Setenv(tc.key, tc.value)

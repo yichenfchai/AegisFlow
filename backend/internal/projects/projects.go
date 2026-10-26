@@ -45,6 +45,7 @@ type Project struct {
 	Description   string `json:"description"`
 	RepoURL       string `json:"repoUrl"`
 	DefaultBranch string `json:"defaultBranch"`
+	BuildCommand  string `json:"buildCommand"`
 	Status        string `json:"status"`
 	CreatedBy     string `json:"createdBy"`
 	CreatedAt     int64  `json:"createdAt"`
@@ -56,6 +57,7 @@ type Input struct {
 	Description   string
 	RepoURL       string
 	DefaultBranch string
+	BuildCommand  string
 }
 
 type Patch struct {
@@ -63,6 +65,7 @@ type Patch struct {
 	Description   *string
 	RepoURL       *string
 	DefaultBranch *string
+	BuildCommand  *string
 	Archived      *bool
 }
 
@@ -72,7 +75,7 @@ type Service struct {
 
 func New(db *sql.DB) *Service { return &Service{db: db} }
 
-const projectColumns = `id,name,description,repo_url,default_branch,status,created_by,created_at,updated_at`
+const projectColumns = `id,name,description,repo_url,default_branch,build_command,status,created_by,created_at,updated_at`
 
 // Source locations serve different deployment scenarios: https or SSH git URLs
 // for hosted repositories, absolute local paths for single-node checkout
@@ -124,6 +127,16 @@ func validateRepoURL(repoURL string) error {
 	return fmt.Errorf("%w: repoUrl must be an https:// or git@ URL, a file:/// URL, or an absolute local path", ErrValidation)
 }
 
+func validateBuildCommand(command string) error {
+	if err := validateText("buildCommand", command, 512); err != nil {
+		return err
+	}
+	if strings.ContainsAny(command, "\r\n") {
+		return fmt.Errorf("%w: buildCommand must be a single line", ErrValidation)
+	}
+	return nil
+}
+
 func validateBranch(branch string) error {
 	if err := validateText("defaultBranch", branch, 128); err != nil {
 		return err
@@ -145,6 +158,9 @@ func validateInput(input Input) error {
 		return err
 	}
 	if err := validateRepoURL(input.RepoURL); err != nil {
+		return err
+	}
+	if err := validateBuildCommand(input.BuildCommand); err != nil {
 		return err
 	}
 	return validateBranch(input.DefaultBranch)
@@ -172,7 +188,7 @@ type rowScanner interface{ Scan(dest ...any) error }
 
 func scanProject(row rowScanner) (*Project, error) {
 	var p Project
-	if err := row.Scan(&p.ID, &p.Name, &p.Description, &p.RepoURL, &p.DefaultBranch, &p.Status, &p.CreatedBy, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := row.Scan(&p.ID, &p.Name, &p.Description, &p.RepoURL, &p.DefaultBranch, &p.BuildCommand, &p.Status, &p.CreatedBy, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &p, nil
@@ -188,14 +204,14 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (*P
 		return nil, err
 	}
 	now := time.Now().Unix()
-	project := &Project{ID: id, Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, Status: StatusActive, CreatedBy: actor.ID, CreatedAt: now, UpdatedAt: now}
+	project := &Project{ID: id, Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, BuildCommand: input.BuildCommand, Status: StatusActive, CreatedBy: actor.ID, CreatedAt: now, UpdatedAt: now}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `INSERT INTO projects(id,name,description,repo_url,default_branch,status,created_by,created_at,updated_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8) ON CONFLICT (lower(name)) DO NOTHING`, id, input.Name, input.Description, input.RepoURL, input.DefaultBranch, StatusActive, actor.ID, now)
+	result, err := tx.ExecContext(ctx, `INSERT INTO projects(id,name,description,repo_url,default_branch,build_command,status,created_by,created_at,updated_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) ON CONFLICT (lower(name)) DO NOTHING`, id, input.Name, input.Description, input.RepoURL, input.DefaultBranch, input.BuildCommand, StatusActive, actor.ID, now)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +279,7 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 	if !auth.ValidID(id) {
 		return nil, fmt.Errorf("%w: invalid project id", ErrValidation)
 	}
-	if patch.Name == nil && patch.Description == nil && patch.RepoURL == nil && patch.DefaultBranch == nil && patch.Archived == nil {
+	if patch.Name == nil && patch.Description == nil && patch.RepoURL == nil && patch.DefaultBranch == nil && patch.BuildCommand == nil && patch.Archived == nil {
 		return nil, fmt.Errorf("%w: at least one field is required", ErrValidation)
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -296,13 +312,17 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 		updated.DefaultBranch = *patch.DefaultBranch
 		fieldChange = true
 	}
+	if patch.BuildCommand != nil {
+		updated.BuildCommand = *patch.BuildCommand
+		fieldChange = true
+	}
 	// An archived project is read-only; only restoring it (or repeating the
 	// archive no-op) is accepted.
 	if current.Status == StatusArchived && fieldChange {
 		return nil, fmt.Errorf("%w: archived project is read-only until restored", ErrConflict)
 	}
 	if fieldChange {
-		if err = validateInput(Input{Name: updated.Name, Description: updated.Description, RepoURL: updated.RepoURL, DefaultBranch: updated.DefaultBranch}); err != nil {
+		if err = validateInput(Input{Name: updated.Name, Description: updated.Description, RepoURL: updated.RepoURL, DefaultBranch: updated.DefaultBranch, BuildCommand: updated.BuildCommand}); err != nil {
 			return nil, err
 		}
 	}
@@ -333,8 +353,8 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 		}
 	}
 	updated.UpdatedAt = time.Now().Unix()
-	if _, err = tx.ExecContext(ctx, `UPDATE projects SET name=$2,description=$3,repo_url=$4,default_branch=$5,status=$6,updated_at=$7 WHERE id=$1`,
-		id, updated.Name, updated.Description, updated.RepoURL, updated.DefaultBranch, updated.Status, updated.UpdatedAt); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE projects SET name=$2,description=$3,repo_url=$4,default_branch=$5,build_command=$6,status=$7,updated_at=$8 WHERE id=$1`,
+		id, updated.Name, updated.Description, updated.RepoURL, updated.DefaultBranch, updated.BuildCommand, updated.Status, updated.UpdatedAt); err != nil {
 		return nil, err
 	}
 	action, detail := ActionUpdate, ""
