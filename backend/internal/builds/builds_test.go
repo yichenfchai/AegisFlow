@@ -240,14 +240,14 @@ func TestCancelRunningBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForStatus(t, s, build.ID, StatusRunning)
-	cancelled, err := s.Cancel(context.Background(), build.ID)
+	cancelled, err := s.Cancel(context.Background(), testActor, build.ID)
 	if err != nil || cancelled.Status != StatusCancelled {
 		t.Fatalf("cancel = %+v err=%v", cancelled, err)
 	}
 	waitForStatus(t, s, build.ID, StatusCancelled)
 	waitForLog(t, s, build.ID, "cancelled")
 	// Cancelling a terminal build is rejected; repeating is idempotent.
-	again, err := s.Cancel(context.Background(), build.ID)
+	again, err := s.Cancel(context.Background(), testActor, build.ID)
 	if err != nil || again.Status != StatusCancelled {
 		t.Fatalf("idempotent cancel = %+v err=%v", again, err)
 	}
@@ -257,7 +257,7 @@ func TestCancelRunningBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForStatus(t, s, quick.ID, StatusSucceeded)
-	if _, err = s.Cancel(context.Background(), quick.ID); err == nil || !strings.Contains(err.Error(), "queued or running") {
+	if _, err = s.Cancel(context.Background(), testActor, quick.ID); err == nil || !strings.Contains(err.Error(), "queued or running") {
 		t.Fatalf("cancel finished build error = %v", err)
 	}
 }

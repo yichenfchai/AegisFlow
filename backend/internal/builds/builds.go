@@ -101,6 +101,19 @@ func newID() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
+// writeAudit records a build operation in the shared audit trail inside the
+// caller's transaction, so the state change and its audit row commit together.
+// The detail never contains the command: it may hold secrets from the project.
+func writeAudit(ctx context.Context, tx *sql.Tx, actor auth.Actor, action, objectID, detail string) error {
+	id, err := newID()
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO auth_audit(id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
+	 VALUES($1,$2,$3,$4,$5,'build',$6,'success',$7,$8)`, id, time.Now().Unix(), actor.ID, actor.Username, action, objectID, detail, actor.RequestID)
+	return err
+}
+
 func scanBuild(row rowScanner) (*Build, error) {
 	var b Build
 	if err := row.Scan(&b.ID, &b.ProjectID, &b.BuildNumber, &b.Status, &b.Branch, &b.Command, &b.TriggeredBy, &b.CreatedAt, &b.StartedAt, &b.FinishedAt); err != nil {
@@ -152,6 +165,9 @@ func (s *Service) Trigger(ctx context.Context, actor auth.Actor, projectID, bran
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE projects SET build_count=$2 WHERE id=$1`, projectID, build.BuildNumber); err != nil {
+		return nil, err
+	}
+	if err = writeAudit(ctx, tx, actor, "build.trigger", id, fmt.Sprintf("project=%s build=%d", projectID, build.BuildNumber)); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -241,8 +257,9 @@ func (s *Service) Logs(ctx context.Context, buildID string, after int64, limit i
 }
 
 // Cancel moves a queued or running build to cancelled. The executing worker
-// notices through its status watchdog and terminates the process.
-func (s *Service) Cancel(ctx context.Context, id string) (*Build, error) {
+// notices through its status watchdog and terminates the process. Repeating on
+// an already-cancelled build is idempotent and writes no second audit row.
+func (s *Service) Cancel(ctx context.Context, actor auth.Actor, id string) (*Build, error) {
 	if !auth.ValidID(id) {
 		return nil, fmt.Errorf("%w: invalid build id", ErrValidation)
 	}
@@ -265,6 +282,9 @@ func (s *Service) Cancel(ctx context.Context, id string) (*Build, error) {
 		}
 	}
 	if err != nil {
+		return nil, err
+	}
+	if err = writeAudit(ctx, tx, actor, "build.cancel", build.ID, fmt.Sprintf("project=%s build=%d", build.ProjectID, build.BuildNumber)); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
