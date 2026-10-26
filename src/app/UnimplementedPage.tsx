@@ -1,8 +1,8 @@
 import { Icon } from '@/components/ui/Icon'
 
 /**
- * 明确的未实现声明页：P2 之前不再为非主线业务模块投入 mock 演示。
- * 项目/构建主线页面保留在 BusinessGate 后面；本页对任何访问都恒定显示。
+ * 明确的未实现声明页：非主线业务模块不投入 mock 演示。
+ * 项目、构建与账号主线为真实接口；本页对任何访问都恒定显示。
  */
 export function UnimplementedPage({ title }: { title: string }) {
   return (

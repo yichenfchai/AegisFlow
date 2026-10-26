@@ -45,8 +45,6 @@ export function CommandPalette() {
     () => [
       { group: '页面', label: '项目列表', to: '/' },
       { group: '页面', label: '构建流水线', to: '/builds' },
-      { group: '构建', label: '#1092 · 运行中 · web-api', to: '/builds/1092' },
-      { group: '构建', label: '#1091 · 失败 · AI 诊断', to: '/builds/1091/diagnosis' },
       { group: '页面', label: '账号安全 · 修改密码与管理会话', to: '/account' },
       { group: '页面', label: '用户与审计 · 管理员', to: '/settings' },
     ],

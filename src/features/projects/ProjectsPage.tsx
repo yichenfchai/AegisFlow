@@ -1,20 +1,32 @@
 import { useState } from 'react'
-import { Link } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Button, ConfirmDialog, DataTable, PageHeader, Pagination, type Column } from '@/components/ui/DataTable'
 import { StatusBadge } from '@/components/ui/Badge'
 import { projectsAPI, type Project } from '@/api/projects'
+import { buildsAPI } from '@/api/builds'
 import { useSession } from '@/stores/session'
 import { ApiError } from '@/api/http'
 import { fmtRel } from '@/api/format'
 
 const PAGE_SIZE = 12
 
+function triggerError(cause: unknown): string {
+  if (cause instanceof ApiError) {
+    if (cause.status === 400) return '该项目未配置构建命令，先补充构建命令再触发'
+    if (cause.status === 409) return '项目已归档，不能触发构建'
+    if (cause.status === 403) return '当前角色没有触发构建的权限'
+    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
+  }
+  return cause instanceof Error ? cause.message : '触发构建失败，请稍后重试'
+}
+
 /** 项目列表（真实接口）：P2 主线页面，替代原仪表盘演示。 */
 export function ProjectsPage() {
   const { user } = useSession()
   const canEdit = user?.role === 'admin' || user?.role === 'member'
   const queryClient = useQueryClient()
+  const nav = useNavigate()
   const [page, setPage] = useState(1)
   const { data, isLoading, error } = useQuery({
     queryKey: ['projects', page],
@@ -23,6 +35,7 @@ export function ProjectsPage() {
   const [toggleTarget, setToggleTarget] = useState<Project | null>(null)
   const [actionError, setActionError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [triggering, setTriggering] = useState<string | null>(null)
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['projects'] })
   const toggleArchive = async () => {
@@ -38,6 +51,20 @@ export function ProjectsPage() {
       setActionError(cause instanceof ApiError && cause.status === 409 ? '项目已归档，只能先恢复再修改' : cause instanceof Error ? cause.message : '操作失败，请稍后重试')
     } finally {
       setBusy(false)
+    }
+  }
+
+  const triggerBuild = async (project: Project) => {
+    setActionError('')
+    setTriggering(project.id)
+    try {
+      await buildsAPI.trigger(project.id)
+      await queryClient.invalidateQueries({ queryKey: ['builds'] })
+      nav('/builds')
+    } catch (cause) {
+      setActionError(triggerError(cause))
+    } finally {
+      setTriggering(null)
     }
   }
 
@@ -72,14 +99,33 @@ export function ProjectsPage() {
       key: 'actions',
       header: '操作',
       align: 'right',
-      render: (p) =>
-        canEdit ? (
-          <Button variant={p.status === 'archived' ? 'secondary' : 'danger'} size="sm" disabled={busy} onClick={() => setToggleTarget(p)}>
-            {p.status === 'archived' ? '恢复' : '归档'}
-          </Button>
-        ) : (
-          <span className="text-label-sm text-outline">—</span>
-        ),
+      render: (p) => (
+        <div className="flex items-center justify-end gap-space-sm">
+          {canEdit &&
+            (p.buildCommand ? (
+              <Button
+                variant="secondary"
+                size="sm"
+                icon="play_arrow"
+                disabled={triggering !== null || p.status === 'archived'}
+                onClick={() => void triggerBuild(p)}
+              >
+                {triggering === p.id ? '触发中...' : '构建'}
+              </Button>
+            ) : (
+              <span className="text-label-sm text-outline" title="该项目未配置构建命令">
+                未配置构建命令
+              </span>
+            ))}
+          {canEdit ? (
+            <Button variant={p.status === 'archived' ? 'secondary' : 'danger'} size="sm" disabled={busy} onClick={() => setToggleTarget(p)}>
+              {p.status === 'archived' ? '恢复' : '归档'}
+            </Button>
+          ) : (
+            <span className="text-label-sm text-outline">—</span>
+          )}
+        </div>
+      ),
     },
   ]
 

@@ -8,6 +8,8 @@ export interface Project {
   description: string
   repoUrl: string
   defaultBranch: string
+  /** 构建命令快照来源；为空的项目不能触发构建 */
+  buildCommand: string
   status: 'active' | 'archived'
   createdBy: string
   createdAt: number
@@ -19,9 +21,13 @@ export type ProjectInput = {
   description?: string
   repoUrl?: string
   defaultBranch?: string
+  /** 单行 shell 命令，最多 512 字节；触发构建时固化到构建行 */
+  buildCommand?: string
 }
 
-export type ProjectPatch = Partial<Pick<Project, 'name' | 'description' | 'repoUrl' | 'defaultBranch'>> & {
+export type ProjectPatch = Partial<
+  Pick<Project, 'name' | 'description' | 'repoUrl' | 'defaultBranch' | 'buildCommand'>
+> & {
   archived?: boolean
 }
 

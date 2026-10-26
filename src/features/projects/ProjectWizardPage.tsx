@@ -26,6 +26,7 @@ export function ProjectWizardPage() {
   const [description, setDescription] = useState('')
   const [repoUrl, setRepoUrl] = useState('')
   const [defaultBranch, setDefaultBranch] = useState('main')
+  const [buildCommand, setBuildCommand] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -41,6 +42,10 @@ export function ProjectWizardPage() {
       setError('项目名称不能以点、连字符或空白开头，且不含路径与特殊字符')
       return
     }
+    if (/[\r\n]/.test(buildCommand) || byteLength(buildCommand) > 512) {
+      setError('构建命令需为单行，最多 512 字节')
+      return
+    }
     setBusy(true)
     try {
       await projectsAPI.create({
@@ -48,6 +53,7 @@ export function ProjectWizardPage() {
         description: description.trim() || undefined,
         repoUrl: repoUrl.trim() || undefined,
         defaultBranch: defaultBranch.trim() || undefined,
+        buildCommand: buildCommand.trim() || undefined,
       })
       await queryClient.invalidateQueries({ queryKey: ['projects'] })
       nav('/', { replace: true })
@@ -77,6 +83,20 @@ export function ProjectWizardPage() {
             <option value="master">master</option>
             <option value="">（不设置）</option>
           </Select>
+        </Field>
+        <Field
+          label="构建命令"
+          hint="单行 shell 命令，最多 512 字节；在临时目录执行。选填，未配置的项目不能触发构建"
+          htmlFor="project-build-command"
+        >
+          <Input
+            id="project-build-command"
+            mono
+            value={buildCommand}
+            onChange={(e) => setBuildCommand(e.target.value)}
+            disabled={busy}
+            placeholder="echo hello"
+          />
         </Field>
         {error && (
           <p role="alert" className="text-body-sm text-error bg-error/10 rounded px-space-lg py-space-md">

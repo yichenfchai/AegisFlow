@@ -1,10 +1,8 @@
 import { createBrowserRouter, Navigate } from 'react-router'
-import { BusinessGate } from '@/features/auth/BusinessGate'
 import { AppShell } from './layout/AppShell'
 import { UnimplementedPage } from './UnimplementedPage'
 import { BuildListPage } from '@/features/builds/BuildListPage'
 import { BuildDetailPage } from '@/features/builds/BuildDetailPage'
-import { DiagnosisPage } from '@/features/builds/DiagnosisPage'
 import { SettingsPage } from '@/features/settings/SettingsPages'
 import { LoginPage } from '@/features/auth/LoginPage'
 import { SessionGate } from '@/features/auth/SessionGate'
@@ -13,14 +11,9 @@ import { ProjectsPage } from '@/features/projects/ProjectsPage'
 import { AccountSecurityPage } from '@/features/account/AccountSecurityPage'
 
 /**
- * 真实页面（项目列表/创建、账号、用户与审计）不进 Gate。
- * 构建链路仍是演示页，保留在 BusinessGate 后：mock 显式开启才展示。
- * 非主线页面恒定显示 UnimplementedPage。
+ * 真实页面（项目、构建、账号、用户与审计）不进 Gate；业务演示页已随 P3
+ * 构建闭环下线。非主线页面恒定显示 UnimplementedPage。
  */
-function demo(element: React.ReactElement): React.ReactElement {
-  return <BusinessGate>{element}</BusinessGate>
-}
-
 export const router = createBrowserRouter([
   { path: '/login', element: <LoginPage /> },
   {
@@ -30,10 +23,10 @@ export const router = createBrowserRouter([
       { path: '/', element: <ProjectsPage /> },
       { path: '/projects/new', element: <ProjectWizardPage /> },
 
-      // 构建演示（待 P3 接入真实接口）
-      { path: '/builds', element: demo(<BuildListPage />) },
-      { path: '/builds/:id', element: demo(<BuildDetailPage />) },
-      { path: '/builds/:id/diagnosis', element: demo(<DiagnosisPage />) },
+      // 真实构建闭环（P3）：列表、详情、取消；AI 诊断尚未实现
+      { path: '/builds', element: <BuildListPage /> },
+      { path: '/builds/:id', element: <BuildDetailPage /> },
+      { path: '/builds/:id/diagnosis', element: <UnimplementedPage title="AI 诊断" /> },
 
       // 真实账号能力（所有角色）
       { path: '/account', element: <AccountSecurityPage /> },

@@ -10,12 +10,15 @@ export function LogViewer({
   running,
   highlightSeq,
   maxHeight = 420,
+  title,
 }: {
   lines: LogLine[]
   running?: boolean
   /** 高亮行（AI 锚点跳转） */
   highlightSeq?: number
   maxHeight?: number
+  /** 工具条左侧标题（默认 bash） */
+  title?: string
 }) {
   const boxRef = useRef<HTMLDivElement>(null)
   const autoScroll = useRef(true)
@@ -32,7 +35,7 @@ export function LogViewer({
       <div className="flex items-center justify-between px-space-lg py-space-sm border-b border-surface-container-highest bg-surface-container-low">
         <div className="flex items-center gap-space-md text-label-md text-outline">
           <Icon name="terminal" size={14} />
-          <span className="font-mono">bash — web-api</span>
+          <span className="font-mono">{title ?? 'bash'}</span>
           {running && (
             <span className="flex items-center gap-space-sm text-secondary">
               <span className="w-1.5 h-1.5 rounded-full bg-secondary gp-breathe" />
