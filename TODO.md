@@ -100,6 +100,8 @@ P3 第一批验证记录（2026-10-26）：后端 `go build ./...`、`go vet ./.
 
 多副本 worker 租约验证记录（2026-10-26）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（internal/builds 8 组，含新增 `TestWorkerLeaseIsExclusiveAcrossInstances` 与 `TestStandbyDoesNotRecoverAnotherInstancesBuild`：两个独立连接池竞争同一 schema 租约；持锁期间待命副本不改动 running 构建；释放后待命副本接管并恢复为 interrupted 且输出 `interrupted builds recovered`）。E2E 六组在重置 `aegis_e2e` 后通过（1.9m）。
 
+CI 暴露的既有缺陷修复（2026-10-26，随 worker 租约 PR 一并提交）：① 输出丢失——`cmd.Wait` 先于管道读取关闭读端，快命令的 stdout 可能被丢弃；改为先 drain 再 Wait，并在取消/超时后关闭父端读口，避免 Windows 上 `cmd /c ping` 的孙进程占住管道；新增 900 行输出回归用例（internal/builds 9 组）。② 短 token 下预刷新风暴——固定的 5s 提前刷新阈值在 `AEGIS_ACCESS_TTL=3s` 的 E2E 中使每个请求都轮换 Cookie，导航中断的轮换会让新页面重放已消费的 Cookie 而被判重放并登出；改为按 token 生命周期缩放提前量，新增 session store 单测（11 例）。本地 `npm run build`、`npm run lint`（0 错误、5 警告）、`npm test`（11 例）与 E2E 六组通过；CI 侧 backend/frontend 通过，e2e 结果见 PR。
+
 - [鉴权、部署与权限约定](docs/auth-contract.md)
 - [OpenAPI](backend/openapi.yaml)
 - [项目说明](README.md)

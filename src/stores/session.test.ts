@@ -123,6 +123,23 @@ describe('session store', () => {
     expect(refreshCalls).toBe(before + 1)
   })
 
+  it('does not rotate the cookie on every request when the token is short-lived', async () => {
+    const { useSession, apiRequest } = await freshStore()
+    fetchMock = (url) => {
+      if (url.includes('/auth/login')) return jsonResponse(200, { ...sessionPayload, expiresIn: 3 })
+      if (url.includes('/auth/refresh')) {
+        refreshCalls++
+        return jsonResponse(200, { ...sessionPayload, expiresIn: 3 })
+      }
+      return jsonResponse(200, { ok: true })
+    }
+    await useSession.getState().login('admin', 'pw', true)
+    const before = refreshCalls
+    for (let i = 0; i < 3; i++) await apiRequest('/jobs')
+    // A fixed five-second margin would have refreshed (and rotated) on every call.
+    expect(refreshCalls).toBe(before)
+  })
+
   it('retries a 401 exactly once after rotating the token', async () => {
     const { useSession, apiRequest } = await freshStore()
     let jobCalls = 0
