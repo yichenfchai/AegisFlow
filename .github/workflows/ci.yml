@@ -131,3 +131,13 @@ jobs:
       # Playwright starts the real Go backend and Vite dev server itself.
       - name: Browser tests (real backend, frontend, PostgreSQL, Redis)
         run: npm run test:e2e
+      # Traces and the page snapshot in error-context.md are the only way to
+      # diagnose a browser-only failure after the runner is gone.
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 7
