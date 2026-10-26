@@ -19,6 +19,7 @@
 - [x] P2 项目管理第一批（2026-10-25）：迁移 v3 项目表（共享账本抽出 internal/dbmigrate）；internal/projects 注册表（校验/大小写唯一/归档只读/分页/事务内审计，全局角色授权，不依赖 Gin）；项目 CRUD + 归档端点与 OpenAPI；首页替换为真实项目列表、创建向导接真实接口。
 - [x] P3 第一批最小构建闭环（2026-10-26）：迁移 v4（projects.build_command/build_count、builds 六状态表、build_log_events 游标表）；internal/builds 服务与进程内单并发 worker（SKIP LOCKED 领取、临时目录执行、超时与取消看门狗、批量日志与截断、重启恢复 interrupted）；httpapi 五个构建端点 + OpenAPI + RBAC；前端构建列表/详情接真实接口（`after` 游标累积轮询日志、取消按钮），项目行触发构建，创建向导支持构建命令；E2E 第六组与 E2E CI job；随后补多副本 worker 租约（PostgreSQL 会话级 advisory lock，只有持锁副本恢复与执行，待命副本自动接管）。
 - [x] P3 构建操作审计（2026-10-26）：触发（build.trigger）与取消（build.cancel）在状态变更同一事务写入 auth_audit，objectType 为 build；detail 只记录项目与构建号，不写命令；幂等重复取消不重复记账；OpenAPI 审计枚举、后端 README/鉴权契约、前端审计页中文映射（含对象类型）同步；E2E 断言管理员审计页可见“触发构建”。
+- [x] 前端演示层清理（2026-10-26）：删除全部未路由演示页（仪表盘、部署、审查、扫描、审批、知识库、攻击防御、策略、密钥、部署目标、演示审计）、mock 数据层（`src/api/mock`、`src/api/sse`）、假遥测（`stores/telemetry`）与只被演示页使用的 `BusinessGate`/`PlaceholderPage`/`StageTimeline`/`CountdownButton`；移除 `VITE_ENABLE_BUSINESS_MOCKS` 及其文档/测试配置；底部状态条改为陈述真实服务范围。未接入路由恒定显示 `UnimplementedPage`。
 
 ## P0：确定接口约定并打通真实鉴权
 
@@ -104,6 +105,8 @@ P3 第一批验证记录（2026-10-26）：后端 `go build ./...`、`go vet ./.
 CI 暴露的既有缺陷修复（2026-10-26，随 worker 租约 PR 一并提交）：① 输出丢失——`cmd.Wait` 先于管道读取关闭读端，快命令的 stdout 可能被丢弃；改为先 drain 再 Wait，并在取消/超时后关闭父端读口，避免 Windows 上 `cmd /c ping` 的孙进程占住管道；新增 900 行输出回归用例（internal/builds 9 组）。② 短 token 下预刷新风暴——固定的 5s 提前刷新阈值在 `AEGIS_ACCESS_TTL=3s` 的 E2E 中使每个请求都轮换 Cookie，导航中断的轮换会让新页面重放已消费的 Cookie 而被判重放并登出；改为按 token 生命周期缩放提前量，新增 session store 单测（11 例）。本地 `npm run build`、`npm run lint`（0 错误、5 警告）、`npm test`（11 例）与 E2E 六组通过；CI 侧 backend/frontend 通过，e2e 结果见 PR。
 
 P3 构建操作审计验证记录（2026-10-26）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（internal/builds 12 组，新增 3 个审计用例：触发写一条 build.trigger、取消与幂等只写一条 build.cancel、被拒绝的触发不写审计；httpapi 新增 1 个用例：构建触发/取消后管理员审计接口可见 build.* 与 objectType build，detail 不泄露命令，viewer 仍 403）。前端 `npm run build`、`npm run lint`（0 错误、5 条既有警告）、`npm test`（11 例）通过；E2E 六组通过（重置 `aegis_e2e`），构建用例新增管理员审计页断言（“触发构建”与“构建:对象”）。
+
+前端演示层清理验证记录（2026-10-26）：`npm run build` 通过（Vite 模块数 103→96，产物体积降低）；`npm run lint` 0 错误、2 条警告（清理前 5 条，均为演示代码警告）；`npm test` 11/11；重置 `aegis_e2e` 后 E2E 六组通过（2.1m）。`AGENTS.md` 的「演示页边界」条目仍保留，待所有者在下一次约束更新时删除（本次未改约束文档）。
 
 - [鉴权、部署与权限约定](docs/auth-contract.md)
 - [OpenAPI](backend/openapi.yaml)
