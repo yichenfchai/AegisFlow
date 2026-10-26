@@ -44,6 +44,15 @@ func sleepCommand(seconds int) string {
 	return fmt.Sprintf("sleep %d", seconds)
 }
 
+// floodCommand prints numbered lines. A fast, chatty process is the case where
+// reaping it before draining its pipes used to lose buffered output.
+func floodCommand(lines int) string {
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf("for /l %%i in (1,1,%d) do @echo line%%i", lines)
+	}
+	return fmt.Sprintf("for i in $(seq 1 %d); do echo line$i; done", lines)
+}
+
 func createProject(t *testing.T, registry *projects.Service, name, command string) *projects.Project {
 	t.Helper()
 	project, err := registry.Create(context.Background(), testActor, projects.Input{Name: name, BuildCommand: command, DefaultBranch: "main"})
@@ -174,6 +183,22 @@ func waitForLog(t *testing.T, s *Service, id, want string) string {
 			t.Fatalf("missing %q in logs: %s", want, text)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestWorkerCapturesChattyOutput(t *testing.T) {
+	s, registry := testService(t)
+	startWorker(t, s)
+	// Stay below the 1000-event log page so one read sees the last line.
+	project := createProject(t, registry, "flood-project", floodCommand(900))
+	build, err := s.Trigger(context.Background(), testActor, project.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, s, build.ID, StatusSucceeded)
+	text := waitForLog(t, s, build.ID, "line900")
+	if !strings.Contains(text, "\nline1\n") {
+		t.Fatalf("first output line missing: %s", text[:min(len(text), 200)])
 	}
 }
 

@@ -97,6 +97,25 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 		s.finish(build, StatusFailed)
 		return
 	}
+	// Closing the parent read ends unblocks the stream readers. Cancelling a
+	// shell command may leave grandchildren (on Windows `cmd /c ping` does)
+	// holding the pipes open, so shutdown must not wait for them.
+	var closeOnce sync.Once
+	closeStreams := func() {
+		closeOnce.Do(func() {
+			_ = stdout.Close()
+			_ = stderr.Close()
+		})
+	}
+	ctxWatch := make(chan struct{})
+	defer close(ctxWatch)
+	go func() {
+		select {
+		case <-execCtx.Done():
+			closeStreams()
+		case <-ctxWatch:
+		}
+	}()
 	// The watchdog terminates the process when the API cancels the build or
 	// the server shuts down.
 	watchCtx, stopWatch := context.WithCancel(context.Background())
@@ -114,6 +133,7 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 				current, err := s.Get(context.Background(), build.ID)
 				if err != nil || current.Status != StatusRunning {
 					_ = cmd.Process.Kill()
+					closeStreams()
 					return
 				}
 			}
@@ -124,8 +144,10 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 	streamWG.Add(2)
 	go func() { defer streamWG.Done(); writer.stream(stdout, "stdout") }()
 	go func() { defer streamWG.Done(); writer.stream(stderr, "stderr") }()
-	waitErr := cmd.Wait()
+	// Drain both pipes before Wait: Wait closes the parent ends of the pipes,
+	// so reaping first would drop output that a fast command already wrote.
 	streamWG.Wait()
+	waitErr := cmd.Wait()
 	stopWatch()
 	watchWG.Wait()
 
