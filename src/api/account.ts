@@ -80,4 +80,13 @@ export const AUDIT_ACTION_TEXT: Record<string, string> = {
   'project.update': '更新项目',
   'project.archive': '归档项目',
   'project.unarchive': '恢复项目',
+  'build.trigger': '触发构建',
+  'build.cancel': '取消构建',
+}
+
+export const AUDIT_OBJECT_TEXT: Record<string, string> = {
+  user: '用户',
+  session: '会话',
+  project: '项目',
+  build: '构建',
 }

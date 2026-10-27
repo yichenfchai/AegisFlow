@@ -12,7 +12,7 @@ import {
   type Column,
 } from '@/components/ui/DataTable'
 import { Segmented, StatusBadge } from '@/components/ui/Badge'
-import { adminAPI, AUDIT_ACTION_TEXT, type AccountUser, type AuditEntry } from '@/api/account'
+import { adminAPI, AUDIT_ACTION_TEXT, AUDIT_OBJECT_TEXT, type AccountUser, type AuditEntry } from '@/api/account'
 import { ApiError } from '@/api/http'
 import { useSession } from '@/stores/session'
 import { fmtRel } from '@/api/format'
@@ -282,7 +282,7 @@ const AUDIT_COLUMNS: Column<AuditEntry>[] = [
     render: (e) => (
       <div>
         <div className="font-mono text-label-sm text-outline" title={e.requestId}>
-          {e.objectType}:{e.objectId.slice(0, 10)}
+          {AUDIT_OBJECT_TEXT[e.objectType] ?? e.objectType}:{e.objectId.slice(0, 10)}
         </div>
         {e.detail && <div className="text-label-sm text-outline">{e.detail}</div>}
       </div>

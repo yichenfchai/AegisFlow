@@ -587,7 +587,7 @@ func (s *Server) cancelBuild(c *gin.Context) {
 	if !s.decode(c, &struct{}{}) {
 		return
 	}
-	build, err := s.builds.Cancel(c.Request.Context(), c.Param("id"))
+	build, err := s.builds.Cancel(c.Request.Context(), actorFrom(c), c.Param("id"))
 	if err != nil {
 		s.buildError(c, err)
 		return

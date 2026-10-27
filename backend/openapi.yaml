@@ -666,6 +666,8 @@ paths:
         build number is a per-project monotonic sequence; branch defaults to
         the project defaultBranch. Execution starts in-process (single worker,
         SKIP LOCKED claiming); a restart marks running builds interrupted.
+        A successful trigger writes a build.trigger audit entry (objectType
+        build) in the same transaction as the build row.
       security:
         - bearerAuth: []
       parameters:
@@ -825,7 +827,7 @@ paths:
       tags: [Builds]
       operationId: cancelBuild
       summary: Cancel a queued or running build (admin or member)
-      description: The executing worker terminates the process within its watchdog interval. Repeating on an already-cancelled build is an idempotent 200; terminal builds return 409.
+      description: The executing worker terminates the process within its watchdog interval. Repeating on an already-cancelled build is an idempotent 200; terminal builds return 409. A successful state change writes a build.cancel audit entry (objectType build) in the same transaction; an idempotent repeat writes no second entry.
       security:
         - bearerAuth: []
       parameters:
@@ -1121,8 +1123,8 @@ components:
         createdAt: { type: integer, format: int64, description: Unix seconds }
         actorId: { type: string, description: Empty for system rows }
         actorUsername: { type: string }
-        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive] }
-        objectType: { type: string, enum: [user, session, project] }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, build.trigger, build.cancel] }
+        objectType: { type: string, enum: [user, session, project, build] }
         objectId: { type: string }
         result: { type: string, enum: [success, failure] }
         detail: { type: string, description: Safe context such as role transitions or revoked counts; never secrets }

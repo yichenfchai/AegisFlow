@@ -44,6 +44,12 @@ test('构建闭环：触发、成功日志与 viewer 只读', async ({ page }) =
   // 终态构建没有取消按钮。
   await expect(page.getByRole('button', { name: '取消构建' })).toHaveCount(0)
 
+  // 触发构建写入持久化审计，管理员可在审计页按中文动作看到。
+  await page.goto('/settings')
+  await page.getByRole('button', { name: '审计', exact: true }).click()
+  await expect(page.getByText('触发构建').first()).toBeVisible()
+  await expect(page.getByText(/构建:/).first()).toBeVisible()
+
   const projectID = await page.evaluate(async (projectName) => {
     const { apiRequest } = await import('/src/stores/session.ts')
     const result = await apiRequest<{ items: { id: string; name: string }[] }>('/projects?limit=100&offset=0')
