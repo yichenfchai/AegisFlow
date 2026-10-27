@@ -292,7 +292,6 @@ func TestRecoverInterruptedAndList(t *testing.T) {
 	}
 }
 
-
 // outsiderActor is a global member who is not a member of the private project.
 var outsiderActor = auth.Actor{ID: "outsider-0000000000001", Username: "otto", Role: "member", RequestID: "req-outsider"}
 
