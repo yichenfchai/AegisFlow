@@ -84,7 +84,7 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 ## 开发模式和验收
 
-VITE_ENABLE_BUSINESS_MOCKS=false 是默认。项目、构建与账号管理始终调用真实接口；该开关现在只控制演示遥测与未接入模块的演示 API 注入，不改变鉴权，也不提供认证回退。未实现页面恒定显示未实现声明，不用演示数据冒充业务结果。
+前端不再提供业务演示数据或演示开关：项目、构建、账号与审计始终调用真实接口，未接入模块恒定显示未实现声明，不用演示数据冒充业务结果。登录与鉴权没有 mock 回退。
 
 后端验证：go test ./...、go vet ./...。前端验证：npm run build、npm run lint、npm test（session store 单元测试）。浏览器验证：先 npx playwright install chromium，再 npm run test:e2e；先设置 AEGIS_TEST_DATABASE_URL/AEGIS_TEST_REDIS_URL 运行后端真实集成测试；浏览器测试需另设置 AEGIS_E2E_DATABASE_URL/AEGIS_E2E_REDIS_URL 指向专用可丢弃服务，测试启动本地前后端，要求 8080、5173 端口空闲。E2E 后端显式设置 AEGIS_LOGIN_RATE_LIMIT=100，因为同一地址在一分钟内驱动多个账号登录；生产默认配额仍是 10。测试账号仅存在测试临时库；端到端配置使用随机 JWT 密钥，不使用生产数据。
 

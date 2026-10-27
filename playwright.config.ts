@@ -36,6 +36,6 @@ export default defineConfig({
         AEGIS_LOGIN_RATE_LIMIT: '100',
       },
     },
-    { command: 'npm run dev -- --host localhost --strictPort', url: 'http://localhost:5173', reuseExistingServer: false, env: { VITE_ENABLE_BUSINESS_MOCKS: 'false' } },
+    { command: 'npm run dev -- --host localhost --strictPort', url: 'http://localhost:5173', reuseExistingServer: false },
   ],
 })

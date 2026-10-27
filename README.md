@@ -14,7 +14,7 @@
 
 1. 启动 PostgreSQL、Redis，按后端文档设置连接 URL、共享密钥、首次管理员账号和密码，在 backend 目录启动 Go 服务（127.0.0.1:8080）。
 2. 在项目根目录运行 `npm install`、`npm run dev`，访问 **http://localhost:5173**。Vite 将 /api 转发至 Go 服务。
-3. 使用初始化的管理员账号登录。项目、构建、账号安全与用户管理均为真实功能；创建带「构建命令」的项目后可在项目行直接触发构建。`VITE_ENABLE_BUSINESS_MOCKS` 不再启用项目/构建演示页，仅影响未接入模块的演示数据注入，登录仍需真实账号。
+3. 使用初始化的管理员账号登录。项目、构建、账号安全与用户管理均为真实功能；创建带「构建命令」的项目后可在项目行直接触发构建。未接入的模块恒定显示未实现声明，不提供演示数据开关。
 4. 如修改访问域名或端口，同步配置后端 `AEGIS_ALLOWED_ORIGINS`。生产使用 HTTPS 并启用 `AEGIS_COOKIE_SECURE=true`。
 
 构建：`npm run build`；规范检查：`npm run lint`；单元测试：`npm test`；浏览器测试：`npx playwright install chromium` 后运行 `npm run test:e2e`（需设置专用测试服务的 `AEGIS_E2E_DATABASE_URL`、`AEGIS_E2E_REDIS_URL`，并保持 5173 和 8080 端口空闲）。
