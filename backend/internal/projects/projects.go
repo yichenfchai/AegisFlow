@@ -27,6 +27,10 @@ var (
 	ErrValidation = errors.New("validation failed")
 	ErrConflict   = errors.New("conflict")
 	ErrNotFound   = errors.New("not found")
+	// ErrForbidden means the caller may see the project but not modify it: the
+	// global role is a ceiling and a private project additionally requires the
+	// caller to be one of its maintainers.
+	ErrForbidden = errors.New("forbidden")
 )
 
 // Audited project actions, recorded in the shared auth_audit trail.
@@ -35,6 +39,11 @@ const (
 	ActionUpdate    = "project.update"
 	ActionArchive   = "project.archive"
 	ActionUnarchive = "project.unarchive"
+	// Membership changes are audited on the project object, inside the same
+	// transaction as the membership row.
+	ActionMemberAdd    = "project.member_add"
+	ActionMemberUpdate = "project.member_update"
+	ActionMemberRemove = "project.member_remove"
 )
 
 const (
@@ -62,6 +71,10 @@ const (
 // globalAdminRole is the role that is never subject to project visibility or
 // membership; it mirrors the auth package's role vocabulary.
 const globalAdminRole = "admin"
+
+// globalMemberRole is the only non-admin role that may write at all; whether it
+// may write a specific project is decided by AuthorizeWrite.
+const globalMemberRole = "member"
 
 type Project struct {
 	ID            string `json:"id"`
@@ -133,6 +146,58 @@ func VisiblePredicate(alias string, adminParam, actorParam int) string {
 // actor: whether the actor is a global admin, and the actor's user id.
 func VisibilityArgs(actor auth.Actor) (isAdmin bool, userID string) {
 	return actor.Role == globalAdminRole, actor.ID
+}
+
+// RowQuerier is satisfied by both *sql.DB and *sql.Tx, so a caller that already
+// holds the project row in a transaction can pass that transaction and see the
+// same snapshot.
+type RowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// AuthorizeWrite applies the project-maintainer overlay on top of the global
+// role. The global role stays a ceiling: a viewer never writes, an admin always
+// may. A private project additionally requires the caller to be one of its
+// maintainers; a public project keeps the pre-membership rule where any member
+// may write. An invisible project is reported as not found, never as forbidden.
+func (s *Service) AuthorizeWrite(ctx context.Context, q RowQuerier, actor auth.Actor, projectID string) error {
+	if actor.Role == globalAdminRole {
+		return nil
+	}
+	if actor.Role != globalMemberRole {
+		return fmt.Errorf("%w: read-only roles cannot modify projects", ErrForbidden)
+	}
+	var visibility string
+	err := q.QueryRowContext(ctx, `SELECT visibility FROM projects WHERE id=$1`, projectID).Scan(&visibility)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if visibility != VisibilityPrivate {
+		return nil
+	}
+	role, ok, err := memberRole(ctx, q, actor.ID, projectID)
+	if err != nil {
+		return err
+	}
+	if !ok || role != RoleMaintainer {
+		return fmt.Errorf("%w: only a project maintainer can modify a private project", ErrForbidden)
+	}
+	return nil
+}
+
+// memberRole reads one membership row; ok is false when the user is not a member.
+func memberRole(ctx context.Context, q RowQuerier, userID, projectID string) (role string, ok bool, err error) {
+	err = q.QueryRowContext(ctx, `SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2`, projectID, userID).Scan(&role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return role, true, nil
 }
 
 // Source locations serve different deployment scenarios: https or SSH git URLs
@@ -395,6 +460,11 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 	if err != nil {
 		return nil, err
 	}
+	// Visibility decides whether the actor can see the row; the maintainer
+	// overlay then decides whether it may change it.
+	if err = s.AuthorizeWrite(ctx, tx, actor, id); err != nil {
+		return nil, err
+	}
 	updated := *current
 	fieldChange := false
 	if patch.Name != nil {
@@ -523,6 +593,7 @@ func (s *Service) ListMembers(ctx context.Context, actor auth.Actor, projectID s
 
 // AddMember grants a user a role on the project. Adding an existing member is a
 // conflict; the target account must exist so membership cannot hold dangling ids.
+// Membership changes are audited inside the same transaction as the row.
 func (s *Service) AddMember(ctx context.Context, actor auth.Actor, projectID, userID, role string) (*Member, error) {
 	if !auth.ValidID(projectID) {
 		return nil, fmt.Errorf("%w: invalid project id", ErrValidation)
@@ -536,8 +607,16 @@ func (s *Service) AddMember(ctx context.Context, actor auth.Actor, projectID, us
 	if _, err := s.Get(ctx, actor, projectID); err != nil {
 		return nil, err
 	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err = s.AuthorizeWrite(ctx, tx, actor, projectID); err != nil {
+		return nil, err
+	}
 	var username string
-	err := s.db.QueryRowContext(ctx, `SELECT username FROM auth_users WHERE id=$1`, userID).Scan(&username)
+	err = tx.QueryRowContext(ctx, `SELECT username FROM auth_users WHERE id=$1`, userID).Scan(&username)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%w: user not found", ErrNotFound)
 	}
@@ -545,7 +624,7 @@ func (s *Service) AddMember(ctx context.Context, actor auth.Actor, projectID, us
 		return nil, err
 	}
 	now := time.Now().Unix()
-	result, err := s.db.ExecContext(ctx, `INSERT INTO project_members(project_id,user_id,role,created_by,created_at)
+	result, err := tx.ExecContext(ctx, `INSERT INTO project_members(project_id,user_id,role,created_by,created_at)
 	 VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, projectID, userID, role, actor.ID, now)
 	if err != nil {
 		return nil, err
@@ -554,6 +633,12 @@ func (s *Service) AddMember(ctx context.Context, actor auth.Actor, projectID, us
 		return nil, err
 	} else if n == 0 {
 		return nil, fmt.Errorf("%w: user is already a member of this project", ErrConflict)
+	}
+	if err = writeAudit(ctx, tx, actor, ActionMemberAdd, projectID, fmt.Sprintf("user=%s role=%s", username, role)); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
 	}
 	return &Member{ProjectID: projectID, UserID: userID, Username: username, Role: role, CreatedBy: actor.ID, CreatedAt: now}, nil
 }
@@ -573,7 +658,15 @@ func (s *Service) UpdateMemberRole(ctx context.Context, actor auth.Actor, projec
 	if _, err := s.Get(ctx, actor, projectID); err != nil {
 		return nil, err
 	}
-	member, err := scanMember(s.db.QueryRowContext(ctx, `UPDATE project_members pm SET role=$3
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err = s.AuthorizeWrite(ctx, tx, actor, projectID); err != nil {
+		return nil, err
+	}
+	member, err := scanMember(tx.QueryRowContext(ctx, `UPDATE project_members pm SET role=$3
 	 WHERE pm.project_id=$1 AND pm.user_id=$2
 	 RETURNING pm.project_id,pm.user_id,(SELECT username FROM auth_users WHERE id=pm.user_id),pm.role,pm.created_by,pm.created_at`,
 		projectID, userID, role))
@@ -581,6 +674,12 @@ func (s *Service) UpdateMemberRole(ctx context.Context, actor auth.Actor, projec
 		return nil, fmt.Errorf("%w: membership not found", ErrNotFound)
 	}
 	if err != nil {
+		return nil, err
+	}
+	if err = writeAudit(ctx, tx, actor, ActionMemberUpdate, projectID, fmt.Sprintf("user=%s role=%s", member.Username, member.Role)); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
 	return member, nil
@@ -599,17 +698,29 @@ func (s *Service) RemoveMember(ctx context.Context, actor auth.Actor, projectID,
 	if err != nil {
 		return err
 	}
-	if userID == project.CreatedBy {
-		return fmt.Errorf("%w: the project creator cannot be removed", ErrValidation)
-	}
-	result, err := s.db.ExecContext(ctx, `DELETE FROM project_members WHERE project_id=$1 AND user_id=$2`, projectID, userID)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return err
 	}
-	if n, err := result.RowsAffected(); err != nil {
+	defer tx.Rollback()
+	if err = s.AuthorizeWrite(ctx, tx, actor, projectID); err != nil {
 		return err
-	} else if n == 0 {
+	}
+	if userID == project.CreatedBy {
+		return fmt.Errorf("%w: the project creator cannot be removed", ErrValidation)
+	}
+	var role string
+	err = tx.QueryRowContext(ctx, `DELETE FROM project_members WHERE project_id=$1 AND user_id=$2 RETURNING role`, projectID, userID).Scan(&role)
+	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: membership not found", ErrNotFound)
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	var username string
+	_ = tx.QueryRowContext(ctx, `SELECT username FROM auth_users WHERE id=$1`, userID).Scan(&username)
+	if err = writeAudit(ctx, tx, actor, ActionMemberRemove, projectID, fmt.Sprintf("user=%s role=%s", username, role)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

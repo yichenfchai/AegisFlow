@@ -193,6 +193,11 @@ func (s *Service) enqueue(ctx context.Context, actor auth.Actor, projectID, bran
 	if status != projects.StatusActive {
 		return nil, fmt.Errorf("%w: archived project cannot start builds", ErrConflict)
 	}
+	// Visibility decided whether the row was found; the maintainer overlay then
+	// decides whether this actor may start work on the project.
+	if err = s.projects.AuthorizeWrite(ctx, tx, actor, projectID); err != nil {
+		return nil, err
+	}
 	if command == "" {
 		return nil, fmt.Errorf("%w: project has no build command configured", ErrValidation)
 	}
@@ -343,28 +348,34 @@ func (s *Service) Cancel(ctx context.Context, actor auth.Actor, id string) (*Bui
 	if !auth.ValidID(id) {
 		return nil, fmt.Errorf("%w: invalid build id", ErrValidation)
 	}
+	// Resolve the build first: this applies visibility (404) and yields the
+	// project whose maintainer overlay then decides whether cancelling is
+	// allowed (403).
+	current, err := s.Get(ctx, actor, id)
+	if err != nil {
+		return nil, err
+	}
+	if err = s.projects.AuthorizeWrite(ctx, s.db, actor, current.ProjectID); err != nil {
+		return nil, err
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	isAdmin, userID := projects.VisibilityArgs(actor)
 	build, err := scanBuild(tx.QueryRowContext(ctx, `UPDATE builds SET status=$2, finished_at=CASE WHEN finished_at=0 THEN $3 ELSE finished_at END
-	 WHERE id=$1 AND status IN ($4,$5)
-	   AND project_id IN (SELECT p.id FROM projects p WHERE `+projects.VisiblePredicate("p", 6, 7)+`)
-	 RETURNING `+buildColumns, id, StatusCancelled, time.Now().Unix(), StatusQueued, StatusRunning, isAdmin, userID))
+	 WHERE id=$1 AND status IN ($4,$5) RETURNING `+buildColumns, id, StatusCancelled, time.Now().Unix(), StatusQueued, StatusRunning))
 	if errors.Is(err, sql.ErrNoRows) {
-		// Distinguish "already cancelled" from "not visible": Get applies the
-		// same visibility rule, so an invisible build stays a 404 here too.
-		exists, existsErr := s.Get(ctx, actor, id)
-		switch {
-		case existsErr != nil:
-			return nil, existsErr
-		case exists.Status == StatusCancelled:
-			return exists, nil
-		default:
-			return nil, fmt.Errorf("%w: only queued or running builds can be cancelled", ErrConflict)
+		// Distinguish "already cancelled" from "finished another way"; the re-read
+		// also keeps the visibility check on the fallback path.
+		fresh, freshErr := s.Get(ctx, actor, id)
+		if freshErr != nil {
+			return nil, freshErr
 		}
+		if fresh.Status == StatusCancelled {
+			return fresh, nil
+		}
+		return nil, fmt.Errorf("%w: only queued or running builds can be cancelled", ErrConflict)
 	}
 	if err != nil {
 		return nil, err
