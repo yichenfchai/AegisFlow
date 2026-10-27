@@ -2,6 +2,7 @@ package builds
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -288,5 +289,78 @@ func TestRecoverInterruptedAndList(t *testing.T) {
 	}
 	if list, total, err = s.List(ctx, project.ID, 20, 0); err != nil || total != 1 || list[0].Status != StatusInterrupted {
 		t.Fatalf("project filter = %+v err=%v", list, err)
+	}
+}
+
+func TestRetryEnqueuesANewBuild(t *testing.T) {
+	s, registry := testService(t)
+	startWorker(t, s)
+	ctx := context.Background()
+	project := createProject(t, registry, "retry-project", "echo retry-me")
+	build, err := s.Trigger(ctx, testActor, project.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, s, build.ID, StatusSucceeded)
+
+	retried, err := s.Retry(ctx, testActor, build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.BuildNumber != build.BuildNumber+1 || retried.Status != StatusQueued || retried.Branch != build.Branch {
+		t.Fatalf("retry payload = %+v", retried)
+	}
+	waitForStatus(t, s, retried.ID, StatusSucceeded)
+
+	// A retry runs the project's current command, not the original snapshot:
+	// fixing the command and retrying is the point of the operation.
+	changed := "echo changed-command"
+	if _, err = registry.Update(ctx, testActor, project.ID, projects.Patch{BuildCommand: &changed}); err != nil {
+		t.Fatal(err)
+	}
+	third, err := s.Retry(ctx, testActor, build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Command != changed {
+		t.Fatalf("retry command = %q, want %q", third.Command, changed)
+	}
+	waitForStatus(t, s, third.ID, StatusSucceeded)
+
+	// Only terminal builds can be retried.
+	long := sleepCommand(30)
+	if _, err = registry.Update(ctx, testActor, project.ID, projects.Patch{BuildCommand: &long}); err != nil {
+		t.Fatal(err)
+	}
+	running, err := s.Trigger(ctx, testActor, project.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, s, running.ID, StatusRunning)
+	if _, err = s.Retry(ctx, testActor, running.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("retry of a running build error = %v", err)
+	}
+	if _, err = s.Cancel(ctx, testActor, running.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = s.Retry(ctx, testActor, "missing-0000000000000001"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown build error = %v", err)
+	}
+
+	// Retries are audited with their provenance and never the command.
+	var rows int
+	var detail string
+	if err = s.db.QueryRowContext(ctx, `SELECT count(*), coalesce(max(detail),'') FROM auth_audit WHERE action='build.retry'`).Scan(&rows, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("build.retry audit rows = %d", rows)
+	}
+	if !strings.Contains(detail, "retry_of=") {
+		t.Fatalf("retry detail = %q", detail)
+	}
+	if strings.Contains(detail, "echo") {
+		t.Fatalf("retry detail leaked the command: %q", detail)
 	}
 }

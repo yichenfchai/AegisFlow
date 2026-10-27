@@ -125,6 +125,7 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	buildRoutes.GET("/:id/logs", s.getBuildLogs)
 	buildRoutes.GET("/:id/events", s.streamBuildEvents)
 	buildRoutes.POST("/:id/cancel", s.requireRole("admin", "member"), s.cancelBuild)
+	buildRoutes.POST("/:id/retry", s.requireRole("admin", "member"), s.retryBuild)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }
@@ -486,7 +487,7 @@ func (s *Server) buildError(c *gin.Context, err error) {
 	case errors.Is(err, builds.ErrValidation):
 		s.fail(c, 400, "validation_failed", "project has no build command configured, or invalid ids or branch")
 	case errors.Is(err, builds.ErrConflict):
-		s.fail(c, 409, "conflict", "archived project cannot start builds, or only queued/running builds can be cancelled")
+		s.fail(c, 409, "conflict", "archived project cannot start builds, only queued or running builds can be cancelled, and only terminal builds can be retried")
 	case errors.Is(err, builds.ErrNotFound):
 		s.fail(c, 404, "not_found", "resource not found")
 	default:
@@ -750,6 +751,24 @@ func (s *Server) cancelBuild(c *gin.Context) {
 		return
 	}
 	s.respond(c, 200, build)
+}
+
+// retryBuild enqueues a new build for a terminal build's branch, using the
+// project's current command; the original row stays as the historical record.
+func (s *Server) retryBuild(c *gin.Context) {
+	if s.builds == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	if !s.decode(c, &struct{}{}) {
+		return
+	}
+	build, err := s.builds.Retry(c.Request.Context(), actorFrom(c), c.Param("id"))
+	if err != nil {
+		s.buildError(c, err)
+		return
+	}
+	s.respond(c, 201, build)
 }
 
 func (s *Server) changePassword(c *gin.Context) {
