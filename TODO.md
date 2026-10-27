@@ -20,6 +20,7 @@
 - [x] P3 第一批最小构建闭环（2026-10-26）：迁移 v4（projects.build_command/build_count、builds 六状态表、build_log_events 游标表）；internal/builds 服务与进程内单并发 worker（SKIP LOCKED 领取、临时目录执行、超时与取消看门狗、批量日志与截断、重启恢复 interrupted）；httpapi 五个构建端点 + OpenAPI + RBAC；前端构建列表/详情接真实接口（`after` 游标累积轮询日志、取消按钮），项目行触发构建，创建向导支持构建命令；E2E 第六组与 E2E CI job；随后补多副本 worker 租约（PostgreSQL 会话级 advisory lock，只有持锁副本恢复与执行，待命副本自动接管）。
 - [x] P3 构建操作审计（2026-10-26）：触发（build.trigger）与取消（build.cancel）在状态变更同一事务写入 auth_audit，objectType 为 build；detail 只记录项目与构建号，不写命令；幂等重复取消不重复记账；OpenAPI 审计枚举、后端 README/鉴权契约、前端审计页中文映射（含对象类型）同步；E2E 断言管理员审计页可见“触发构建”。
 - [x] 前端演示层清理（2026-10-26）：删除全部未路由演示页（仪表盘、部署、审查、扫描、审批、知识库、攻击防御、策略、密钥、部署目标、演示审计）、mock 数据层（`src/api/mock`、`src/api/sse`）、假遥测（`stores/telemetry`）与只被演示页使用的 `BusinessGate`/`PlaceholderPage`/`StageTimeline`/`CountdownButton`；移除 `VITE_ENABLE_BUSINESS_MOCKS` 及其文档/测试配置；底部状态条改为陈述真实服务范围。未接入路由恒定显示 `UnimplementedPage`。
+- [x] 构建命令环境隔离（2026-10-26，④a 安全子集）：`cmd.Env` 改为显式白名单（PATH/HOME/TMPDIR/TMP/TEMP/LANG；Windows 加 SYSTEMROOT 等），不再继承 `AEGIS_*` 服务凭据；`HOME`/临时目录指向构建目录；构建目录显式 0700；新增单元测试与真实执行 `env`/`set` 的集成测试。
 
 ## P0：确定接口约定并打通真实鉴权
 
@@ -68,7 +69,7 @@
 
 - [x] 定义构建任务状态机：排队、执行、成功、失败、取消；明确合法转换及重启恢复规则。（六态含 `interrupted`：由持有 worker 租约的副本在启动时把遗留 `running` 统一转为中断；租约为 PostgreSQL 会话级 advisory lock，保证同一部署只有一个副本执行与恢复。）
 - [ ] 设计任务、阶段、日志及产物数据模型，实现触发、详情、列表、取消和重试接口。（第一批已落地 builds / build_log_events 模型与触发、详情、列表、取消、游标日志接口；阶段、产物与重试未做。）
-- [ ] 建立受控执行环境：工作目录、执行身份、超时、取消传播、资源上限及敏感信息脱敏；隔离不可信仓库代码。（第一批只有临时工作目录、超时与取消传播；执行身份、资源上限、脱敏与隔离明确推迟，勿把不可信仓库命令接入。设计草案见 [受控执行环境与 clone 设计](docs/build-execution-design.md)，待所有者确认 D1-D6 后按 ④a/④b/④c 拆 PR。）
+- [ ] 建立受控执行环境：工作目录、执行身份、超时、取消传播、资源上限及敏感信息脱敏；隔离不可信仓库代码。（已实现：临时工作目录、超时/取消传播、0700 目录、环境变量白名单（不继承 `AEGIS_*`）。仍待做：专用执行身份、CPU/内存/进程数上限、输出脱敏、仓库 clone 与隔离；设计见 [受控执行环境与 clone 设计](docs/build-execution-design.md)，待所有者确认 D1-D6 后按 ④a/④b/④c 拆 PR。勿把不可信仓库命令接入。）
 - [x] 实现最小任务调度与 worker，限制并发；根据实际需求决定是否引入外部队列。（进程内单并发 worker，PostgreSQL 会话锁保证多副本单 worker，`FOR UPDATE SKIP LOCKED` 领取兜底；暂不引入外部队列，也不做多 worker 并行吞吐。）
 - [ ] 实现 SSE 日志与状态推送，支持断线恢复、事件序号及权限校验。（第一批用 `after` 游标轮询，事件 id 已可作为未来断点续传序号；SSE 推迟。）
 - [x] 接入构建列表和详情，验证一次真实构建从触发到结束，以及失败、取消和服务重启场景。（前端真实列表/详情/取消；E2E 覆盖触发→成功→日志；失败、超时、取消、重启中断由 internal/builds 集成测试覆盖。）
@@ -107,6 +108,8 @@ CI 暴露的既有缺陷修复（2026-10-26，随 worker 租约 PR 一并提交�
 P3 构建操作审计验证记录（2026-10-26）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（internal/builds 12 组，新增 3 个审计用例：触发写一条 build.trigger、取消与幂等只写一条 build.cancel、被拒绝的触发不写审计；httpapi 新增 1 个用例：构建触发/取消后管理员审计接口可见 build.* 与 objectType build，detail 不泄露命令，viewer 仍 403）。前端 `npm run build`、`npm run lint`（0 错误、5 条既有警告）、`npm test`（11 例）通过；E2E 六组通过（重置 `aegis_e2e`），构建用例新增管理员审计页断言（“触发构建”与“构建:对象”）。
 
 前端演示层清理验证记录（2026-10-26）：`npm run build` 通过（Vite 模块数 103→96，产物体积降低）；`npm run lint` 0 错误、2 条警告（清理前 5 条，均为演示代码警告）；`npm test` 11/11；重置 `aegis_e2e` 后 E2E 六组通过（2.1m）。`AGENTS.md` 的「演示页边界」条目仍保留，待所有者在下一次约束更新时删除（本次未改约束文档）。
+
+构建命令环境隔离验证记录（2026-10-26）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（internal/builds 15 组，新增 3 个用例：白名单不含 `AEGIS_*`、构建目录 0700、真实执行 `env`/`set` 断言日志无服务凭据且 HOME 位于 `aegis-build-*`）。E2E 六组通过（重置 `aegis_e2e`）。同 UID 下仍可读取服务进程的 `/proc/<pid>/environ` 或直连数据库，这属于 ④b 专用执行身份的范围，本 PR 只关闭环境变量继承。
 
 - [鉴权、部署与权限约定](docs/auth-contract.md)
 - [OpenAPI](backend/openapi.yaml)
