@@ -8,6 +8,7 @@ import { LoginPage } from '@/features/auth/LoginPage'
 import { SessionGate } from '@/features/auth/SessionGate'
 import { ProjectWizardPage } from '@/features/projects/ProjectWizardPage'
 import { ProjectsPage } from '@/features/projects/ProjectsPage'
+import { ProjectMembersPage } from '@/features/projects/ProjectMembersPage'
 import { AccountSecurityPage } from '@/features/account/AccountSecurityPage'
 
 /**
@@ -22,6 +23,7 @@ export const router = createBrowserRouter([
       // 真实项目注册表（P2）
       { path: '/', element: <ProjectsPage /> },
       { path: '/projects/new', element: <ProjectWizardPage /> },
+      { path: '/projects/:id/members', element: <ProjectMembersPage /> },
 
       // 真实构建闭环（P3）：列表、详情、取消；AI 诊断尚未实现
       { path: '/builds', element: <BuildListPage /> },
