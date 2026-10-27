@@ -88,6 +88,25 @@ var Migrations = [][]string{{
 	 message TEXT NOT NULL,
 	 created_at BIGINT NOT NULL)`,
 	`CREATE INDEX build_log_events_build_idx ON build_log_events(build_id, id)`,
+}, {
+	// Project visibility and membership (permissions design P1). Existing
+	// projects stay public; the creator becomes the first maintainer so an
+	// owner keeps access when the default visibility changes later. user_id is
+	// a denormalized actor snapshot like created_by and the audit actor — not
+	// a foreign key — so membership does not depend on auth row lifecycle
+	// (accounts are disabled, never deleted) and the service validates the
+	// user explicitly on insert.
+	`ALTER TABLE projects ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public','private'))`,
+	`CREATE TABLE project_members (
+	 project_id TEXT NOT NULL REFERENCES projects(id),
+	 user_id TEXT NOT NULL,
+	 role TEXT NOT NULL CHECK (role IN ('maintainer','viewer')),
+	 created_by TEXT NOT NULL DEFAULT '',
+	 created_at BIGINT NOT NULL,
+	 PRIMARY KEY (project_id, user_id))`,
+	`CREATE INDEX project_members_user_idx ON project_members(user_id, project_id)`,
+	`INSERT INTO project_members(project_id,user_id,role,created_by,created_at)
+	 SELECT id, created_by, 'maintainer', created_by, created_at FROM projects WHERE created_by <> ''`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped

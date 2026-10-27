@@ -100,7 +100,7 @@ worker 调用容器运行时（Docker/Podman）启动一次性容器：只挂载
 
 ## 7. 数据模型与配置变更
 
-- 迁移 v5：`builds.repo_url TEXT NOT NULL DEFAULT ''`（触发时快照）。
+- 迁移 **v6**：`builds.repo_url TEXT NOT NULL DEFAULT ''`（触发时快照）。原计划写的是 v5，但 v5 已被项目可见性与成员表占用（[项目级成员权限设计](project-permissions-design.md) §5）；`internal/dbmigrate` 是共享的版本化账本，按落地顺序编号，④c 需追加 v6。
 - 配置新增：
   - `AEGIS_BUILD_SANDBOX=container|user|none`（默认 `none` 用于开发，生产应设 `container`）；
   - `AEGIS_BUILD_CPU`、`AEGIS_BUILD_MEMORY`、`AEGIS_BUILD_PIDS`、`AEGIS_BUILD_DISK`（默认值见 §4）；

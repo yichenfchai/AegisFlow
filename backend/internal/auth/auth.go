@@ -42,10 +42,13 @@ var idPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
 func ValidID(id string) bool { return idPattern.MatchString(id) }
 
 // Actor identifies who performed an auditable operation. RequestID links the
-// audit row to the structured request log.
+// audit row to the structured request log. Role is the caller's global role as
+// read for this request; it bounds what the actor may see and do, so callers
+// must never derive it from client-supplied input.
 type Actor struct {
 	ID        string
 	Username  string
+	Role      string
 	RequestID string
 }
 
