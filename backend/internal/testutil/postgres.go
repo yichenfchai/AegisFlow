@@ -6,11 +6,13 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"net/url"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -32,13 +34,38 @@ func OpenPostgres(t testing.TB) *sql.DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		if _, err := admin.ExecContext(ctx, `DROP SCHEMA "`+schema+`" CASCADE`); err != nil {
+		if err := dropSchema(ctx, admin, schema); err != nil {
 			t.Errorf("drop PostgreSQL test schema: %v", err)
 		}
 	})
 	return schemaPool(t, u, schema)
+}
+
+// dropSchema removes a test schema, retrying when PostgreSQL reports a
+// deadlock. Parallel test packages create and drop schemas in the same
+// database; catalog lock ordering can deadlock even though each statement is
+// independent, and a deadlock victim is rolled back. The drop is idempotent
+// (IF EXISTS), so retrying is safe.
+func dropSchema(ctx context.Context, db *sql.DB, schema string) error {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if _, err = db.ExecContext(ctx, `DROP SCHEMA IF EXISTS "`+schema+`" CASCADE`); err == nil || !isDeadlock(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt+1) * 50 * time.Millisecond):
+		}
+	}
+	return err
+}
+
+func isDeadlock(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "40P01"
 }
 
 // ClonePostgres opens an independent pool in an existing test database schema.
