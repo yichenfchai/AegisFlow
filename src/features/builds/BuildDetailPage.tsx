@@ -8,8 +8,11 @@ import {
   buildsAPI,
   BUILD_STATUS_TEXT,
   BUILD_STATUS_TONE,
+  type Build,
   type BuildStatus,
+  type LogEvent,
 } from '@/api/builds'
+import { streamBuildEvents } from '@/api/buildStream'
 import { projectsAPI } from '@/api/projects'
 import { ApiError } from '@/api/http'
 import { fmtRel } from '@/api/format'
@@ -47,10 +50,10 @@ interface LogState {
 }
 
 /**
- * 按游标累积构建日志：after 取上一条事件 id，只追加新事件，不整页重刷。
- * cursor 用 ref 保存，轮询循环不因状态变化重启；终态后继续读满宽限期。
+ * 轮询回退：按游标累积构建日志（after 取上一条事件 id，只追加新事件）。
+ * SSE 建立失败时才启动；终态后继续读满宽限期，避免丢掉最后一批 flush。
  */
-function useBuildLogs(buildID: string, terminal: boolean) {
+function usePollingLogs(buildID: string, terminal: boolean, enabled: boolean) {
   const [state, setState] = useState<LogState>({ buildID, lines: emptyLogs, error: '' })
   const cursor = useRef(0)
   const terminalRef = useRef(terminal)
@@ -60,6 +63,7 @@ function useBuildLogs(buildID: string, terminal: boolean) {
   }, [terminal])
 
   useEffect(() => {
+    if (!enabled) return
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | undefined
     let tailDeadline = 0
@@ -104,11 +108,106 @@ function useBuildLogs(buildID: string, terminal: boolean) {
       cancelled = true
       if (timer) clearTimeout(timer)
     }
-  }, [buildID])
+  }, [buildID, enabled])
 
   return state.buildID === buildID
     ? { lines: state.lines, error: state.error }
     : { lines: emptyLogs, error: '' }
+}
+
+type LogMode = 'connecting' | 'streaming' | 'polling' | 'done'
+
+interface StreamState extends LogState {
+  mode: LogMode
+}
+
+/**
+ * SSE 优先：日志与状态通过 /builds/:id/events 推送（fetch 流式读取，因为
+ * EventSource 不能带 Bearer）。连接失败重试一次后回退到轮询；服务端到达
+ * 连接寿命上限时按游标续传，构建终态后停止。
+ */
+function useBuildStream(buildID: string, onBuild: (build: Build) => void) {
+  const [state, setState] = useState<StreamState>({ buildID, lines: emptyLogs, error: '', mode: 'connecting' })
+  const cursor = useRef(0)
+  const onBuildRef = useRef(onBuild)
+
+  useEffect(() => {
+    onBuildRef.current = onBuild
+  }, [onBuild])
+
+  useEffect(() => {
+    const abort = new AbortController()
+    let disposed = false
+    let attempts = 0
+    cursor.current = 0
+
+    const append = (events: LogEvent[]) => {
+      setState((prev) => {
+        const lines = prev.buildID === buildID ? prev.lines : emptyLogs
+        const added = events.map((event, index) => ({
+          seq: lines.length + index + 1,
+          stream: event.stream,
+          content: event.message,
+          ts: event.createdAt,
+        }))
+        return { buildID, lines: [...lines, ...added], error: '', mode: 'streaming' }
+      })
+    }
+
+    const run = async () => {
+      while (!disposed) {
+        try {
+          const end = await streamBuildEvents(buildID, cursor.current, abort.signal, {
+            onOpen: () =>
+              setState((prev) => ({
+                buildID,
+                lines: prev.buildID === buildID ? prev.lines : emptyLogs,
+                error: '',
+                mode: 'streaming',
+              })),
+            onStatus: (next) => onBuildRef.current(next),
+            onLogs: (events) => {
+              cursor.current = events[events.length - 1].id
+              append(events)
+            },
+          })
+          attempts = 0
+          if (end === 'terminal') {
+            setState((prev) => ({
+              buildID,
+              lines: prev.buildID === buildID ? prev.lines : emptyLogs,
+              error: '',
+              mode: 'done',
+            }))
+            return
+          }
+        } catch (cause) {
+          if (disposed) return
+          attempts++
+          if (attempts >= 2) {
+            setState((prev) => ({
+              buildID,
+              lines: prev.buildID === buildID ? prev.lines : emptyLogs,
+              mode: 'polling',
+              error: cause instanceof Error ? cause.message : '日志流不可用，已回退轮询',
+            }))
+            return
+          }
+          await new Promise((resolve) => setTimeout(resolve, 500 * attempts))
+        }
+      }
+    }
+
+    void run()
+    return () => {
+      disposed = true
+      abort.abort()
+    }
+  }, [buildID])
+
+  return state.buildID === buildID
+    ? { lines: state.lines, mode: state.mode, error: state.error }
+    : { lines: emptyLogs, mode: 'connecting' as LogMode, error: '' }
 }
 
 /** 构建详情（真实接口）：状态、命令快照、触发信息与游标累积的日志流。 */
@@ -141,7 +240,13 @@ export function BuildDetailPage() {
   })
 
   const terminal = build ? isTerminal(build.status) : false
-  const { lines, error: logError } = useBuildLogs(id, terminal)
+  const stream = useBuildStream(id, (next) => {
+    queryClient.setQueryData(['build', next.id], next)
+  })
+  const polling = usePollingLogs(id, terminal, stream.mode === 'polling')
+  const lines = stream.mode === 'polling' ? polling.lines : stream.lines
+  const logError = stream.mode === 'polling' ? polling.error : stream.error
+  const live = stream.mode === 'streaming'
 
   const cancel = async () => {
     if (!build) return
@@ -236,7 +341,7 @@ export function BuildDetailPage() {
         </div>
 
         <div className="space-y-space-sm">
-          <LogViewer lines={lines} running={!terminal} title={build.command} maxHeight={560} />
+          <LogViewer lines={lines} running={!terminal} live={live} title={build.command} maxHeight={560} />
           {logError && (
             <p role="alert" className="text-body-sm text-error">
               {logError}

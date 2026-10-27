@@ -32,10 +32,17 @@ test('构建闭环：触发、成功日志与 viewer 只读', async ({ page }) =
   await expect(page).toHaveURL('/builds')
   const buildRow = page.getByRole('row', { name: new RegExp(name) })
   await expect(buildRow).toBeVisible()
+  // 详情页用带 Bearer 的 SSE 流式读取日志（EventSource 无法带 Authorization）。
+  const eventStream = page.waitForResponse(
+    (response) => response.url().includes('/api/v1/builds/') && response.url().includes('/events'),
+  )
   await buildRow.getByRole('link', { name: '#1' }).click()
+  const streamResponse = await eventStream
+  expect(streamResponse.status()).toBe(200)
+  expect(streamResponse.headers()['content-type']).toContain('text/event-stream')
   await expect(page).toHaveURL(/\/builds\/[A-Za-z0-9_-]{16,64}$/)
 
-  // 详情页展示命令快照，并在轮询中到达成功终态。
+  // 详情页展示命令快照，并通过 SSE 推送到达成功终态与日志。
   await expect(page.getByText('echo e2e-build-ok').first()).toBeVisible()
   await expect(page.getByText('成功', { exact: true })).toBeVisible({ timeout: 20_000 })
   // 日志按游标累积：进程输出与收尾系统行都要出现。

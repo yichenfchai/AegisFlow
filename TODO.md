@@ -21,6 +21,7 @@
 - [x] P3 构建操作审计（2026-10-26）：触发（build.trigger）与取消（build.cancel）在状态变更同一事务写入 auth_audit，objectType 为 build；detail 只记录项目与构建号，不写命令；幂等重复取消不重复记账；OpenAPI 审计枚举、后端 README/鉴权契约、前端审计页中文映射（含对象类型）同步；E2E 断言管理员审计页可见“触发构建”。
 - [x] 前端演示层清理（2026-10-26）：删除全部未路由演示页（仪表盘、部署、审查、扫描、审批、知识库、攻击防御、策略、密钥、部署目标、演示审计）、mock 数据层（`src/api/mock`、`src/api/sse`）、假遥测（`stores/telemetry`）与只被演示页使用的 `BusinessGate`/`PlaceholderPage`/`StageTimeline`/`CountdownButton`；移除 `VITE_ENABLE_BUSINESS_MOCKS` 及其文档/测试配置；底部状态条改为陈述真实服务范围。未接入路由恒定显示 `UnimplementedPage`。
 - [x] 构建命令环境隔离（2026-10-26，④a 安全子集）：`cmd.Env` 改为显式白名单（PATH/HOME/TMPDIR/TMP/TEMP/LANG；Windows 加 SYSTEMROOT 等），不再继承 `AEGIS_*` 服务凭据；`HOME`/临时目录指向构建目录；构建目录显式 0700；新增单元测试与真实执行 `env`/`set` 的集成测试。
+- [x] P3 构建 SSE 推送（2026-10-26）：`GET /api/v1/builds/{id}/events` 流式推送 status/logs/done，`Last-Event-ID`/`after` 续传、15s 心跳、终态静默收尾、单连接 10 分钟上限后要求重连；为长连接单独豁免服务器写超时；前端用带 Bearer 的 fetch 流式读取（EventSource 无法带 Authorization，token 不进 URL），连接失败重试一次后回退现有游标轮询，并在日志工具条显示“实时推送”。
 
 ## P0：确定接口约定并打通真实鉴权
 
@@ -71,7 +72,7 @@
 - [ ] 设计任务、阶段、日志及产物数据模型，实现触发、详情、列表、取消和重试接口。（第一批已落地 builds / build_log_events 模型与触发、详情、列表、取消、游标日志接口；阶段、产物与重试未做。）
 - [ ] 建立受控执行环境：工作目录、执行身份、超时、取消传播、资源上限及敏感信息脱敏；隔离不可信仓库代码。（已实现：临时工作目录、超时/取消传播、0700 目录、环境变量白名单（不继承 `AEGIS_*`）。仍待做：专用执行身份、CPU/内存/进程数上限、输出脱敏、仓库 clone 与隔离；设计见 [受控执行环境与 clone 设计](docs/build-execution-design.md)，待所有者确认 D1-D6 后按 ④a/④b/④c 拆 PR。勿把不可信仓库命令接入。）
 - [x] 实现最小任务调度与 worker，限制并发；根据实际需求决定是否引入外部队列。（进程内单并发 worker，PostgreSQL 会话锁保证多副本单 worker，`FOR UPDATE SKIP LOCKED` 领取兜底；暂不引入外部队列，也不做多 worker 并行吞吐。）
-- [ ] 实现 SSE 日志与状态推送，支持断线恢复、事件序号及权限校验。（第一批用 `after` 游标轮询，事件 id 已可作为未来断点续传序号；SSE 推迟。）
+- [x] 实现 SSE 日志与状态推送，支持断线恢复、事件序号及权限校验。（`GET /builds/{id}/events`：status/logs/done 帧、事件 id 即续传序号、`Last-Event-ID`/`after` 断点续传、心跳与终态收尾、沿用 Bearer + 全局角色校验；前端失败自动回退轮询。）
 - [x] 接入构建列表和详情，验证一次真实构建从触发到结束，以及失败、取消和服务重启场景。（前端真实列表/详情/取消；E2E 覆盖触发→成功→日志；失败、超时、取消、重启中断由 internal/builds 集成测试覆盖。）
 
 ## P4：部署、审批与审计
@@ -110,6 +111,8 @@ P3 构建操作审计验证记录（2026-10-26）：`go build ./...`、`go vet .
 前端演示层清理验证记录（2026-10-26）：`npm run build` 通过（Vite 模块数 103→96，产物体积降低）；`npm run lint` 0 错误、2 条警告（清理前 5 条，均为演示代码警告）；`npm test` 11/11；重置 `aegis_e2e` 后 E2E 六组通过（2.1m）。`AGENTS.md` 的「演示页边界」条目仍保留，待所有者在下一次约束更新时删除（本次未改约束文档）。
 
 构建命令环境隔离验证记录（2026-10-26）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（internal/builds 15 组，新增 3 个用例：白名单不含 `AEGIS_*`、构建目录 0700、真实执行 `env`/`set` 断言日志无服务凭据且 HOME 位于 `aegis-build-*`）。E2E 六组通过（重置 `aegis_e2e`）。同 UID 下仍可读取服务进程的 `/proc/<pid>/environ` 或直连数据库，这属于 ④b 专用执行身份的范围，本 PR 只关闭环境变量继承。
+
+P3 构建 SSE 验证记录（2026-10-26）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（httpapi 新增 2 组 SSE 用例：真实 httptest 服务器配置 200ms 写超时，仍能在延迟命令后收到输出与终态 done；负游标/非数字游标/未知构建/未鉴权分别 400/400/404/401）。前端 `npm run build`、`npm run lint`（0 错误、2 条既有警告）、`npm test`（14 例，含 SSE 分帧解析 3 例）通过；E2E 六组通过（重置 `aegis_e2e`），构建用例断言 `/events` 返回 200 与 `text/event-stream` 且日志经推送到达。
 
 - [鉴权、部署与权限约定](docs/auth-contract.md)
 - [OpenAPI](backend/openapi.yaml)
