@@ -8,7 +8,7 @@ import (
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX"} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("AEGIS_JWT_SECRET", strings.Repeat("s", 32))
@@ -54,6 +54,35 @@ func TestRejectUnsafeConfig(t *testing.T) {
 			t.Setenv(tc.key, tc.value)
 			if _, err := Load(); err == nil {
 				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestBuildSandboxConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    BuildSandbox
+		invalid bool
+	}{
+		{"", BuildSandboxNone, false},
+		{"none", BuildSandboxNone, false},
+		{"user", "", true},
+		{"container", "", true},
+		{"docker", "", true},
+		{"Container", "", true},
+	} {
+		t.Run("value="+tc.value, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_BUILD_SANDBOX", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid || (!tc.invalid && c.BuildSandbox != tc.want) {
+				t.Fatalf("sandbox=%q err=%v", c.BuildSandbox, err)
+			}
+			// An unimplemented mode must say so: silently accepting it would
+			// promise isolation the executor does not provide.
+			if tc.invalid && tc.value == "container" && !strings.Contains(err.Error(), "not implemented") {
+				t.Fatalf("error should explain that the mode is not implemented: %v", err)
 			}
 		})
 	}

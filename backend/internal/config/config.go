@@ -20,7 +20,19 @@ type Config struct {
 	AllowedOrigins                                                                                  []string
 	AccessTTL, RefreshTTL, BuildTimeout                                                             time.Duration
 	CookieSecure                                                                                    bool
+	BuildSandbox                                                                                    BuildSandbox
 }
+
+// BuildSandbox is how build commands are executed. It mirrors the options in
+// docs/build-execution-design.md: "none" runs commands as the service account,
+// "user" a dedicated OS account and "container" a one-shot container per build.
+type BuildSandbox string
+
+const (
+	BuildSandboxNone      BuildSandbox = "none"
+	BuildSandboxUser      BuildSandbox = "user"
+	BuildSandboxContainer BuildSandbox = "container"
+)
 
 // Load fails closed: credentials have no built-in defaults. Durations use Go syntax.
 func Load() (Config, error) {
@@ -113,6 +125,18 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("invalid CORS origin %q", origin)
 		}
 		c.AllowedOrigins = append(c.AllowedOrigins, origin)
+	}
+	// Build isolation switch. Only the unisolated mode exists today: accepting
+	// "user" or "container" while the executor still runs commands as the
+	// service account would be a false guarantee, so it fails closed until the
+	// controlled execution environment lands (docs/build-execution-design.md §7).
+	switch value := BuildSandbox(os.Getenv("AEGIS_BUILD_SANDBOX")); value {
+	case "", BuildSandboxNone:
+		c.BuildSandbox = BuildSandboxNone
+	case BuildSandboxUser, BuildSandboxContainer:
+		return c, fmt.Errorf("AEGIS_BUILD_SANDBOX=%s is not implemented yet: builds would still run as the service account; use none", value)
+	default:
+		return c, fmt.Errorf("AEGIS_BUILD_SANDBOX must be none, user or container, got %q", value)
 	}
 	return c, nil
 }

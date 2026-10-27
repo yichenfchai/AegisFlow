@@ -34,6 +34,11 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	if cfg.BuildSandbox == config.BuildSandboxNone {
+		// Not an error: the controlled execution environment is not built yet.
+		// The warning keeps an operator from assuming isolation that does not exist.
+		logger.Warn("build commands run as the service account without isolation", "sandbox", string(cfg.BuildSandbox))
+	}
 	db, err := sql.Open("pgx", cfg.DatabaseURL)
 	if err != nil {
 		return errors.New("invalid PostgreSQL connection configuration")
