@@ -11,6 +11,7 @@ export function LogViewer({
   highlightSeq,
   maxHeight = 420,
   title,
+  live,
 }: {
   lines: LogLine[]
   running?: boolean
@@ -19,6 +20,8 @@ export function LogViewer({
   maxHeight?: number
   /** 工具条左侧标题（默认 bash） */
   title?: string
+  /** 当前由 SSE 实时推送（而非轮询回退） */
+  live?: boolean
 }) {
   const boxRef = useRef<HTMLDivElement>(null)
   const autoScroll = useRef(true)
@@ -40,6 +43,12 @@ export function LogViewer({
             <span className="flex items-center gap-space-sm text-secondary">
               <span className="w-1.5 h-1.5 rounded-full bg-secondary gp-breathe" />
               流式写入保持活跃
+            </span>
+          )}
+          {live && (
+            <span className="flex items-center gap-space-sm text-success">
+              <span className="w-1.5 h-1.5 rounded-full bg-success gp-breathe" />
+              实时推送
             </span>
           )}
         </div>

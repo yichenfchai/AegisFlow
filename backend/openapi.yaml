@@ -779,10 +779,10 @@ paths:
       operationId: getBuildLogs
       summary: Build log events after a cursor (all roles)
       description: |
-        Polling endpoint; SSE streaming arrives in a later batch. The cursor
-        `after` is the last event id the client saw and doubles as the future
-        resume sequence. Output is capped server-side (line length and total
-        events) with a system line marking truncation.
+        Polling endpoint retained as the fallback for SSE clients. The cursor
+        `after` is the last event id the client saw. Output is capped
+        server-side (line length and total events) with a system line marking
+        truncation.
       security:
         - bearerAuth: []
       parameters:
@@ -817,6 +817,46 @@ paths:
                         type: array
                         items: { $ref: '#/components/schemas/LogEvent' }
                   requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/builds/{buildId}/events:
+    get:
+      tags: [Builds]
+      operationId: streamBuildEvents
+      summary: Stream build logs and status as Server-Sent Events (all roles)
+      description: |
+        Long-lived `text/event-stream` response. Frames: `event: status` with a
+        Build payload on connect and on every status change; `event: logs` with
+        a JSON array of LogEvent whose last id is the resume cursor; `event:
+        done` with `{"reason":"terminal"}` once a finished build's output has
+        settled, or `{"reason":"reconnect"}` when the connection lifetime cap
+        is reached. Comment frames (`: ping`) keep intermediaries open. Resume
+        with `Last-Event-ID` (or `?after=`). Clients must send the bearer token
+        on a streaming request; RBAC matches the polling logs endpoint.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - name: after
+          in: query
+          required: false
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: Server-Sent Events stream (status, logs, done, ping comments)
+          content:
+            text/event-stream:
+              schema: { type: string }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }

@@ -34,7 +34,8 @@
 | POST /api/v1/projects/{id}/builds | admin/member Bearer，JSON branch? | 入队构建，201（queued）；项目须活跃且配置 buildCommand |
 | GET /api/v1/builds | Bearer（所有角色），limit/offset/projectId? | 构建分页，最新在前 |
 | GET /api/v1/builds/{id} | Bearer（所有角色） | 构建详情（状态、命令快照、时间戳） |
-| GET /api/v1/builds/{id}/logs | Bearer（所有角色），after/limit | 日志事件 {items}，按事件 id 升序；after 为游标 |
+| GET /api/v1/builds/{id}/logs | Bearer（所有角色），after/limit | 日志事件 {items}，按事件 id 升序；after 为游标（SSE 回退通道） |
+| GET /api/v1/builds/{id}/events | Bearer（所有角色），after 或 Last-Event-ID | SSE：status/logs/done 帧与心跳；按事件 id 续传 |
 | POST /api/v1/builds/{id}/cancel | admin/member Bearer，JSON {} | 取消排队/运行中的构建；重复取消幂等，终态 409 |
 
 accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh token 不返回 JSON，由 HttpOnly、SameSite=Strict、Path=/api/v1/auth 的 Cookie 保存，无 Domain。勾选保持登录时 Cookie 持久化到绝对会话期限，未勾选使用 session Cookie；浏览器恢复会话可能保留 session Cookie，因此不承诺关闭窗口立即退出。主动退出以服务端撤销为准。默认绝对期限 30 天，由后端配置决定，刷新不延长。
@@ -45,6 +46,7 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 - 构建状态为 queued/running/succeeded/failed/cancelled/interrupted；interrupted 由持有 worker 租约的实例在启动恢复时产生，表示进程中断而非业务失败。
 - 触发时固化命令、分支与触发人快照，构建号在项目内自增；仓储地址不参与本批执行（不 clone），命令在临时目录用系统 shell 执行，超时由 AEGIS_BUILD_TIMEOUT 控制。
+- 日志与状态提供两条读取通道：`GET /builds/{id}/events` 的 SSE 推送（`status`/`logs`/`done` 帧，`Last-Event-ID` 或 `after` 续传，15s 心跳，终态后静默收尾，单连接上限 10 分钟）与保留的 `after` 游标轮询。SSE 必须携带 Bearer，因此前端用 fetch 流式读取而不是 `EventSource`，token 不放进 URL。
 - 构建不改变账号/权限数据，也不写审计表；触发、取消与日志读取沿用全局角色授权（admin/member 可写，viewer 只读），每次请求由服务端校验，不依赖前端隐藏按钮。
 - 执行环境尚非完全受控：以服务进程身份执行，没有专用执行账号、资源上限或输出脱敏；但构建命令只获得最小环境变量白名单（`PATH`/`HOME`/`TMPDIR`/`TMP`/`TEMP`/`LANG` 等，Windows 另加系统必需变量），不继承 `AEGIS_*` 服务凭据，`HOME` 与临时目录都指向 0700 的构建目录。不要把不可信仓库命令接入本批执行器。
 
@@ -88,4 +90,4 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 后端验证：go test ./...、go vet ./...。前端验证：npm run build、npm run lint、npm test（session store 单元测试）。浏览器验证：先 npx playwright install chromium，再 npm run test:e2e；先设置 AEGIS_TEST_DATABASE_URL/AEGIS_TEST_REDIS_URL 运行后端真实集成测试；浏览器测试需另设置 AEGIS_E2E_DATABASE_URL/AEGIS_E2E_REDIS_URL 指向专用可丢弃服务，测试启动本地前后端，要求 8080、5173 端口空闲。E2E 后端显式设置 AEGIS_LOGIN_RATE_LIMIT=100，因为同一地址在一分钟内驱动多个账号登录；生产默认配额仍是 10。测试账号仅存在测试临时库；端到端配置使用随机 JWT 密钥，不使用生产数据。
 
-验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出；构建闭环覆盖 UI 创建带构建命令的项目、触发构建、列表与详情、轮询日志中出现进程输出与 build succeeded、viewer 只读且触发 403。剩余能力（SSE 推送、受控执行环境、仓库 clone、多 worker 并行吞吐）、生产备份及业务审计见 [TODO](../TODO.md)。
+验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出；构建闭环覆盖 UI 创建带构建命令的项目、触发构建、列表与详情、SSE 推送日志中出现进程输出与 build succeeded、viewer 只读且触发 403。剩余能力（受控执行环境、仓库 clone、多 worker 并行吞吐）、生产备份及业务审计见 [TODO](../TODO.md)。
