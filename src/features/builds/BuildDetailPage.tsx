@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link, useParams } from 'react-router'
+import { Link, useNavigate, useParams } from 'react-router'
 import { Button, PageHeader } from '@/components/ui/DataTable'
 import { StatusBadge } from '@/components/ui/Badge'
 import { LogViewer } from '@/components/domain/LogViewer'
@@ -31,10 +31,10 @@ const LOG_TAIL_GRACE_MS = 6000
 
 const isTerminal = (status: BuildStatus) => TERMINAL_STATUSES.includes(status)
 
-function opError(cause: unknown): string {
+function opError(cause: unknown, conflict = '构建状态不允许该操作'): string {
   if (cause instanceof ApiError) {
-    if (cause.status === 409) return '构建已结束，无法取消'
-    if (cause.status === 403) return '当前角色没有取消构建的权限'
+    if (cause.status === 409) return conflict
+    if (cause.status === 403) return '当前角色没有该操作权限'
     if (cause.status === 404) return '构建不存在或已被清理'
     if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
@@ -216,8 +216,10 @@ export function BuildDetailPage() {
   const { user } = useSession()
   const canWrite = user?.role === 'admin' || user?.role === 'member'
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
   const [actionError, setActionError] = useState('')
   const [cancelling, setCancelling] = useState(false)
+  const [retrying, setRetrying] = useState(false)
 
   const { data: build, isLoading, error } = useQuery({
     queryKey: ['build', id],
@@ -257,9 +259,25 @@ export function BuildDetailPage() {
       await queryClient.invalidateQueries({ queryKey: ['build', build.id] })
       await queryClient.invalidateQueries({ queryKey: ['builds'] })
     } catch (cause) {
-      setActionError(opError(cause))
+      setActionError(opError(cause, '构建已结束，无法取消'))
     } finally {
       setCancelling(false)
+    }
+  }
+
+  /** 重试返回的是一个新构建，直接跳到它的详情页。 */
+  const retry = async () => {
+    if (!build) return
+    setActionError('')
+    setRetrying(true)
+    try {
+      const next = await buildsAPI.retry(build.id)
+      await queryClient.invalidateQueries({ queryKey: ['builds'] })
+      navigate(`/builds/${next.id}`)
+    } catch (cause) {
+      setActionError(opError(cause, '项目已归档或缺少构建命令，无法重试'))
+    } finally {
+      setRetrying(false)
     }
   }
 
@@ -302,6 +320,11 @@ export function BuildDetailPage() {
                   {cancelling ? '取消中...' : '取消构建'}
                 </Button>
               ) : null
+            ) : null}
+            {terminal && canWrite ? (
+              <Button icon="restart_alt" disabled={retrying} onClick={() => void retry()}>
+                {retrying ? '重试中...' : '重试构建'}
+              </Button>
             ) : null}
           </>
         }
