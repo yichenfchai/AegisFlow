@@ -23,7 +23,8 @@
 - [x] 构建命令环境隔离（2026-10-26，④a 安全子集）：`cmd.Env` 改为显式白名单（PATH/HOME/TMPDIR/TMP/TEMP/LANG；Windows 加 SYSTEMROOT 等），不再继承 `AEGIS_*` 服务凭据；`HOME`/临时目录指向构建目录；构建目录显式 0700；新增单元测试与真实执行 `env`/`set` 的集成测试。
 - [x] P3 构建 SSE 推送（2026-10-26）：`GET /api/v1/builds/{id}/events` 流式推送 status/logs/done，`Last-Event-ID`/`after` 续传、15s 心跳、终态静默收尾、单连接 10 分钟上限后要求重连；为长连接单独豁免服务器写超时；前端用带 Bearer 的 fetch 流式读取（EventSource 无法带 Authorization，token 不进 URL），连接失败重试一次后回退现有游标轮询，并在日志工具条显示“实时推送”。
 - [x] 项目可见性与成员（2026-10-27，⑤ P1）：迁移 v5（`projects.visibility` + `project_members`，存量项目按 `created_by` 补写 maintainer 行）；`internal/projects` 增加可见性谓词（唯一实现，构建查询复用）与成员增删改；项目与构建的列表、详情、日志、SSE、触发、取消全部按可见性过滤，不可见一律 404 防枚举；成员 API 四端点；创建者不可移除、重复成员 409、目标账号不存在 404；OpenAPI、鉴权契约、后端/根 README 同步。
-- [x] 项目写权限叠加（2026-10-27，⑤ P2）：`projects.AuthorizeWrite` 统一判定——全局角色是上限（viewer 不写、admin 总写），private 项目额外要求 maintainer（可见但无权 403，不可见仍 404），public 项目保持任意 member 可写；项目修改/归档、触发/取消、成员增删改全部复用；成员变更写 `project.member_add` / `project.member_update` / `project.member_remove` 审计（与状态同事务，detail 只写用户名与角色）；OpenAPI 审计枚举、鉴权契约、后端 README 同步。前端成员页（P3）待做。
+- [x] 项目写权限叠加（2026-10-27，⑤ P2）：`projects.AuthorizeWrite` 统一判定——全局角色是上限（viewer 不写、admin 总写），private 项目额外要求 maintainer（可见但无权 403，不可见仍 404），public 项目保持任意 member 可写；项目修改/归档、触发/取消、成员增删改全部复用；成员变更写 `project.member_add` / `project.member_update` / `project.member_remove` 审计（与状态同事务，detail 只写用户名与角色）；OpenAPI 审计枚举、鉴权契约、后端 README 同步。
+- [x] 项目可见性与成员前端（2026-10-27，⑤ P3）：项目列表增加公开/私有徽章与「成员」入口；创建向导支持选择可见性（默认公开）；新增 `/projects/:id/members` 成员管理页（列表、添加、改角色、移除），管理员从用户目录选择，非管理员 maintainer 通过用户 ID 添加（已知可用性缺口：他们没有全站用户列表权限）。E2E 新增第七组覆盖私有项目、非成员 404、查看者 403 与提升维护者后可触发。
 
 ## P0：确定接口约定并打通真实鉴权
 
@@ -119,6 +120,8 @@ P3 构建 SSE 验证记录（2026-10-26）：`go build ./...`、`go vet ./...`�
 项目可见性与成员 P1 验证记录（2026-10-27）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17（5433）+ Redis 8.8 下 `go test -race ./... -count=1` 全绿。新增用例：`internal/projects` 2 组（可见性过滤：admin 全见、非成员只见 public、非成员 Get/Update 均 404、成员 viewer 读、切回 public 恢复；成员生命周期：创建者为 maintainer、添加/重复 409/账号不存在 404/非法角色 400/改角色/未知成员 404/创建者不可移除 400/移除后失去可见性/非成员列成员 404）；`internal/builds` 1 组（private 项目下 outsider 的 List 为空、Get/Logs/Trigger/Cancel 全 404，创建者与 admin 不受影响）；`httpapi` 1 组（私有项目对非成员四条路径全 404、成员列表、重复 409、未知账号 404、非法角色 400、成员可读、全局 viewer 仍 403 写、提升/移除成员、创建者不可移除、public 项目对所有角色行为不变）。OpenAPI 契约用例新增 4 条成员路由。前端未改动；E2E 六组在重置 `aegis_e2e` 后通过，验证 public 项目行为未变。
 
 项目写权限叠加 P2 验证记录（2026-10-27）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿。新增用例：`internal/projects` 1 组（非成员写 404、viewer 成员更新与加成员均 403、全局 viewer 即使被加为 maintainer 仍 403、提升 maintainer 后可写、public 项目任意 member 可写、创建者仍不可移除、`project.member_add/update/remove` 三条审计齐全）；`internal/builds` 1 组（private 项目 viewer 成员触发/取消均 403，提升 maintainer 后触发成功）；`httpapi` 1 组（非成员 PATCH 404；viewer 成员在改项目、触发构建、加成员、改角色、移除成员五条路径全部 403 且 code=forbidden；提升后 PATCH 与触发均 200/201）。前端未改动；E2E 六组回归通过（public 项目行为不变）。
+
+项目可见性与成员 P3 验证记录（2026-10-27）：前端 `npm run build` 通过（模块数 99，产物体积 +336 B gzip 约 +1.7 kB），`npm run lint` 0 错误 2 条既有警告，`npm test` 14 例通过。新增 `tests/e2e/permissions.spec.ts`（第七组）：向导创建私有项目并断言列表徽章「私有」；成员页显示创建者自动为维护者；管理员从用户目录添加查看者；非成员新上下文深链 `/projects/{id}/members` 得到「未找到该项目」；查看者成员可进成员页但无「添加成员」控件，且直接调用触发构建接口返回 403；提设为维护者后同一账号能在项目行触发构建并跳到构建列表。`npm run test:e2e` 七组全过（重置 `aegis_e2e`，1.4m）。后端沿用 P1/P2 的 race 结果，本批只改前端与文档。
 
 - [鉴权、部署与权限约定](docs/auth-contract.md)
 - [OpenAPI](backend/openapi.yaml)
