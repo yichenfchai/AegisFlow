@@ -72,18 +72,30 @@ server: {
 | PATCH | /api/v1/users/{id} | Bearer + admin；`{role?,disabled?}` 至少一项 | `{updated:true}` |
 | POST | /api/v1/users/{id}/password-reset | Bearer + admin；`{password}` | `{reset:true}`，撤销目标全部会话 |
 | GET | /api/v1/audit | Bearer + admin；`?limit=&offset=` | `{items,total,limit,offset}`，最新在前 |
-| GET | /api/v1/projects | Bearer（所有角色）；`?limit=&offset=&status=active\|archived` | `{items,total,limit,offset}`，按名称排序 |
-| POST | /api/v1/projects | Bearer + admin/member；`{name,description?,repoUrl?,defaultBranch?,buildCommand?}` | Project，201 |
-| GET | /api/v1/projects/{id} | Bearer（所有角色） | Project |
-| PATCH | /api/v1/projects/{id} | Bearer + admin/member；`{name?,description?,repoUrl?,defaultBranch?,buildCommand?,archived?}` 至少一项 | Project；归档项目只接受恢复 |
-| POST | /api/v1/projects/{id}/builds | Bearer + admin/member；`{branch?}`；项目须活跃且已配置 buildCommand | Build，201（queued） |
-| GET | /api/v1/builds | Bearer（所有角色）；`?limit=&offset=&projectId=` | `{items,total,limit,offset}`，最新在前 |
-| GET | /api/v1/builds/{id} | Bearer（所有角色） | Build |
-| GET | /api/v1/builds/{id}/logs | Bearer（所有角色）；`?after=&limit=`（after 为事件 id 游标，limit 1-1000，默认 200） | `{items}`，按事件 id 升序（SSE 的回退通道） |
+| GET | /api/v1/projects | Bearer（所有角色）；`?limit=&offset=&status=active\|archived` | `{items,total,limit,offset}`，按名称排序，仅列调用者可见项目 |
+| POST | /api/v1/projects | Bearer + admin/member；`{name,description?,repoUrl?,defaultBranch?,buildCommand?,visibility?}` | Project，201；创建者自动成为 maintainer |
+| GET | /api/v1/projects/{id} | Bearer（可见者） | Project；私有项目对非成员 404 |
+| PATCH | /api/v1/projects/{id} | Bearer + admin/member；`{name?,description?,repoUrl?,defaultBranch?,buildCommand?,visibility?,archived?}` 至少一项 | Project；归档项目只接受恢复；不可见项目 404 |
+| POST | /api/v1/projects/{id}/builds | Bearer + admin/member；`{branch?}`；项目须活跃且已配置 buildCommand | Build，201（queued）；不可见项目 404 |
+| GET | /api/v1/projects/{id}/members | Bearer（可见者） | ProjectMember[]，maintainer 在前 |
+| POST | /api/v1/projects/{id}/members | Bearer + admin/member；`{userId,role}` | ProjectMember，201；重复成员 409，账号不存在 404 |
+| PATCH | /api/v1/projects/{id}/members/{userId} | Bearer + admin/member；`{role}` | ProjectMember；无该成员 404 |
+| DELETE | /api/v1/projects/{id}/members/{userId} | Bearer + admin/member | `{removed:true}`；创建者不可移除（400） |
+| GET | /api/v1/builds | Bearer（所有角色）；`?limit=&offset=&projectId=` | `{items,total,limit,offset}`，最新在前，仅含可见项目的构建 |
+| GET | /api/v1/builds/{id} | Bearer（可见者） | Build；不可见项目的构建 404 |
+| GET | /api/v1/builds/{id}/logs | Bearer（可见者）；`?after=&limit=`（after 为事件 id 游标，limit 1-1000，默认 200） | `{items}`，按事件 id 升序（SSE 的回退通道）；不可见 404 |
 | GET | /api/v1/builds/{id}/events | Bearer（所有角色）；`?after=` 或 `Last-Event-ID` 续传 | `text/event-stream`：`status` / `logs` / `done` 帧 + `: ping` 心跳 |
 | POST | /api/v1/builds/{id}/cancel | Bearer + admin/member；**`{}`** | Build；重复取消幂等 200，终态构建 409 |
 
 **所有 auth POST（包括 login）强制恰好一个 Origin，且精确匹配允许列表**；缺失、不匹配、`null` 或跨站请求返回 `403 origin_denied`，在登录、轮换和退出之前拦截。非浏览器 curl/脚本也必须带该 Origin。其他请求如果携带 Origin 也须符合允许列表。全局拒绝 `Sec-Fetch-Site: cross-site`。允许来源响应包含 `Access-Control-Allow-Origin: <原始允许源>`、`Access-Control-Allow-Credentials: true`，`Vary: Origin, Sec-Fetch-Site`；OPTIONS 额外 Vary 请求方法与请求头，允许 GET/POST/OPTIONS 和 Authorization/Content-Type。
+
+### 项目可见性与成员（P1）
+
+- `projects.visibility` 为 `public`（默认）或 `private`。全局 admin 永远可见；其他角色可见 public 项目，以及自己创建或被加入的项目（`project_members`）。
+- 可见性在服务端逐请求解析：项目列表、项目详情、构建列表/详情/日志/SSE、成员列表、触发构建与改项目都带同一条可见性谓词。**不可见一律 404**（而非 403），避免用私有 id 枚举项目。
+- 成员角色 `maintainer`/`viewer` 目前只决定可见性；写操作仍由全局角色决定（admin/member 可写）。把写权限叠加到成员角色属于下一批（P2），届时 private 项目的项目级 viewer 将只读。
+- 创建者在同一事务内写入 maintainer 成员行，语义上是 owner：不能被移除（400）。成员目标是真实账号（不存在 404），重复添加 409。
+- 迁移 v5 为存量项目补写创建者的 maintainer 行，并把 `visibility` 默认为 `public`，因此升级后行为不变。
 
 ### 构建执行（P3 第一批）
 
@@ -168,10 +180,10 @@ $env:AEGIS_OPS_REDIS_URL = 'redis://localhost:6379/2'
 go test ./cmd/server/ -run TestRealProcessLifecycle -count=1
 ```
 
-分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计）、构建流水线（触发校验与每项目编号、成功与失败退出码、超时、取消与幂等、重启恢复为 interrupted、跨副本 worker 租约互斥与待命接管、SSE 推送与写超时豁免/终态收尾/非法游标、游标日志分页与截断、RBAC 与未接线 503）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目/构建端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
+分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计、可见性读过滤与成员增删改、创建者不可移除与 404 枚举语义）、构建流水线（触发校验与每项目编号、成功与失败退出码、超时、取消与幂等、重启恢复为 interrupted、跨副本 worker 租约互斥与待命接管、SSE 推送与写超时豁免/终态收尾/非法游标、游标日志分页与截断、RBAC 与未接线 503）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目/构建端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
 
 ## 架构
 
-cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；worker 通过租约启动并随信号上下文退出；进程生命周期验收测试见 cmd/server/ops_test.go）；internal/config 校验连接 URL、连接数、登录配额与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、分页与事务内审计，全局角色授权，不依赖 Gin）；internal/builds 是构建流水线（触发与编号、单 worker 租约、SKIP LOCKED 领取、临时目录执行、取消看门狗、批量日志与重启恢复，不依赖 Gin）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.11 与 Go 1.23 兼容。
+cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；worker 通过租约启动并随信号上下文退出；进程生命周期验收测试见 cmd/server/ops_test.go）；internal/config 校验连接 URL、连接数、登录配额与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、可见性与成员、分页与事务内审计，读写都带可见性谓词，不依赖 Gin）；internal/builds 是构建流水线（触发与编号、单 worker 租约、SKIP LOCKED 领取、临时目录执行、取消看门狗、批量日志与重启恢复，不依赖 Gin）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.11 与 Go 1.23 兼容。
 
 本地双实例样例见 [compose.yaml](../compose.yaml) 与 [部署说明](../deploy/README.md)。应用副本可横向扩展，但数据库、Redis、入口网关的高可用需另行部署；样例单节点依赖不等于整套服务高可用。数据库集成测试未配置 URL 会明确 Skip，不能将跳过当作生产验证通过。
