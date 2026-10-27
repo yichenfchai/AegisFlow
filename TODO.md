@@ -71,7 +71,7 @@
 
 - [x] 定义构建任务状态机：排队、执行、成功、失败、取消；明确合法转换及重启恢复规则。（六态含 `interrupted`：由持有 worker 租约的副本在启动时把遗留 `running` 统一转为中断；租约为 PostgreSQL 会话级 advisory lock，保证同一部署只有一个副本执行与恢复。）
 - [ ] 设计任务、阶段、日志及产物数据模型，实现触发、详情、列表、取消和重试接口。（第一批已落地 builds / build_log_events 模型与触发、详情、列表、取消、游标日志接口；阶段、产物与重试未做。）
-- [ ] 建立受控执行环境：工作目录、执行身份、超时、取消传播、资源上限及敏感信息脱敏；隔离不可信仓库代码。（已实现：临时工作目录、超时/取消传播、0700 目录、环境变量白名单（不继承 `AEGIS_*`）。仍待做：专用执行身份、CPU/内存/进程数上限、输出脱敏、仓库 clone 与隔离；设计见 [受控执行环境与 clone 设计](docs/build-execution-design.md)，待所有者确认 D1-D6 后按 ④a/④b/④c 拆 PR。勿把不可信仓库命令接入。）
+- [ ] 建立受控执行环境：工作目录、执行身份、超时、取消传播、资源上限及敏感信息脱敏；隔离不可信仓库代码。（已实现：临时工作目录、超时/取消传播、0700 目录、环境变量白名单（不继承 `AEGIS_*`）、输出脱敏（fail closed，只记替换数量）。仍待做：专用执行身份、CPU/内存/进程数上限、仓库 clone 与隔离；设计见 [受控执行环境与 clone 设计](docs/build-execution-design.md)，待所有者确认 D1-D6 后按 ④a/④b/④c 拆 PR。勿把不可信仓库命令接入。）
 - [x] 实现最小任务调度与 worker，限制并发；根据实际需求决定是否引入外部队列。（进程内单并发 worker，PostgreSQL 会话锁保证多副本单 worker，`FOR UPDATE SKIP LOCKED` 领取兜底；暂不引入外部队列，也不做多 worker 并行吞吐。）
 - [x] 实现 SSE 日志与状态推送，支持断线恢复、事件序号及权限校验。（`GET /builds/{id}/events`：status/logs/done 帧、事件 id 即续传序号、`Last-Event-ID`/`after` 断点续传、心跳与终态收尾、沿用 Bearer + 全局角色校验；前端失败自动回退轮询。）
 - [x] 接入构建列表和详情，验证一次真实构建从触发到结束，以及失败、取消和服务重启场景。（前端真实列表/详情/取消；E2E 覆盖触发→成功→日志；失败、超时、取消、重启中断由 internal/builds 集成测试覆盖。）
@@ -116,6 +116,8 @@ P3 构建操作审计验证记录（2026-10-26）：`go build ./...`、`go vet .
 P3 构建 SSE 验证记录（2026-10-26）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（httpapi 新增 2 组 SSE 用例：真实 httptest 服务器配置 200ms 写超时，仍能在延迟命令后收到输出与终态 done；负游标/非数字游标/未知构建/未鉴权分别 400/400/404/401）。前端 `npm run build`、`npm run lint`（0 错误、2 条既有警告）、`npm test`（14 例，含 SSE 分帧解析 3 例）通过；E2E 六组通过（重置 `aegis_e2e`），构建用例断言 `/events` 返回 200 与 `text/event-stream` 且日志经推送到达。
 
 项目可见性与成员 P1 验证记录（2026-10-27）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17（5433）+ Redis 8.8 下 `go test -race ./... -count=1` 全绿。新增用例：`internal/projects` 2 组（可见性过滤：admin 全见、非成员只见 public、非成员 Get/Update 均 404、成员 viewer 读、切回 public 恢复；成员生命周期：创建者为 maintainer、添加/重复 409/账号不存在 404/非法角色 400/改角色/未知成员 404/创建者不可移除 400/移除后失去可见性/非成员列成员 404）；`internal/builds` 1 组（private 项目下 outsider 的 List 为空、Get/Logs/Trigger/Cancel 全 404，创建者与 admin 不受影响）；`httpapi` 1 组（私有项目对非成员四条路径全 404、成员列表、重复 409、未知账号 404、非法角色 400、成员可读、全局 viewer 仍 403 写、提升/移除成员、创建者不可移除、public 项目对所有角色行为不变）。OpenAPI 契约用例新增 4 条成员路由。前端未改动；E2E 六组在重置 `aegis_e2e` 后通过，验证 public 项目行为未变。
+
+构建输出脱敏验证记录（2026-10-27）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（internal/builds 新增 15 个单元子用例覆盖 `AEGIS_*=`/`Bearer`/`postgres://`/`redis://`/GitHub token/AWS key/JWT/私钥头/同行多凭据/普通输出不误伤/短词不误伤，另加 1 组真实执行用例：命令打印三类伪凭据，日志中出现 `[redacted]`、原值全部不出现、并写入只含数量的 system 统计行；`valuesSurvive` 单独覆盖 fail-closed 判定）。E2E 六组通过（重置 `aegis_e2e`），确认既有构建用例行为不变。
 
 - [鉴权、部署与权限约定](docs/auth-contract.md)
 - [OpenAPI](backend/openapi.yaml)
