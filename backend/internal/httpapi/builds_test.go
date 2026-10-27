@@ -101,14 +101,14 @@ func TestBuildRoutesLifecycle(t *testing.T) {
 	if done["finishedAt"].(float64) == 0 {
 		t.Fatal("finishedAt not set")
 	}
-	w := request(h, "GET", "/api/v1/builds/"+buildID+"/logs?after=0&limit=200", "", adminToken)
-	if w.Code != 200 || !strings.Contains(w.Body.String(), "built-by-http") || !strings.Contains(w.Body.String(), "build succeeded") {
-		t.Fatalf("logs: %d %s", w.Code, w.Body.String())
-	}
-	if w = request(h, "GET", "/api/v1/builds/"+buildID+"/logs?after=-1", "", adminToken); w.Code != 400 {
+	// The worker commits the terminal status before it flushes its final log
+	// batch (documented ordering), so poll instead of reading once.
+	waitForLogs(t, h, adminToken, buildID, "built-by-http", "build succeeded")
+	if w := request(h, "GET", "/api/v1/builds/"+buildID+"/logs?after=-1", "", adminToken); w.Code != 400 {
 		t.Fatalf("bad cursor: %d", w.Code)
 	}
-	if w = request(h, "GET", "/api/v1/builds/missing-0000000000000001/logs", "", adminToken); w.Code != 404 {
+	w := request(h, "GET", "/api/v1/builds/missing-0000000000000001/logs", "", adminToken)
+	if w.Code != 404 {
 		t.Fatalf("unknown build logs: %d", w.Code)
 	}
 
@@ -181,5 +181,35 @@ func TestBuildRBACAndFailClosed(t *testing.T) {
 	}
 	if w := request(bare, "GET", "/api/v1/builds", "", tokens.Data.AccessToken); w.Code != 503 {
 		t.Fatalf("missing pipeline: %d", w.Code)
+	}
+}
+
+// waitForLogs polls the log page until every wanted substring is present. The
+// worker commits the terminal status before flushing its final batch, so a
+// single read taken right after a terminal status can legitimately be empty.
+func waitForLogs(t *testing.T, h http.Handler, token, buildID string, want ...string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	body := ""
+	for {
+		w := request(h, "GET", "/api/v1/builds/"+buildID+"/logs?after=0&limit=200", "", token)
+		if w.Code != 200 {
+			t.Fatalf("logs status: %d %s", w.Code, w.Body.String())
+		}
+		body = w.Body.String()
+		missing := false
+		for _, text := range want {
+			if !strings.Contains(body, text) {
+				missing = true
+				break
+			}
+		}
+		if !missing {
+			return body
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("logs missing %v after 10s: %s", want, body)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
