@@ -46,7 +46,7 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 - 构建状态为 queued/running/succeeded/failed/cancelled/interrupted；interrupted 由持有 worker 租约的实例在启动恢复时产生，表示进程中断而非业务失败。
 - 触发时固化命令、分支与触发人快照，构建号在项目内自增；仓储地址不参与本批执行（不 clone），命令在临时目录用系统 shell 执行，超时由 AEGIS_BUILD_TIMEOUT 控制。
 - 构建不改变账号/权限数据，也不写审计表；触发、取消与日志读取沿用全局角色授权（admin/member 可写，viewer 只读），每次请求由服务端校验，不依赖前端隐藏按钮。
-- 执行环境尚非受控环境：以服务进程身份执行，没有专用执行账号、资源上限或输出脱敏；不要把不可信仓库命令接入本批执行器。
+- 执行环境尚非完全受控：以服务进程身份执行，没有专用执行账号、资源上限或输出脱敏；但构建命令只获得最小环境变量白名单（`PATH`/`HOME`/`TMPDIR`/`TMP`/`TEMP`/`LANG` 等，Windows 另加系统必需变量），不继承 `AEGIS_*` 服务凭据，`HOME` 与临时目录都指向 0700 的构建目录。不要把不可信仓库命令接入本批执行器。
 
 ## 客户端会话生命周期
 

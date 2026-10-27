@@ -65,7 +65,7 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 	execCtx, stop := context.WithTimeout(ctx, s.timeout)
 	defer stop()
 
-	workDir, err := os.MkdirTemp("", "aegis-build-*")
+	workDir, err := newBuildWorkDir()
 	if err != nil {
 		s.finish(build, StatusFailed)
 		return
@@ -82,6 +82,7 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 	}
 	cmd := exec.CommandContext(execCtx, shell, flag, build.Command)
 	cmd.Dir = workDir
+	cmd.Env = buildCommandEnv(workDir)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		s.finish(build, StatusFailed)

@@ -87,10 +87,10 @@ server: {
 ### 构建执行（P3 第一批）
 
 - 状态机六态：`queued → running → succeeded/failed/cancelled`，只有持有 worker 租约的实例在启动后把遗留的 `running` 统一转为 `interrupted`。`interrupted` 表示进程被打断而不是业务失败，需要重新触发。租约是 PostgreSQL 会话级 advisory lock（按 database + schema 隔离）：同一部署只有一个副本执行与恢复，其余副本待命并在下一重试周期接管；连接或进程消失时锁自动释放。它保证"同一时刻一个 worker"，不提供多 worker 并行吞吐。
-- 触发时固化命令快照与分支（默认取项目 defaultBranch），构建号在每个项目内自增；之后修改项目命令不影响已触发的构建。命令在系统临时目录执行（Unix `sh -c`、Windows `cmd /c`），结束后删除目录。
+- 触发时固化命令快照与分支（默认取项目 defaultBranch），构建号在每个项目内自增；之后修改项目命令不影响已触发的构建。命令在系统临时目录执行（Unix `sh -c`、Windows `cmd /c`），结束后删除目录。目录显式以 0700 创建；构建命令只获得显式白名单环境变量（`PATH`、`HOME`、`TMPDIR`/`TMP`/`TEMP`、`LANG` 等，Windows 另加 `SYSTEMROOT` 等系统变量），**不继承** `AEGIS_*` 服务凭据。
 - worker 随服务进程启动、单并发运行；持有租约的副本用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取任务，`AEGIS_BUILD_TIMEOUT` 到期或收到取消请求时终止子进程。取消通过 300ms 状态看门狗传播到正在运行的命令。待命副本不领取、不恢复，只定期重试租约。
 - 日志按行写入 `build_log_events`，批量 500ms 落库；单行超过 4096 字节按 rune 边界截断，单构建最多记录 5000 条事件，超限后追加一条 system 截断说明。当前读取使用 `after` 游标轮询，SSE 推送在后续批次。
-- 本批边界（明确不做）：受控执行身份与资源上限、输出脱敏、仓库 clone。构建只执行项目配置的命令，不下载代码。下一批的设计草案（隔离选项、资源上限、脱敏、clone 与需要拍板的决策）见 [受控执行环境与 clone 设计](../docs/build-execution-design.md)。
+- 本批边界（仍不做）：受控执行身份与资源上限、输出脱敏、仓库 clone。构建只执行项目配置的命令，不下载代码。环境变量白名单与 0700 构建目录已实现；剩余隔离、资源上限与 clone 的设计见 [受控执行环境与 clone 设计](../docs/build-execution-design.md)。
 
 
 ### Cookie 与前端对齐
