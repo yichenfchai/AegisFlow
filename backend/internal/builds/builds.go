@@ -141,6 +141,33 @@ func scanBuild(row rowScanner) (*Build, error) {
 // Trigger enqueues a build. The project must exist, be active, and carry a
 // build command; the row lock serializes the per-project number sequence.
 func (s *Service) Trigger(ctx context.Context, actor auth.Actor, projectID, branch string) (*Build, error) {
+	return s.enqueue(ctx, actor, projectID, branch, "build.trigger", "")
+}
+
+// Retry enqueues a new build for the branch of an existing terminal build. The
+// command comes from the project's current configuration, so a retry after
+// fixing the command builds the fix; the original row stays as the historical
+// record of what ran. Queued and running builds cannot be retried (409).
+func (s *Service) Retry(ctx context.Context, actor auth.Actor, id string) (*Build, error) {
+	if !auth.ValidID(id) {
+		return nil, fmt.Errorf("%w: invalid build id", ErrValidation)
+	}
+	// The visibility-filtered read keeps retry behind the same 404 wall as the
+	// rest of the pipeline; the enqueue path then applies the maintainer overlay.
+	original, err := s.Get(ctx, actor, id)
+	if err != nil {
+		return nil, err
+	}
+	if !Terminal(original.Status) {
+		return nil, fmt.Errorf("%w: only terminal builds can be retried", ErrConflict)
+	}
+	return s.enqueue(ctx, actor, original.ProjectID, original.Branch, "build.retry", fmt.Sprintf(" retry_of=%d", original.BuildNumber))
+}
+
+// enqueue inserts a queued build and commits its audit row in the same
+// transaction. action distinguishes a fresh trigger from a retry; detailSuffix
+// carries the retry provenance and never contains the command.
+func (s *Service) enqueue(ctx context.Context, actor auth.Actor, projectID, branch, action, detailSuffix string) (*Build, error) {
 	if !auth.ValidID(projectID) {
 		return nil, fmt.Errorf("%w: invalid project id", ErrValidation)
 	}
@@ -187,7 +214,7 @@ func (s *Service) Trigger(ctx context.Context, actor auth.Actor, projectID, bran
 	if _, err = tx.ExecContext(ctx, `UPDATE projects SET build_count=$2 WHERE id=$1`, projectID, build.BuildNumber); err != nil {
 		return nil, err
 	}
-	if err = writeAudit(ctx, tx, actor, "build.trigger", id, fmt.Sprintf("project=%s build=%d", projectID, build.BuildNumber)); err != nil {
+	if err = writeAudit(ctx, tx, actor, action, id, fmt.Sprintf("project=%s build=%d%s", projectID, build.BuildNumber, detailSuffix)); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {

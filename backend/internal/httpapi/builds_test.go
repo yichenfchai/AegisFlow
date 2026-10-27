@@ -213,3 +213,52 @@ func waitForLogs(t *testing.T, h http.Handler, token, buildID string, want ...st
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+func TestBuildRetryRoute(t *testing.T) {
+	h, _ := testServer(t)
+	adminToken, _, _ := loginHTTP(t, h, "admin", "a-strong-password")
+	createUserHTTP(t, h, adminToken, "retry-viewer", "viewer-password-1", "viewer")
+	viewerToken, _, _ := loginHTTP(t, h, "retry-viewer", "viewer-password-1")
+	projectID := createBuildableProject(t, h, adminToken, "retry-route", "echo retry-route")
+	buildID := triggerBuild(t, h, adminToken, projectID, `{}`)
+	waitForHTTPBuild(t, h, adminToken, buildID, builds.StatusSucceeded)
+
+	if w := request(h, "POST", "/api/v1/builds/"+buildID+"/retry", `{}`, viewerToken); w.Code != 403 {
+		t.Fatalf("viewer retry: %d %s", w.Code, w.Body.String())
+	}
+	w := request(h, "POST", "/api/v1/builds/"+buildID+"/retry", `{}`, adminToken)
+	if w.Code != 201 {
+		t.Fatalf("retry: %d %s", w.Code, w.Body.String())
+	}
+	var retried struct {
+		Data struct {
+			ID          string `json:"id"`
+			BuildNumber int64  `json:"buildNumber"`
+			Status      string `json:"status"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &retried); err != nil || retried.Data.ID == "" ||
+		retried.Data.Status != builds.StatusQueued || retried.Data.BuildNumber != 2 {
+		t.Fatalf("retry payload: %s", w.Body.String())
+	}
+
+	// A queued or running build cannot be retried.
+	if w = request(h, "PATCH", "/api/v1/projects/"+projectID, `{"buildCommand":"ping -n 30 127.0.0.1 >nul"}`, adminToken); w.Code != 200 {
+		t.Fatalf("set long command: %d %s", w.Code, w.Body.String())
+	}
+	runningID := triggerBuild(t, h, adminToken, projectID, `{}`)
+	waitForHTTPBuild(t, h, adminToken, runningID, builds.StatusRunning)
+	if w = request(h, "POST", "/api/v1/builds/"+runningID+"/retry", `{}`, adminToken); w.Code != 409 {
+		t.Fatalf("retry running: %d %s", w.Code, w.Body.String())
+	}
+	if w = request(h, "POST", "/api/v1/builds/"+runningID+"/cancel", `{}`, adminToken); w.Code != 200 {
+		t.Fatalf("cleanup cancel: %d", w.Code)
+	}
+
+	if w = request(h, "POST", "/api/v1/builds/missing-0000000000000001/retry", `{}`, adminToken); w.Code != 404 {
+		t.Fatalf("unknown build retry: %d", w.Code)
+	}
+	if w = request(h, "POST", "/api/v1/builds/"+buildID+"/retry", `{}`, ""); w.Code != 401 {
+		t.Fatalf("unauthenticated retry: %d", w.Code)
+	}
+}
