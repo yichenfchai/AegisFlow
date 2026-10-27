@@ -17,6 +17,7 @@ let restoreFlight: Promise<void> | null = null
 let revision = 0
 let initialized = false
 let expiresAt = 0
+let accessLifetimeMs = 0
 let refreshTimer: ReturnType<typeof setTimeout> | undefined
 function scheduleRefresh(delay: number) {
   clearTimeout(refreshTimer)
@@ -77,13 +78,15 @@ export const useSession = create<SessionState>(() => ({
   },
 }))
 function apply(session: AuthSession) {
-  expiresAt = Date.now() + session.expiresIn * 1000
+  accessLifetimeMs = session.expiresIn * 1000
+  expiresAt = Date.now() + accessLifetimeMs
   scheduleRefresh(Math.max(1000, session.expiresIn * 1000 - Math.min(30_000, session.expiresIn * 200)))
   useSession.setState({ user: session.user, accessToken: session.accessToken, status: 'authenticated', error: null })
 }
 function clearSession() {
   clearTimeout(refreshTimer)
   expiresAt = 0
+  accessLifetimeMs = 0
   useSession.setState({ user: null, accessToken: null, status: 'anonymous', error: null })
 }
 export function errorMessage(error: unknown): string {
@@ -122,7 +125,12 @@ export function refreshSession(): Promise<void> {
 export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (useSession.getState().status === 'loading') await useSession.getState().restore()
   if (useSession.getState().status !== 'authenticated') throw new ApiError(401, 'unauthorized', '请先登录')
-  if (Date.now() >= expiresAt - 5000) await refreshSession()
+  // A fixed five-second margin refreshes on every request whenever the server
+  // issues short-lived tokens, and each refresh rotates the cookie; an aborted
+  // rotation (for example a page reload mid-flight) then looks like a replay.
+  // Scale the margin to the token lifetime instead.
+  const refreshMargin = Math.min(5000, Math.max(1000, Math.floor(accessLifetimeMs / 2)))
+  if (Date.now() >= expiresAt - refreshMargin) await refreshSession()
   const token = useSession.getState().accessToken!
   const expected = revision
   try { return await httpRequest<T>(path, init, token) } catch (error) {

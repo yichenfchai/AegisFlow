@@ -4,11 +4,12 @@
 //
 // P3 first-slice boundaries, deliberately: commands run through the system
 // shell without a sandbox (no dedicated execution identity, resource caps, or
-// output redaction yet — that arrives with the controlled-environment batch);
-// the worker runs in-process with concurrency one; claiming uses SELECT ...
-// FOR UPDATE SKIP LOCKED so instances never double-run a build, but a restart
-// marks every running build interrupted, which is only correct for
-// single-instance deployments (multi-instance lease/heartbeat is deferred).
+// output redaction yet — that arrives with the controlled-environment batch).
+// The worker runs in-process with concurrency one and is guarded by a
+// PostgreSQL session advisory lock (RunWorker): only the lease holder recovers
+// interrupted builds and claims queued ones, so standby replicas never turn a
+// peer's running build into interrupted. Claiming also uses SELECT ... FOR
+// UPDATE SKIP LOCKED as a second line of defence.
 package builds
 
 import (
@@ -71,11 +72,12 @@ const (
 )
 
 type Service struct {
-	db        *sql.DB
-	projects  *projects.Service
-	timeout   time.Duration
-	maxEvents int
-	notify    chan struct{}
+	db         *sql.DB
+	projects   *projects.Service
+	timeout    time.Duration
+	maxEvents  int
+	notify     chan struct{}
+	leaseRetry time.Duration
 }
 
 // New uses the default execution timeout of ten minutes.
@@ -84,7 +86,7 @@ func New(db *sql.DB, projectRegistry *projects.Service) *Service {
 }
 
 func newWithLimits(db *sql.DB, projectRegistry *projects.Service, timeout time.Duration, maxEvents int) *Service {
-	return &Service{db: db, projects: projectRegistry, timeout: timeout, maxEvents: maxEvents, notify: make(chan struct{}, 1)}
+	return &Service{db: db, projects: projectRegistry, timeout: timeout, maxEvents: maxEvents, notify: make(chan struct{}, 1), leaseRetry: defaultLeaseRetry}
 }
 
 const buildColumns = `id,project_id,build_number,status,branch,command,triggered_by,created_at,started_at,finished_at`

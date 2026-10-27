@@ -17,7 +17,7 @@
 - [x] 收尾杂项：用户可见的 GoPulse 文案统一为 AegisFlow，README 移除 Vite 模板样板，引入 vitest 覆盖 session store 并接入 CI。
 - [x] P1 运维验收（2026-10-25）：`cmd/server/ops_test.go` 真实进程生命周期测试——编译真实二进制、随机端口启动、readyz、登录并创建项目、Windows CTRL_BREAK/SIGTERM 优雅退出（退出码 0）、重启后 access token/refresh Cookie/项目数据全部存活；已接入 CI。
 - [x] P2 项目管理第一批（2026-10-25）：迁移 v3 项目表（共享账本抽出 internal/dbmigrate）；internal/projects 注册表（校验/大小写唯一/归档只读/分页/事务内审计，全局角色授权，不依赖 Gin）；项目 CRUD + 归档端点与 OpenAPI；首页替换为真实项目列表、创建向导接真实接口。
-- [x] P3 第一批最小构建闭环（2026-10-26）：迁移 v4（projects.build_command/build_count、builds 六状态表、build_log_events 游标表）；internal/builds 服务与进程内单并发 worker（SKIP LOCKED 领取、临时目录执行、超时与取消看门狗、批量日志与截断、重启恢复 interrupted）；httpapi 五个构建端点 + OpenAPI + RBAC；前端构建列表/详情接真实接口（`after` 游标累积轮询日志、取消按钮），项目行触发构建，创建向导支持构建命令；E2E 第六组与 E2E CI job。
+- [x] P3 第一批最小构建闭环（2026-10-26）：迁移 v4（projects.build_command/build_count、builds 六状态表、build_log_events 游标表）；internal/builds 服务与进程内单并发 worker（SKIP LOCKED 领取、临时目录执行、超时与取消看门狗、批量日志与截断、重启恢复 interrupted）；httpapi 五个构建端点 + OpenAPI + RBAC；前端构建列表/详情接真实接口（`after` 游标累积轮询日志、取消按钮），项目行触发构建，创建向导支持构建命令；E2E 第六组与 E2E CI job；随后补多副本 worker 租约（PostgreSQL 会话级 advisory lock，只有持锁副本恢复与执行，待命副本自动接管）。
 
 ## P0：确定接口约定并打通真实鉴权
 
@@ -64,10 +64,10 @@
 
 ## P3：最小构建闭环
 
-- [x] 定义构建任务状态机：排队、执行、成功、失败、取消；明确合法转换及重启恢复规则。（六态含 `interrupted`：启动时把遗留 `running` 统一转为中断；单实例恢复语义，跨实例 lease/heartbeat 推迟。）
+- [x] 定义构建任务状态机：排队、执行、成功、失败、取消；明确合法转换及重启恢复规则。（六态含 `interrupted`：由持有 worker 租约的副本在启动时把遗留 `running` 统一转为中断；租约为 PostgreSQL 会话级 advisory lock，保证同一部署只有一个副本执行与恢复。）
 - [ ] 设计任务、阶段、日志及产物数据模型，实现触发、详情、列表、取消和重试接口。（第一批已落地 builds / build_log_events 模型与触发、详情、列表、取消、游标日志接口；阶段、产物与重试未做。）
 - [ ] 建立受控执行环境：工作目录、执行身份、超时、取消传播、资源上限及敏感信息脱敏；隔离不可信仓库代码。（第一批只有临时工作目录、超时与取消传播；执行身份、资源上限、脱敏与隔离明确推迟，勿把不可信仓库命令接入。）
-- [x] 实现最小任务调度与 worker，限制并发；根据实际需求决定是否引入外部队列。（进程内单并发 worker，`FOR UPDATE SKIP LOCKED` 领取；暂不引入外部队列。）
+- [x] 实现最小任务调度与 worker，限制并发；根据实际需求决定是否引入外部队列。（进程内单并发 worker，PostgreSQL 会话锁保证多副本单 worker，`FOR UPDATE SKIP LOCKED` 领取兜底；暂不引入外部队列，也不做多 worker 并行吞吐。）
 - [ ] 实现 SSE 日志与状态推送，支持断线恢复、事件序号及权限校验。（第一批用 `after` 游标轮询，事件 id 已可作为未来断点续传序号；SSE 推迟。）
 - [x] 接入构建列表和详情，验证一次真实构建从触发到结束，以及失败、取消和服务重启场景。（前端真实列表/详情/取消；E2E 覆盖触发→成功→日志；失败、超时、取消、重启中断由 internal/builds 集成测试覆盖。）
 
@@ -84,7 +84,7 @@
 - [ ] 扩展代码审查、扫描、知识库、防御策略等业务；分别定义最小接口和验收标准。
 - [ ] 需要统一身份源时接入 LDAP/OIDC，并定义外部身份到本地角色的映射。
 - [x] 多实例共享存储、集中登录限流及可信代理配置。
-- [ ] 构建模块增加跨实例任务领取、幂等执行及 worker 恢复协调。
+- [ ] 构建模块增加跨实例任务领取、幂等执行及 worker 恢复协调。（单 worker 租约、恢复归属与待命接管已实现；多 worker 并行领取与幂等执行未做。）
 - [ ] 补齐部署说明、TLS 反向代理配置、数据库备份恢复及升级流程。
 - [ ] 增加运行指标、告警和按需求引入链路追踪。
 
@@ -97,6 +97,10 @@ P1 验证记录（2026-10-25）：`npm run build`、`npm run lint`（0 错误、
 P1 运维验收 + P2 第一批验证记录（2026-10-25）：`cmd/server/ops_test.go` 真实进程生命周期测试通过（随机端口启动、readyz、登录并创建项目、优雅退出退出码 0、重启后 access token/refresh Cookie/项目数据存活，约 7 秒），已接入 CI。projects 服务 4 组集成测试、httpapi 项目路由测试通过；E2E 扩至五组，新增项目管理（UI 创建、归档/恢复、审计记录、viewer 无入口且 API 403）。`go test -race ./...` 全量、`gofmt`/`go vet`、前端 build/lint/vitest 复验通过。
 
 P3 第一批验证记录（2026-10-26）：后端 `go build ./...`、`go vet ./...`、`gofmt -l ./cmd ./internal` 为空；本机便携 PostgreSQL 17（5433）+ Redis 8.8 下 `go test -race ./... -count=1` 全量通过（新增 internal/builds 集成测试：触发校验与编号、成功、失败退出码、超时、取消与幂等、重启恢复 interrupted、游标日志；httpapi 构建路由 2 组 + ratelimit 配置配额用例）。前端 `npm run build`、`npm run lint`（0 错误、5 条既有演示警告）、`npm test`（session store 10 用例）通过。E2E 六组通过：auth.spec 五组 + builds.spec 构建闭环（UI 创建带构建命令的项目 → 触发 → 列表/详情 → 日志出现输出与 `build succeeded` → viewer 只读且触发 403）。E2E job 已加入 CI（PG17/Redis7.4 services、一次性 `aegis_e2e` 库）；测试环境以 `AEGIS_LOGIN_RATE_LIMIT=100` 启动后端，避免同地址多账号用例触发生产默认的 10 次/分钟登录限流。
+
+多副本 worker 租约验证记录（2026-10-26）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（internal/builds 8 组，含新增 `TestWorkerLeaseIsExclusiveAcrossInstances` 与 `TestStandbyDoesNotRecoverAnotherInstancesBuild`：两个独立连接池竞争同一 schema 租约；持锁期间待命副本不改动 running 构建；释放后待命副本接管并恢复为 interrupted 且输出 `interrupted builds recovered`）。E2E 六组在重置 `aegis_e2e` 后通过（1.9m）。
+
+CI 暴露的既有缺陷修复（2026-10-26，随 worker 租约 PR 一并提交）：① 输出丢失——`cmd.Wait` 先于管道读取关闭读端，快命令的 stdout 可能被丢弃；改为先 drain 再 Wait，并在取消/超时后关闭父端读口，避免 Windows 上 `cmd /c ping` 的孙进程占住管道；新增 900 行输出回归用例（internal/builds 9 组）。② 短 token 下预刷新风暴——固定的 5s 提前刷新阈值在 `AEGIS_ACCESS_TTL=3s` 的 E2E 中使每个请求都轮换 Cookie，导航中断的轮换会让新页面重放已消费的 Cookie 而被判重放并登出；改为按 token 生命周期缩放提前量，新增 session store 单测（11 例）。本地 `npm run build`、`npm run lint`（0 错误、5 警告）、`npm test`（11 例）与 E2E 六组通过；CI 侧 backend/frontend 通过，e2e 结果见 PR。
 
 - [鉴权、部署与权限约定](docs/auth-contract.md)
 - [OpenAPI](backend/openapi.yaml)
