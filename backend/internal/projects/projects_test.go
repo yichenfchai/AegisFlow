@@ -12,7 +12,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
-var testActor = auth.Actor{ID: "actor-000000000000001", Username: "tester", RequestID: "req-projects"}
+var testActor = auth.Actor{ID: "actor-000000000000001", Username: "tester", Role: "member", RequestID: "req-projects"}
 
 func testService(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()
@@ -305,5 +305,82 @@ func TestMemberLifecycle(t *testing.T) {
 	// A non-member cannot probe a private project's member list.
 	if _, err = s.ListMembers(ctx, outsiderActor, project.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("member list enumeration error = %v", err)
+	}
+}
+
+func TestPrivateProjectWritesNeedMaintainer(t *testing.T) {
+	s, db := testService(t)
+	ctx := context.Background()
+	seedUser(t, db, memberActor.ID, memberActor.Username)
+	seedUser(t, db, viewerActor.ID, viewerActor.Username)
+	private, err := s.Create(ctx, adminActor, Input{Name: "private-writes", Visibility: VisibilityPrivate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err := s.Create(ctx, adminActor, Input{Name: "public-writes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A member who is not on the project cannot even see it.
+	if _, err = s.Update(ctx, outsiderActor, private.ID, Patch{Description: str("nope")}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("invisible update error = %v", err)
+	}
+	// Viewer membership grants reads but not writes, including membership edits.
+	if _, err = s.AddMember(ctx, adminActor, private.ID, memberActor.ID, RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Update(ctx, memberActor, private.ID, Patch{Description: str("viewer-write")}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("viewer update error = %v", err)
+	}
+	if _, err = s.AddMember(ctx, memberActor, private.ID, viewerActor.ID, RoleViewer); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("viewer add member error = %v", err)
+	}
+	// A global viewer can never write, even when added as a maintainer.
+	if _, err = s.AddMember(ctx, adminActor, private.ID, viewerActor.ID, RoleMaintainer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Update(ctx, viewerActor, private.ID, Patch{Description: str("viewer-role")}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("global viewer update error = %v", err)
+	}
+	// Promotion to maintainer allows the write.
+	if _, err = s.UpdateMemberRole(ctx, adminActor, private.ID, memberActor.ID, RoleMaintainer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Update(ctx, memberActor, private.ID, Patch{Description: str("maintainer-write")}); err != nil {
+		t.Fatalf("maintainer update error = %v", err)
+	}
+	// Public projects keep the pre-membership rule: any member may write.
+	if _, err = s.Update(ctx, outsiderActor, public.ID, Patch{Description: str("public-write")}); err != nil {
+		t.Fatalf("public update error = %v", err)
+	}
+	// Removal is audited and still protected for the creator.
+	if err = s.RemoveMember(ctx, adminActor, private.ID, viewerActor.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RemoveMember(ctx, adminActor, private.ID, adminActor.ID); !errors.Is(err, ErrValidation) {
+		t.Fatalf("creator removal error = %v", err)
+	}
+
+	seen := map[string]bool{}
+	rows, err := db.QueryContext(ctx, `SELECT action FROM auth_audit WHERE action LIKE 'project.member_%'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var action string
+		if err = rows.Scan(&action); err != nil {
+			t.Fatal(err)
+		}
+		seen[action] = true
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{ActionMemberAdd, ActionMemberUpdate, ActionMemberRemove} {
+		if !seen[want] {
+			t.Fatalf("missing audit action %s in %v", want, seen)
+		}
 	}
 }

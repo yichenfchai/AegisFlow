@@ -615,7 +615,7 @@ paths:
     patch:
       tags: [Projects]
       operationId: updateProject
-      summary: Update fields or archive/restore (admin or member)
+      summary: Update fields or archive/restore (admin, or a member with write access)
       description: |
         At least one field is required. Names stay unique case-insensitively.
         Archived projects are read-only except for archived:false (restore);
@@ -1350,7 +1350,7 @@ components:
         createdAt: { type: integer, format: int64, description: Unix seconds }
         actorId: { type: string, description: Empty for system rows }
         actorUsername: { type: string }
-        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, build.trigger, build.cancel] }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel] }
         objectType: { type: string, enum: [user, session, project, build] }
         objectId: { type: string }
         result: { type: string, enum: [success, failure] }
