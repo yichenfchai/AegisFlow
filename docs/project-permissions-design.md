@@ -135,3 +135,13 @@ CREATE INDEX project_members_user_idx ON project_members(user_id, project_id);
 | D6 | 本批范围 | 仅项目+构建 / 同时改造未实现模块 | **仅项目+构建**，其余模块接入时复用 |
 
 > 确认后按 P1→P3 拆 PR；P1 可先只做后端（迁移 + 读过滤 + 成员 API），P3 前端单独评审。
+
+## 10. 实施状态
+
+- **P1（已实现）**：迁移 v5（`projects.visibility`、`project_members`、存量项目按 `created_by` 补写 maintainer 行）、成员 API（列举/添加/改角色/移除）、项目与构建的读过滤（列表、详情、日志、SSE、触发与取消）、不可见一律 404、创建者不可移除。`internal/projects.VisiblePredicate` 是可见性规则的唯一定义，构建查询复用它，避免两处规则漂移。
+- 与本文原稿的两处差异：
+  1. `project_members.user_id` **不加外键**，沿用 `created_by` 与审计 actor 的「快照」建模（账号只禁用、不删除）；目标账号是否存在由服务层校验并在缺失时返回 404。
+  2. 写权限叠加按计划留在 P2，因此 P1 阶段 private 项目的项目级 viewer 仍按全局角色写入。这是分批交付的**已知中间态**（相对变更前没有放松：原本任何 member 都能改任何项目），P2 立即收口。
+- **P2（待做）**：把写权限叠加到成员 maintainer、`project.member_*` 审计行、OpenAPI 审计枚举。
+- **P3（待做）**：前端可见性徽章与成员管理页、E2E。
+- 决策：P1 按 §9 的建议默认值实现（D1 public、D2 maintainer/viewer、D4 404、D5 保留成员行、D6 仅项目+构建）；D3 的成员管理权在 P2 生效。若所有者在 review 中改变任一决策，改动范围限于可见性谓词与成员读写入口。

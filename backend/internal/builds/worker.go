@@ -131,7 +131,7 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 			case <-watchCtx.Done():
 				return
 			case <-ticker.C:
-				current, err := s.Get(context.Background(), build.ID)
+				current, err := s.getByID(context.Background(), build.ID)
 				if err != nil || current.Status != StatusRunning {
 					_ = cmd.Process.Kill()
 					closeStreams()
@@ -162,7 +162,7 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 		writer.systemf("interrupted by server shutdown")
 		s.finish(build, StatusInterrupted)
 	default:
-		if current, err := s.Get(context.Background(), build.ID); err == nil && current.Status == StatusCancelled {
+		if current, err := s.getByID(context.Background(), build.ID); err == nil && current.Status == StatusCancelled {
 			writer.systemf("build cancelled")
 			return
 		}

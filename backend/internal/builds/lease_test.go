@@ -126,7 +126,7 @@ func TestStandbyDoesNotRecoverAnotherInstancesBuild(t *testing.T) {
 	go second.RunWorker(workerCtx, slog.New(recorder))
 	recorder.waitFor(t, "stand-by", 5*time.Second)
 
-	if got, err := first.Get(ctx, build.ID); err != nil || got.Status != StatusRunning {
+	if got, err := first.Get(ctx, testActor, build.ID); err != nil || got.Status != StatusRunning {
 		t.Fatalf("standby touched a running build: %+v err=%v", got, err)
 	}
 

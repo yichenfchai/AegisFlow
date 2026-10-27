@@ -96,9 +96,14 @@ func TestRealProcessLifecycle(t *testing.T) {
 	if refreshed.Data.AccessToken == "" {
 		t.Fatal("refresh cookie lost after restart")
 	}
-	list := getJSON(t, client, origin, second.baseURL+"/api/v1/projects", login.Data.AccessToken)
-	if !strings.Contains(list, projectName) {
-		t.Fatalf("project lost after restart: %s", list)
+	// Read the project itself instead of scanning a page of the shared list: an
+	// ops database may be reused across runs (backend/README documents that),
+	// and after enough runs the new project sorts past the first page. The list
+	// endpoint's pagination has its own coverage; this test owns process
+	// lifecycle, so it asserts the row survived the restart, not page position.
+	detail := getJSON(t, client, origin, second.baseURL+"/api/v1/projects/"+created.Data.ID, login.Data.AccessToken)
+	if !strings.Contains(detail, projectName) {
+		t.Fatalf("project lost after restart: %s", detail)
 	}
 	stopGracefully(t, second)
 }
