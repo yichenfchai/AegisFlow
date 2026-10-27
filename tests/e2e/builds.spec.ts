@@ -51,6 +51,12 @@ test('构建闭环：触发、成功日志与 viewer 只读', async ({ page }) =
   // 终态构建没有取消按钮。
   await expect(page.getByRole('button', { name: '取消构建' })).toHaveCount(0)
 
+  // 终态构建可以重试：新构建沿用原分支与项目当前命令，并跳到新构建详情。
+  await page.getByRole('button', { name: '重试构建' }).click()
+  await expect(page.getByRole('heading', { name: '构建 #2' })).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText('成功', { exact: true })).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByRole('button', { name: '重试构建' })).toBeVisible()
+
   // 触发构建写入持久化审计，管理员可在审计页按中文动作看到。
   await page.goto('/settings')
   await page.getByRole('button', { name: '审计', exact: true }).click()
@@ -79,7 +85,8 @@ test('构建闭环：触发、成功日志与 viewer 只读', async ({ page }) =
   const viewer = await viewerCtx.newPage()
   await login(viewer, username, 'Viewer-pass-2026')
   await viewer.goto('/builds')
-  await expect(viewer.getByRole('row', { name: new RegExp(name) })).toBeVisible()
+  // 重试后该项目有两行构建，取第一行即可断言可见性。
+  await expect(viewer.getByRole('row', { name: new RegExp(name) }).first()).toBeVisible()
   const status = await viewer.evaluate(async (id) => {
     const { apiRequest } = await import('/src/stores/session.ts')
     try {

@@ -36,6 +36,9 @@ export const buildsAPI = {
     }),
   cancel: (id: string) =>
     apiRequest<Build>(`/builds/${encodeURIComponent(id)}/cancel`, { method: 'POST', body: '{}' }),
+  /** 为终态构建再入队一次：沿用原分支，使用项目当前命令。 */
+  retry: (id: string) =>
+    apiRequest<Build>(`/builds/${encodeURIComponent(id)}/retry`, { method: 'POST', body: '{}' }),
   logs: (id: string, after = 0, limit = 200) =>
     apiRequest<{ items: LogEvent[] }>(`/builds/${encodeURIComponent(id)}/logs?after=${after}&limit=${limit}`),
 }
