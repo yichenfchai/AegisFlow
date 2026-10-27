@@ -123,6 +123,7 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	buildRoutes.GET("", s.listBuilds)
 	buildRoutes.GET("/:id", s.getBuild)
 	buildRoutes.GET("/:id/logs", s.getBuildLogs)
+	buildRoutes.GET("/:id/events", s.streamBuildEvents)
 	buildRoutes.POST("/:id/cancel", s.requireRole("admin", "member"), s.cancelBuild)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
@@ -577,6 +578,162 @@ func (s *Server) getBuildLogs(c *gin.Context) {
 		return
 	}
 	s.respond(c, 200, gin.H{"items": events})
+}
+
+const (
+	// ssePollInterval is how often a stream checks PostgreSQL for new events.
+	ssePollInterval = 500 * time.Millisecond
+	// sseHeartbeat keeps proxies and browsers from closing an idle stream.
+	sseHeartbeat = 15 * time.Second
+	// sseTailQuiet closes a finished build's stream once its output has been
+	// quiet this long: the terminal status commits before the worker flushes
+	// its last log batch.
+	sseTailQuiet = 3 * time.Second
+	// sseMaxLifetime forces a reconnect so one connection cannot live forever.
+	sseMaxLifetime = 10 * time.Minute
+	// sseLogBatch bounds the events carried by one frame.
+	sseLogBatch = 500
+)
+
+// streamBuildEvents pushes log events and status changes as Server-Sent
+// Events. Fetch-based clients attach the bearer token, so the normal
+// Authorization contract applies; Last-Event-ID (or ?after=) resumes a stream
+// from the last event id the client saw.
+func (s *Server) streamBuildEvents(c *gin.Context) {
+	if s.builds == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	build, err := s.builds.Get(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		s.buildError(c, err)
+		return
+	}
+	after, ok := s.streamCursor(c)
+	if !ok {
+		return
+	}
+	// The server-wide WriteTimeout would kill a long-lived stream; clear it for
+	// this response only. ResponseController unwraps Gin's writer.
+	controller := http.NewResponseController(c.Writer)
+	if err := controller.SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		s.fail(c, 500, "internal_error", "streaming unavailable")
+		return
+	}
+	c.Header("Content-Type", "text/event-stream; charset=utf-8")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(200)
+	c.Writer.Flush()
+
+	status := build.Status
+	if !writeSSE(c, "status", "", mustJSON(build)) {
+		return
+	}
+	var quietSince time.Time
+	lifetime := time.NewTimer(sseMaxLifetime)
+	defer lifetime.Stop()
+	poll := time.NewTicker(ssePollInterval)
+	defer poll.Stop()
+	heartbeat := time.NewTicker(sseHeartbeat)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-lifetime.C:
+			writeSSE(c, "done", "", []byte(`{"reason":"reconnect"}`))
+			return
+		case <-heartbeat.C:
+			if _, err := c.Writer.WriteString(": ping\n\n"); err != nil {
+				return
+			}
+			c.Writer.Flush()
+		case <-poll.C:
+			events, err := s.builds.Logs(c.Request.Context(), build.ID, after, sseLogBatch)
+			if err != nil {
+				return
+			}
+			if len(events) > 0 {
+				after = events[len(events)-1].ID
+				if !writeSSE(c, "logs", strconv.FormatInt(after, 10), mustJSON(events)) {
+					return
+				}
+				quietSince = time.Time{}
+			}
+			current, err := s.builds.Get(c.Request.Context(), build.ID)
+			if err != nil {
+				return
+			}
+			if current.Status != status {
+				status = current.Status
+				if !writeSSE(c, "status", "", mustJSON(current)) {
+					return
+				}
+				quietSince = time.Time{}
+			}
+			if builds.Terminal(status) && len(events) == 0 {
+				if quietSince.IsZero() {
+					quietSince = time.Now()
+				} else if time.Since(quietSince) >= sseTailQuiet {
+					writeSSE(c, "done", "", []byte(`{"reason":"terminal"}`))
+					return
+				}
+			}
+		}
+	}
+}
+
+// writeSSE writes one Server-Sent Events frame; false means the client is gone.
+func writeSSE(c *gin.Context, event, id string, data []byte) bool {
+	var frame strings.Builder
+	if id != "" {
+		frame.WriteString("id: ")
+		frame.WriteString(id)
+		frame.WriteString("\n")
+	}
+	if event != "" {
+		frame.WriteString("event: ")
+		frame.WriteString(event)
+		frame.WriteString("\n")
+	}
+	if data != nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			frame.WriteString("data: ")
+			frame.WriteString(line)
+			frame.WriteString("\n")
+		}
+	}
+	frame.WriteString("\n")
+	if _, err := c.Writer.WriteString(frame.String()); err != nil {
+		return false
+	}
+	c.Writer.Flush()
+	return true
+}
+
+func mustJSON(value any) []byte {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return []byte("null")
+	}
+	return data
+}
+
+// streamCursor reads the resume position from ?after= or Last-Event-ID.
+func (s *Server) streamCursor(c *gin.Context) (int64, bool) {
+	raw := c.Query("after")
+	if raw == "" {
+		raw = c.GetHeader("Last-Event-ID")
+	}
+	if raw == "" {
+		return 0, true
+	}
+	after, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || after < 0 {
+		s.fail(c, 400, "validation_failed", "after must be a non-negative event id")
+		return 0, false
+	}
+	return after, true
 }
 
 func (s *Server) cancelBuild(c *gin.Context) {

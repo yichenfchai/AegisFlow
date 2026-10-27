@@ -18,6 +18,7 @@
 - [x] P1 运维验收（2026-10-25）：`cmd/server/ops_test.go` 真实进程生命周期测试——编译真实二进制、随机端口启动、readyz、登录并创建项目、Windows CTRL_BREAK/SIGTERM 优雅退出（退出码 0）、重启后 access token/refresh Cookie/项目数据全部存活；已接入 CI。
 - [x] P2 项目管理第一批（2026-10-25）：迁移 v3 项目表（共享账本抽出 internal/dbmigrate）；internal/projects 注册表（校验/大小写唯一/归档只读/分页/事务内审计，全局角色授权，不依赖 Gin）；项目 CRUD + 归档端点与 OpenAPI；首页替换为真实项目列表、创建向导接真实接口。
 - [x] P3 第一批最小构建闭环（2026-10-26）：迁移 v4（projects.build_command/build_count、builds 六状态表、build_log_events 游标表）；internal/builds 服务与进程内单并发 worker（SKIP LOCKED 领取、临时目录执行、超时与取消看门狗、批量日志与截断、重启恢复 interrupted）；httpapi 五个构建端点 + OpenAPI + RBAC；前端构建列表/详情接真实接口（`after` 游标累积轮询日志、取消按钮），项目行触发构建，创建向导支持构建命令；E2E 第六组与 E2E CI job；随后补多副本 worker 租约（PostgreSQL 会话级 advisory lock，只有持锁副本恢复与执行，待命副本自动接管）。
+- [x] P3 构建 SSE 推送（2026-10-26）：`GET /api/v1/builds/{id}/events` 流式推送 status/logs/done，`Last-Event-ID`/`after` 续传、15s 心跳、终态静默收尾、单连接 10 分钟上限后要求重连；为长连接单独豁免服务器写超时；前端用带 Bearer 的 fetch 流式读取（EventSource 无法带 Authorization，token 不进 URL），连接失败重试一次后回退现有游标轮询，并在日志工具条显示“实时推送”。
 
 ## P0：确定接口约定并打通真实鉴权
 
@@ -68,7 +69,7 @@
 - [ ] 设计任务、阶段、日志及产物数据模型，实现触发、详情、列表、取消和重试接口。（第一批已落地 builds / build_log_events 模型与触发、详情、列表、取消、游标日志接口；阶段、产物与重试未做。）
 - [ ] 建立受控执行环境：工作目录、执行身份、超时、取消传播、资源上限及敏感信息脱敏；隔离不可信仓库代码。（第一批只有临时工作目录、超时与取消传播；执行身份、资源上限、脱敏与隔离明确推迟，勿把不可信仓库命令接入。）
 - [x] 实现最小任务调度与 worker，限制并发；根据实际需求决定是否引入外部队列。（进程内单并发 worker，PostgreSQL 会话锁保证多副本单 worker，`FOR UPDATE SKIP LOCKED` 领取兜底；暂不引入外部队列，也不做多 worker 并行吞吐。）
-- [ ] 实现 SSE 日志与状态推送，支持断线恢复、事件序号及权限校验。（第一批用 `after` 游标轮询，事件 id 已可作为未来断点续传序号；SSE 推迟。）
+- [x] 实现 SSE 日志与状态推送，支持断线恢复、事件序号及权限校验。（`GET /builds/{id}/events`：status/logs/done 帧、事件 id 即续传序号、`Last-Event-ID`/`after` 断点续传、心跳与终态收尾、沿用 Bearer + 全局角色校验；前端失败自动回退轮询。）
 - [x] 接入构建列表和详情，验证一次真实构建从触发到结束，以及失败、取消和服务重启场景。（前端真实列表/详情/取消；E2E 覆盖触发→成功→日志；失败、超时、取消、重启中断由 internal/builds 集成测试覆盖。）
 
 ## P4：部署、审批与审计
@@ -101,6 +102,8 @@ P3 第一批验证记录（2026-10-26）：后端 `go build ./...`、`go vet ./.
 多副本 worker 租约验证记录（2026-10-26）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（internal/builds 8 组，含新增 `TestWorkerLeaseIsExclusiveAcrossInstances` 与 `TestStandbyDoesNotRecoverAnotherInstancesBuild`：两个独立连接池竞争同一 schema 租约；持锁期间待命副本不改动 running 构建；释放后待命副本接管并恢复为 interrupted 且输出 `interrupted builds recovered`）。E2E 六组在重置 `aegis_e2e` 后通过（1.9m）。
 
 CI 暴露的既有缺陷修复（2026-10-26，随 worker 租约 PR 一并提交）：① 输出丢失——`cmd.Wait` 先于管道读取关闭读端，快命令的 stdout 可能被丢弃；改为先 drain 再 Wait，并在取消/超时后关闭父端读口，避免 Windows 上 `cmd /c ping` 的孙进程占住管道；新增 900 行输出回归用例（internal/builds 9 组）。② 短 token 下预刷新风暴——固定的 5s 提前刷新阈值在 `AEGIS_ACCESS_TTL=3s` 的 E2E 中使每个请求都轮换 Cookie，导航中断的轮换会让新页面重放已消费的 Cookie 而被判重放并登出；改为按 token 生命周期缩放提前量，新增 session store 单测（11 例）。本地 `npm run build`、`npm run lint`（0 错误、5 警告）、`npm test`（11 例）与 E2E 六组通过；CI 侧 backend/frontend 通过，e2e 结果见 PR。
+
+P3 构建 SSE 验证记录（2026-10-26）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（httpapi 新增 2 组 SSE 用例：真实 httptest 服务器配置 200ms 写超时，仍能在延迟命令后收到输出与终态 done；负游标/非数字游标/未知构建/未鉴权分别 400/400/404/401）。前端 `npm run build`、`npm run lint`（0 错误、5 条既有警告）、`npm test`（13 例，含 SSE 分帧解析 3 例）通过；E2E 六组通过（重置 `aegis_e2e`，1.3m），构建用例断言 `/events` 返回 200 与 `text/event-stream` 且日志经推送到达。
 
 - [鉴权、部署与权限约定](docs/auth-contract.md)
 - [OpenAPI](backend/openapi.yaml)

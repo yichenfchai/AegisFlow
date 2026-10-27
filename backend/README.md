@@ -79,7 +79,8 @@ server: {
 | POST | /api/v1/projects/{id}/builds | Bearer + admin/member；`{branch?}`；项目须活跃且已配置 buildCommand | Build，201（queued） |
 | GET | /api/v1/builds | Bearer（所有角色）；`?limit=&offset=&projectId=` | `{items,total,limit,offset}`，最新在前 |
 | GET | /api/v1/builds/{id} | Bearer（所有角色） | Build |
-| GET | /api/v1/builds/{id}/logs | Bearer（所有角色）；`?after=&limit=`（after 为事件 id 游标，limit 1-1000，默认 200） | `{items}`，按事件 id 升序 |
+| GET | /api/v1/builds/{id}/logs | Bearer（所有角色）；`?after=&limit=`（after 为事件 id 游标，limit 1-1000，默认 200） | `{items}`，按事件 id 升序（SSE 的回退通道） |
+| GET | /api/v1/builds/{id}/events | Bearer（所有角色）；`?after=` 或 `Last-Event-ID` 续传 | `text/event-stream`：`status` / `logs` / `done` 帧 + `: ping` 心跳 |
 | POST | /api/v1/builds/{id}/cancel | Bearer + admin/member；**`{}`** | Build；重复取消幂等 200，终态构建 409 |
 
 **所有 auth POST（包括 login）强制恰好一个 Origin，且精确匹配允许列表**；缺失、不匹配、`null` 或跨站请求返回 `403 origin_denied`，在登录、轮换和退出之前拦截。非浏览器 curl/脚本也必须带该 Origin。其他请求如果携带 Origin 也须符合允许列表。全局拒绝 `Sec-Fetch-Site: cross-site`。允许来源响应包含 `Access-Control-Allow-Origin: <原始允许源>`、`Access-Control-Allow-Credentials: true`，`Vary: Origin, Sec-Fetch-Site`；OPTIONS 额外 Vary 请求方法与请求头，允许 GET/POST/OPTIONS 和 Authorization/Content-Type。
@@ -89,7 +90,7 @@ server: {
 - 状态机六态：`queued → running → succeeded/failed/cancelled`，只有持有 worker 租约的实例在启动后把遗留的 `running` 统一转为 `interrupted`。`interrupted` 表示进程被打断而不是业务失败，需要重新触发。租约是 PostgreSQL 会话级 advisory lock（按 database + schema 隔离）：同一部署只有一个副本执行与恢复，其余副本待命并在下一重试周期接管；连接或进程消失时锁自动释放。它保证"同一时刻一个 worker"，不提供多 worker 并行吞吐。
 - 触发时固化命令快照与分支（默认取项目 defaultBranch），构建号在每个项目内自增；之后修改项目命令不影响已触发的构建。命令在系统临时目录执行（Unix `sh -c`、Windows `cmd /c`），结束后删除目录。
 - worker 随服务进程启动、单并发运行；持有租约的副本用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取任务，`AEGIS_BUILD_TIMEOUT` 到期或收到取消请求时终止子进程。取消通过 300ms 状态看门狗传播到正在运行的命令。待命副本不领取、不恢复，只定期重试租约。
-- 日志按行写入 `build_log_events`，批量 500ms 落库；单行超过 4096 字节按 rune 边界截断，单构建最多记录 5000 条事件，超限后追加一条 system 截断说明。当前读取使用 `after` 游标轮询，SSE 推送在后续批次。
+- 日志按行写入 `build_log_events`，批量 500ms 落库；单行超过 4096 字节按 rune 边界截断，单构建最多记录 5000 条事件，超限后追加一条 system 截断说明。读取有两条通道：`GET /builds/{id}/events` 的 SSE 推送（`status`/`logs`/`done` 帧，`Last-Event-ID` 或 `after` 续传，15s 心跳，终态后等日志静默 3s 再结束，单连接上限 10 分钟后发 `reconnect`），以及保留的 `after` 游标轮询作为回退。SSE 由前端用 `fetch` 流式读取并携带 Bearer——`EventSource` 无法设置 Authorization 头，token 不放进 URL。
 - 本批边界（明确不做）：受控执行身份与资源上限、输出脱敏、仓库 clone。构建只执行项目配置的命令，不下载代码。
 
 
@@ -167,7 +168,7 @@ $env:AEGIS_OPS_REDIS_URL = 'redis://localhost:6379/2'
 go test ./cmd/server/ -run TestRealProcessLifecycle -count=1
 ```
 
-分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计）、构建流水线（触发校验与每项目编号、成功与失败退出码、超时、取消与幂等、重启恢复为 interrupted、跨副本 worker 租约互斥与待命接管、游标日志分页与截断、RBAC 与未接线 503）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目/构建端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
+分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计）、构建流水线（触发校验与每项目编号、成功与失败退出码、超时、取消与幂等、重启恢复为 interrupted、跨副本 worker 租约互斥与待命接管、SSE 推送与写超时豁免/终态收尾/非法游标、游标日志分页与截断、RBAC 与未接线 503）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目/构建端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
 
 ## 架构
 

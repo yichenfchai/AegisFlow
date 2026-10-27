@@ -121,8 +121,10 @@ export function refreshSession(): Promise<void> {
   }).finally(() => { refreshFlight = null })
   return refreshFlight
 }
-// One refresh and at most one retry per request. A late 401 reuses a token already refreshed by a peer request.
-export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+// Returns a token that is valid for the next request, restoring the session or
+// refreshing first when needed. Streaming callers need the raw token because
+// EventSource cannot attach an Authorization header.
+export async function accessTokenForRequest(): Promise<string> {
   if (useSession.getState().status === 'loading') await useSession.getState().restore()
   if (useSession.getState().status !== 'authenticated') throw new ApiError(401, 'unauthorized', '请先登录')
   // A fixed five-second margin refreshes on every request whenever the server
@@ -131,7 +133,11 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
   // Scale the margin to the token lifetime instead.
   const refreshMargin = Math.min(5000, Math.max(1000, Math.floor(accessLifetimeMs / 2)))
   if (Date.now() >= expiresAt - refreshMargin) await refreshSession()
-  const token = useSession.getState().accessToken!
+  return useSession.getState().accessToken!
+}
+// One refresh and at most one retry per request. A late 401 reuses a token already refreshed by a peer request.
+export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const token = await accessTokenForRequest()
   const expected = revision
   try { return await httpRequest<T>(path, init, token) } catch (error) {
     if (!isUnauthorized(error)) throw error
