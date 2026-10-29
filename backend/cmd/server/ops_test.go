@@ -311,3 +311,43 @@ func getJSON(t *testing.T, client *http.Client, origin, url, token string) strin
 	}
 	return string(data)
 }
+
+// envWith replaces the given keys in the current environment. The child must
+// still inherit Windows system variables for exec to work.
+func envWith(overrides map[string]string) []string {
+	env := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, kv := range os.Environ() {
+		key, _, _ := strings.Cut(kv, "=")
+		if _, replaced := overrides[key]; replaced {
+			continue
+		}
+		env = append(env, kv)
+	}
+	for key, value := range overrides {
+		env = append(env, key+"="+value)
+	}
+	return env
+}
+
+// TestUnsupportedBuildSandboxFailsClosed proves the process refuses to start
+// when an isolation mode that is not implemented is requested. Accepting it
+// would let an operator believe builds are isolated when they are not.
+func TestUnsupportedBuildSandboxFailsClosed(t *testing.T) {
+	bin := buildServer(t)
+	cmd := exec.Command(bin)
+	cmd.Env = envWith(map[string]string{
+		"AEGIS_BUILD_SANDBOX": "container",
+		"AEGIS_DATABASE_URL":  "postgres://user:pass@127.0.0.1:1/aegis?sslmode=disable",
+		"AEGIS_REDIS_URL":     "redis://127.0.0.1:1/0",
+		"AEGIS_JWT_SECRET":    strings.Repeat("s", 32),
+	})
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err == nil {
+		t.Fatal("server started with an unimplemented build sandbox mode")
+	}
+	if !strings.Contains(output.String(), "AEGIS_BUILD_SANDBOX") {
+		t.Fatalf("startup output does not name the switch: %s", output.String())
+	}
+}

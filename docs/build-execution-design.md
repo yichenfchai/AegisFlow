@@ -103,11 +103,11 @@ worker 调用容器运行时（Docker/Podman）启动一次性容器：只挂载
 
 - 迁移 **v6**：`builds.repo_url TEXT NOT NULL DEFAULT ''`（触发时快照）。原计划写的是 v5，但 v5 已被项目可见性与成员表占用（[项目级成员权限设计](project-permissions-design.md) §5）；`internal/dbmigrate` 是共享的版本化账本，按落地顺序编号，④c 需追加 v6。
 - 配置新增：
-  - `AEGIS_BUILD_SANDBOX=container|user|none`（默认 `none` 用于开发，生产应设 `container`）；
-  - `AEGIS_BUILD_CPU`、`AEGIS_BUILD_MEMORY`、`AEGIS_BUILD_PIDS`、`AEGIS_BUILD_DISK`（默认值见 §4）；
-  - `AEGIS_BUILD_ALLOW_LOCAL_REPO=true|false`（默认 false）；
+  - `AEGIS_BUILD_SANDBOX=container|user|none`（默认 `none` 用于开发，生产应设 `container`）。**已落地（仅 `none` 可用）**：`user`/`container` 在启动校验中被拒绝并说明“尚未实现”，`none` 启动打印警告；资源与 clone 开关待执行器落地后一起加，避免出现不被执行的配置项。
+  - `AEGIS_BUILD_CPU`、`AEGIS_BUILD_MEMORY`、`AEGIS_BUILD_PIDS`、`AEGIS_BUILD_DISK`（默认值见 §4；待执行器实现时加入）；
+  - `AEGIS_BUILD_ALLOW_LOCAL_REPO=true|false`（默认 false；随 ④c 加入）；
   - `AEGIS_BUILD_CLONE=true|false`（默认 false，④c 灰度用）。
-- 启动校验：`AEGIS_BUILD_SANDBOX=container` 时检查容器运行时可用，否则拒绝启动（fail closed）；`none` 时启动日志明确警告。
+- 启动校验：`AEGIS_BUILD_SANDBOX=container` 时检查容器运行时可用，否则拒绝启动（fail closed）；`none` 时启动日志明确警告。当前实现只做到后半条与「未实现模式拒绝启动」，容器探测等执行器落地时补。
 
 ## 8. 验收标准
 
