@@ -1,8 +1,11 @@
 // Package projects is the project registry: validation, active/archived
-// lifecycle, pagination, and audit rows committed atomically with each
-// mutation. Authorization uses global roles only (admin/member write, viewer
-// read); per-project membership is deferred by design. The HTTP layer owns
-// role checks; this package never depends on Gin.
+// lifecycle, visibility and membership, pagination, and audit rows committed
+// atomically with each mutation. Reads are filtered by project visibility: a
+// private project is invisible (404, never 403) to anyone who is not a global
+// admin, its creator, or a member. Writes are still bounded by the caller's
+// global role; the project-maintainer overlay lands with the next slice of the
+// permissions design. The HTTP layer owns role checks; this package never
+// depends on Gin.
 package projects
 
 import (
@@ -39,6 +42,27 @@ const (
 	StatusArchived = "archived"
 )
 
+const (
+	// VisibilityPublic is the default: every authenticated role can read the
+	// project, exactly like the behaviour before membership existed.
+	VisibilityPublic = "public"
+	// VisibilityPrivate restricts reads to global admins, the creator and
+	// project members.
+	VisibilityPrivate = "private"
+)
+
+const (
+	// RoleMaintainer can read the project and, once the write overlay lands,
+	// modify it and its builds.
+	RoleMaintainer = "maintainer"
+	// RoleViewer can only read the project, its builds and its logs.
+	RoleViewer = "viewer"
+)
+
+// globalAdminRole is the role that is never subject to project visibility or
+// membership; it mirrors the auth package's role vocabulary.
+const globalAdminRole = "admin"
+
 type Project struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
@@ -47,9 +71,21 @@ type Project struct {
 	DefaultBranch string `json:"defaultBranch"`
 	BuildCommand  string `json:"buildCommand"`
 	Status        string `json:"status"`
+	Visibility    string `json:"visibility"`
 	CreatedBy     string `json:"createdBy"`
 	CreatedAt     int64  `json:"createdAt"`
 	UpdatedAt     int64  `json:"updatedAt"`
+}
+
+// Member is one project membership row. Username is resolved from auth_users
+// for display; userID is the stable identity used by the API.
+type Member struct {
+	ProjectID string `json:"projectId"`
+	UserID    string `json:"userId"`
+	Username  string `json:"username"`
+	Role      string `json:"role"`
+	CreatedBy string `json:"createdBy"`
+	CreatedAt int64  `json:"createdAt"`
 }
 
 type Input struct {
@@ -58,6 +94,7 @@ type Input struct {
 	RepoURL       string
 	DefaultBranch string
 	BuildCommand  string
+	Visibility    string
 }
 
 type Patch struct {
@@ -66,6 +103,7 @@ type Patch struct {
 	RepoURL       *string
 	DefaultBranch *string
 	BuildCommand  *string
+	Visibility    *string
 	Archived      *bool
 }
 
@@ -75,7 +113,27 @@ type Service struct {
 
 func New(db *sql.DB) *Service { return &Service{db: db} }
 
-const projectColumns = `id,name,description,repo_url,default_branch,build_command,status,created_by,created_at,updated_at`
+const projectColumns = `p.id,p.name,p.description,p.repo_url,p.default_branch,p.build_command,p.status,p.visibility,p.created_by,p.created_at,p.updated_at`
+
+// VisiblePredicate renders the SQL condition that restricts a query to projects
+// the actor may see. It is the single definition of project visibility; other
+// packages embed it so a joined query filters and paginates identically.
+//
+// alias is the projects table alias in the caller's query, adminParam is the
+// 1-based index of the caller's "is global admin" boolean parameter, and
+// actorParam is the index of the caller's user id. Both parameters appear more
+// than once, so PostgreSQL requires their placeholders to be reused verbatim.
+func VisiblePredicate(alias string, adminParam, actorParam int) string {
+	return fmt.Sprintf(`(%[1]s.visibility='%[2]s' OR $%[3]d OR %[1]s.created_by=$%[4]d OR EXISTS (
+		SELECT 1 FROM project_members pm WHERE pm.project_id=%[1]s.id AND pm.user_id=$%[4]d))`,
+		alias, VisibilityPublic, adminParam, actorParam)
+}
+
+// VisibilityArgs returns the parameter pair VisiblePredicate expects for this
+// actor: whether the actor is a global admin, and the actor's user id.
+func VisibilityArgs(actor auth.Actor) (isAdmin bool, userID string) {
+	return actor.Role == globalAdminRole, actor.ID
+}
 
 // Source locations serve different deployment scenarios: https or SSH git URLs
 // for hosted repositories, absolute local paths for single-node checkout
@@ -150,6 +208,26 @@ func validateBranch(branch string) error {
 	return nil
 }
 
+// normalizeVisibility maps an omitted visibility to the backward-compatible
+// default and rejects values outside the documented enumeration.
+func normalizeVisibility(value string) (string, error) {
+	if value == "" {
+		return VisibilityPublic, nil
+	}
+	if value != VisibilityPublic && value != VisibilityPrivate {
+		return "", fmt.Errorf("%w: visibility must be public or private", ErrValidation)
+	}
+	return value, nil
+}
+
+// validateMemberRole bounds project roles to the two documented values.
+func validateMemberRole(role string) error {
+	if role != RoleMaintainer && role != RoleViewer {
+		return fmt.Errorf("%w: role must be maintainer or viewer", ErrValidation)
+	}
+	return nil
+}
+
 func validateInput(input Input) error {
 	if err := validateName(input.Name); err != nil {
 		return err
@@ -188,15 +266,21 @@ type rowScanner interface{ Scan(dest ...any) error }
 
 func scanProject(row rowScanner) (*Project, error) {
 	var p Project
-	if err := row.Scan(&p.ID, &p.Name, &p.Description, &p.RepoURL, &p.DefaultBranch, &p.BuildCommand, &p.Status, &p.CreatedBy, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := row.Scan(&p.ID, &p.Name, &p.Description, &p.RepoURL, &p.DefaultBranch, &p.BuildCommand, &p.Status, &p.Visibility, &p.CreatedBy, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &p, nil
 }
 
 // Create registers a new active project; names are unique case-insensitively.
+// The creator becomes the first maintainer in the same transaction, so owner
+// access survives a later switch to private visibility.
 func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (*Project, error) {
 	if err := validateInput(input); err != nil {
+		return nil, err
+	}
+	visibility, err := normalizeVisibility(input.Visibility)
+	if err != nil {
 		return nil, err
 	}
 	id, err := newID()
@@ -204,14 +288,14 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (*P
 		return nil, err
 	}
 	now := time.Now().Unix()
-	project := &Project{ID: id, Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, BuildCommand: input.BuildCommand, Status: StatusActive, CreatedBy: actor.ID, CreatedAt: now, UpdatedAt: now}
+	project := &Project{ID: id, Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, BuildCommand: input.BuildCommand, Status: StatusActive, Visibility: visibility, CreatedBy: actor.ID, CreatedAt: now, UpdatedAt: now}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `INSERT INTO projects(id,name,description,repo_url,default_branch,build_command,status,created_by,created_at,updated_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9) ON CONFLICT (lower(name)) DO NOTHING`, id, input.Name, input.Description, input.RepoURL, input.DefaultBranch, input.BuildCommand, StatusActive, actor.ID, now)
+	result, err := tx.ExecContext(ctx, `INSERT INTO projects(id,name,description,repo_url,default_branch,build_command,status,visibility,created_by,created_at,updated_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10) ON CONFLICT (lower(name)) DO NOTHING`, id, input.Name, input.Description, input.RepoURL, input.DefaultBranch, input.BuildCommand, StatusActive, visibility, actor.ID, now)
 	if err != nil {
 		return nil, err
 	}
@@ -219,6 +303,12 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (*P
 		return nil, err
 	} else if n == 0 {
 		return nil, fmt.Errorf("%w: project name already exists", ErrConflict)
+	}
+	if actor.ID != "" {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO project_members(project_id,user_id,role,created_by,created_at)
+		 VALUES($1,$2,$3,$2,$4) ON CONFLICT DO NOTHING`, id, actor.ID, RoleMaintainer, now); err != nil {
+			return nil, err
+		}
 	}
 	if err = writeAudit(ctx, tx, actor, ActionCreate, id, input.Name); err != nil {
 		return nil, err
@@ -229,12 +319,15 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (*P
 	return project, nil
 }
 
-// Get returns one project by id.
-func (s *Service) Get(ctx context.Context, id string) (*Project, error) {
+// Get returns one project by id when the actor may see it. An invisible
+// project is reported as ErrNotFound so private ids cannot be enumerated.
+func (s *Service) Get(ctx context.Context, actor auth.Actor, id string) (*Project, error) {
 	if !auth.ValidID(id) {
 		return nil, fmt.Errorf("%w: invalid project id", ErrValidation)
 	}
-	project, err := scanProject(s.db.QueryRowContext(ctx, `SELECT `+projectColumns+` FROM projects WHERE id=$1`, id))
+	isAdmin, userID := VisibilityArgs(actor)
+	project, err := scanProject(s.db.QueryRowContext(ctx, `SELECT `+projectColumns+` FROM projects p
+	 WHERE p.id=$1 AND `+VisiblePredicate("p", 2, 3), id, isAdmin, userID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -244,19 +337,23 @@ func (s *Service) Get(ctx context.Context, id string) (*Project, error) {
 	return project, nil
 }
 
-// List pages projects ordered by name; status must be empty, active or archived.
-func (s *Service) List(ctx context.Context, status string, limit, offset int) ([]Project, int, error) {
+// List pages the projects the actor may see, ordered by name; status must be
+// empty, active or archived.
+func (s *Service) List(ctx context.Context, actor auth.Actor, status string, limit, offset int) ([]Project, int, error) {
 	if status != "" && status != StatusActive && status != StatusArchived {
 		return nil, 0, fmt.Errorf("%w: status filter must be active or archived", ErrValidation)
 	}
 	if limit < 1 || limit > 100 || offset < 0 {
 		return nil, 0, fmt.Errorf("%w: limit must be 1-100 and offset non-negative", ErrValidation)
 	}
+	isAdmin, userID := VisibilityArgs(actor)
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE ($1='' OR status=$1)`, status).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects p WHERE ($1='' OR p.status=$1) AND `+VisiblePredicate("p", 2, 3), status, isAdmin, userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+projectColumns+` FROM projects WHERE ($1='' OR status=$1) ORDER BY lower(name),id LIMIT $2 OFFSET $3`, status, limit, offset)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+projectColumns+` FROM projects p
+	 WHERE ($1='' OR p.status=$1) AND `+VisiblePredicate("p", 4, 5)+`
+	 ORDER BY lower(p.name),p.id LIMIT $2 OFFSET $3`, status, limit, offset, isAdmin, userID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -279,7 +376,7 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 	if !auth.ValidID(id) {
 		return nil, fmt.Errorf("%w: invalid project id", ErrValidation)
 	}
-	if patch.Name == nil && patch.Description == nil && patch.RepoURL == nil && patch.DefaultBranch == nil && patch.BuildCommand == nil && patch.Archived == nil {
+	if patch.Name == nil && patch.Description == nil && patch.RepoURL == nil && patch.DefaultBranch == nil && patch.BuildCommand == nil && patch.Visibility == nil && patch.Archived == nil {
 		return nil, fmt.Errorf("%w: at least one field is required", ErrValidation)
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -287,7 +384,11 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 		return nil, err
 	}
 	defer tx.Rollback()
-	current, err := scanProject(tx.QueryRowContext(ctx, `SELECT `+projectColumns+` FROM projects WHERE id=$1 FOR UPDATE`, id))
+	isAdmin, userID := VisibilityArgs(actor)
+	// The visibility predicate runs inside the locking read, so an actor who
+	// cannot see the project cannot update it either (404, not 403).
+	current, err := scanProject(tx.QueryRowContext(ctx, `SELECT `+projectColumns+` FROM projects p
+	 WHERE p.id=$1 AND `+VisiblePredicate("p", 2, 3)+` FOR UPDATE`, id, isAdmin, userID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -314,6 +415,14 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 	}
 	if patch.BuildCommand != nil {
 		updated.BuildCommand = *patch.BuildCommand
+		fieldChange = true
+	}
+	if patch.Visibility != nil {
+		visibility, err := normalizeVisibility(*patch.Visibility)
+		if err != nil {
+			return nil, err
+		}
+		updated.Visibility = visibility
 		fieldChange = true
 	}
 	// An archived project is read-only; only restoring it (or repeating the
@@ -353,8 +462,8 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 		}
 	}
 	updated.UpdatedAt = time.Now().Unix()
-	if _, err = tx.ExecContext(ctx, `UPDATE projects SET name=$2,description=$3,repo_url=$4,default_branch=$5,build_command=$6,status=$7,updated_at=$8 WHERE id=$1`,
-		id, updated.Name, updated.Description, updated.RepoURL, updated.DefaultBranch, updated.BuildCommand, updated.Status, updated.UpdatedAt); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE projects SET name=$2,description=$3,repo_url=$4,default_branch=$5,build_command=$6,visibility=$7,status=$8,updated_at=$9 WHERE id=$1`,
+		id, updated.Name, updated.Description, updated.RepoURL, updated.DefaultBranch, updated.BuildCommand, updated.Visibility, updated.Status, updated.UpdatedAt); err != nil {
 		return nil, err
 	}
 	action, detail := ActionUpdate, ""
@@ -374,4 +483,133 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 		return nil, err
 	}
 	return &updated, nil
+}
+
+const memberColumns = `pm.project_id,pm.user_id,COALESCE(u.username,''),pm.role,pm.created_by,pm.created_at`
+
+func scanMember(row rowScanner) (*Member, error) {
+	var m Member
+	if err := row.Scan(&m.ProjectID, &m.UserID, &m.Username, &m.Role, &m.CreatedBy, &m.CreatedAt); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// ListMembers returns the members of a project the actor may see, maintainers
+// first. Membership is never readable for an invisible project, so the caller
+// cannot probe a private project's member list.
+func (s *Service) ListMembers(ctx context.Context, actor auth.Actor, projectID string) ([]Member, error) {
+	if _, err := s.Get(ctx, actor, projectID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+memberColumns+` FROM project_members pm
+	 LEFT JOIN auth_users u ON u.id=pm.user_id
+	 WHERE pm.project_id=$1
+	 ORDER BY CASE pm.role WHEN '`+RoleMaintainer+`' THEN 0 ELSE 1 END, COALESCE(u.username,''), pm.user_id`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	members := make([]Member, 0)
+	for rows.Next() {
+		member, err := scanMember(rows)
+		if err != nil {
+			return nil, err
+		}
+		members = append(members, *member)
+	}
+	return members, rows.Err()
+}
+
+// AddMember grants a user a role on the project. Adding an existing member is a
+// conflict; the target account must exist so membership cannot hold dangling ids.
+func (s *Service) AddMember(ctx context.Context, actor auth.Actor, projectID, userID, role string) (*Member, error) {
+	if !auth.ValidID(projectID) {
+		return nil, fmt.Errorf("%w: invalid project id", ErrValidation)
+	}
+	if !auth.ValidID(userID) {
+		return nil, fmt.Errorf("%w: invalid user id", ErrValidation)
+	}
+	if err := validateMemberRole(role); err != nil {
+		return nil, err
+	}
+	if _, err := s.Get(ctx, actor, projectID); err != nil {
+		return nil, err
+	}
+	var username string
+	err := s.db.QueryRowContext(ctx, `SELECT username FROM auth_users WHERE id=$1`, userID).Scan(&username)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: user not found", ErrNotFound)
+	}
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().Unix()
+	result, err := s.db.ExecContext(ctx, `INSERT INTO project_members(project_id,user_id,role,created_by,created_at)
+	 VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, projectID, userID, role, actor.ID, now)
+	if err != nil {
+		return nil, err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return nil, err
+	} else if n == 0 {
+		return nil, fmt.Errorf("%w: user is already a member of this project", ErrConflict)
+	}
+	return &Member{ProjectID: projectID, UserID: userID, Username: username, Role: role, CreatedBy: actor.ID, CreatedAt: now}, nil
+}
+
+// UpdateMemberRole changes one membership role; a missing membership is not
+// found rather than silently created.
+func (s *Service) UpdateMemberRole(ctx context.Context, actor auth.Actor, projectID, userID, role string) (*Member, error) {
+	if !auth.ValidID(projectID) {
+		return nil, fmt.Errorf("%w: invalid project id", ErrValidation)
+	}
+	if !auth.ValidID(userID) {
+		return nil, fmt.Errorf("%w: invalid user id", ErrValidation)
+	}
+	if err := validateMemberRole(role); err != nil {
+		return nil, err
+	}
+	if _, err := s.Get(ctx, actor, projectID); err != nil {
+		return nil, err
+	}
+	member, err := scanMember(s.db.QueryRowContext(ctx, `UPDATE project_members pm SET role=$3
+	 WHERE pm.project_id=$1 AND pm.user_id=$2
+	 RETURNING pm.project_id,pm.user_id,(SELECT username FROM auth_users WHERE id=pm.user_id),pm.role,pm.created_by,pm.created_at`,
+		projectID, userID, role))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: membership not found", ErrNotFound)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return member, nil
+}
+
+// RemoveMember deletes one membership. The project creator keeps owner access
+// for the lifetime of the project and cannot be removed.
+func (s *Service) RemoveMember(ctx context.Context, actor auth.Actor, projectID, userID string) error {
+	if !auth.ValidID(projectID) {
+		return fmt.Errorf("%w: invalid project id", ErrValidation)
+	}
+	if !auth.ValidID(userID) {
+		return fmt.Errorf("%w: invalid user id", ErrValidation)
+	}
+	project, err := s.Get(ctx, actor, projectID)
+	if err != nil {
+		return err
+	}
+	if userID == project.CreatedBy {
+		return fmt.Errorf("%w: the project creator cannot be removed", ErrValidation)
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM project_members WHERE project_id=$1 AND user_id=$2`, projectID, userID)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return fmt.Errorf("%w: membership not found", ErrNotFound)
+	}
+	return nil
 }

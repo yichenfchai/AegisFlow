@@ -119,12 +119,19 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	projectRoutes.GET("/:id", s.getProject)
 	projectRoutes.PATCH("/:id", s.requireRole("admin", "member"), s.updateProject)
 	projectRoutes.POST("/:id/builds", s.requireRole("admin", "member"), s.triggerBuild)
+	// Membership is readable by anyone who can see the project; mutations are
+	// bounded by the global role until the maintainer overlay lands.
+	projectRoutes.GET("/:id/members", s.listProjectMembers)
+	projectRoutes.POST("/:id/members", s.requireRole("admin", "member"), s.addProjectMember)
+	projectRoutes.PATCH("/:id/members/:userId", s.requireRole("admin", "member"), s.updateProjectMember)
+	projectRoutes.DELETE("/:id/members/:userId", s.requireRole("admin", "member"), s.removeProjectMember)
 	buildRoutes := api.Group("/builds", s.authenticate())
 	buildRoutes.GET("", s.listBuilds)
 	buildRoutes.GET("/:id", s.getBuild)
 	buildRoutes.GET("/:id/logs", s.getBuildLogs)
 	buildRoutes.GET("/:id/events", s.streamBuildEvents)
 	buildRoutes.POST("/:id/cancel", s.requireRole("admin", "member"), s.cancelBuild)
+	buildRoutes.POST("/:id/retry", s.requireRole("admin", "member"), s.retryBuild)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }
@@ -263,10 +270,11 @@ func (s *Server) requireRole(roles ...string) gin.HandlerFunc {
 func currentUser(c *gin.Context) *auth.User { return c.MustGet(userKey).(*auth.User) }
 func (s *Server) me(c *gin.Context)         { s.respond(c, 200, currentUser(c)) }
 
-// actorFrom builds the audit actor of the authenticated caller.
+// actorFrom builds the audit actor of the authenticated caller. Role comes from
+// the freshly inspected database user, never from the request body.
 func actorFrom(c *gin.Context) auth.Actor {
 	user := currentUser(c)
-	return auth.Actor{ID: user.ID, Username: user.Username, RequestID: requestID(c)}
+	return auth.Actor{ID: user.ID, Username: user.Username, Role: user.Role, RequestID: requestID(c)}
 }
 
 // page parses shared limit/offset pagination; the response reports it back.
@@ -407,7 +415,7 @@ func (s *Server) listProjects(c *gin.Context) {
 		return
 	}
 	status := c.Query("status")
-	list, total, err := s.projects.List(c.Request.Context(), status, limit, offset)
+	list, total, err := s.projects.List(c.Request.Context(), actorFrom(c), status, limit, offset)
 	if err != nil {
 		s.projectError(c, err)
 		return
@@ -426,11 +434,12 @@ func (s *Server) createProject(c *gin.Context) {
 		RepoURL       string `json:"repoUrl"`
 		DefaultBranch string `json:"defaultBranch"`
 		BuildCommand  string `json:"buildCommand"`
+		Visibility    string `json:"visibility"`
 	}
 	if !s.decode(c, &input) {
 		return
 	}
-	project, err := s.projects.Create(c.Request.Context(), actorFrom(c), projects.Input{Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, BuildCommand: input.BuildCommand})
+	project, err := s.projects.Create(c.Request.Context(), actorFrom(c), projects.Input{Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, BuildCommand: input.BuildCommand, Visibility: input.Visibility})
 	if err != nil {
 		s.projectError(c, err)
 		return
@@ -443,7 +452,7 @@ func (s *Server) getProject(c *gin.Context) {
 		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
 		return
 	}
-	project, err := s.projects.Get(c.Request.Context(), c.Param("id"))
+	project, err := s.projects.Get(c.Request.Context(), actorFrom(c), c.Param("id"))
 	if err != nil {
 		s.projectError(c, err)
 		return
@@ -462,21 +471,107 @@ func (s *Server) updateProject(c *gin.Context) {
 		RepoURL       *string `json:"repoUrl"`
 		DefaultBranch *string `json:"defaultBranch"`
 		BuildCommand  *string `json:"buildCommand"`
+		Visibility    *string `json:"visibility"`
 		Archived      *bool   `json:"archived"`
 	}
 	if !s.decode(c, &input) {
 		return
 	}
-	if input.Name == nil && input.Description == nil && input.RepoURL == nil && input.DefaultBranch == nil && input.BuildCommand == nil && input.Archived == nil {
+	if input.Name == nil && input.Description == nil && input.RepoURL == nil && input.DefaultBranch == nil && input.BuildCommand == nil && input.Visibility == nil && input.Archived == nil {
 		s.fail(c, 400, "invalid_request", "at least one project field is required")
 		return
 	}
-	project, err := s.projects.Update(c.Request.Context(), actorFrom(c), c.Param("id"), projects.Patch{Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, BuildCommand: input.BuildCommand, Archived: input.Archived})
+	project, err := s.projects.Update(c.Request.Context(), actorFrom(c), c.Param("id"), projects.Patch{Name: input.Name, Description: input.Description, RepoURL: input.RepoURL, DefaultBranch: input.DefaultBranch, BuildCommand: input.BuildCommand, Visibility: input.Visibility, Archived: input.Archived})
 	if err != nil {
 		s.projectError(c, err)
 		return
 	}
 	s.respond(c, 200, project)
+}
+
+// memberError maps membership failures; the validation and conflict messages
+// describe membership rather than project fields, so a client can tell why the
+// request was rejected.
+func (s *Server) memberError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, projects.ErrValidation):
+		s.fail(c, 400, "validation_failed", "role must be maintainer or viewer; the project creator cannot be removed; ids must be valid")
+	case errors.Is(err, projects.ErrConflict):
+		s.fail(c, 409, "conflict", "user is already a member of this project")
+	case errors.Is(err, projects.ErrNotFound):
+		s.fail(c, 404, "not_found", "resource not found")
+	default:
+		s.logger.ErrorContext(c.Request.Context(), "project member request failed", "requestId", requestID(c), "error", err)
+		s.fail(c, 500, "internal_error", "internal server error")
+	}
+}
+
+// listProjectMembers returns the members of a project the caller can see. The
+// visibility check lives in the service, so an invisible project is a 404 here
+// as well.
+func (s *Server) listProjectMembers(c *gin.Context) {
+	if s.projects == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	members, err := s.projects.ListMembers(c.Request.Context(), actorFrom(c), c.Param("id"))
+	if err != nil {
+		s.memberError(c, err)
+		return
+	}
+	s.respond(c, 200, members)
+}
+
+func (s *Server) addProjectMember(c *gin.Context) {
+	if s.projects == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	var input struct {
+		UserID string `json:"userId"`
+		Role   string `json:"role"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	member, err := s.projects.AddMember(c.Request.Context(), actorFrom(c), c.Param("id"), input.UserID, input.Role)
+	if err != nil {
+		s.memberError(c, err)
+		return
+	}
+	s.respond(c, 201, member)
+}
+
+func (s *Server) updateProjectMember(c *gin.Context) {
+	if s.projects == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	var input struct {
+		Role string `json:"role"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	member, err := s.projects.UpdateMemberRole(c.Request.Context(), actorFrom(c), c.Param("id"), c.Param("userId"), input.Role)
+	if err != nil {
+		s.memberError(c, err)
+		return
+	}
+	s.respond(c, 200, member)
+}
+
+func (s *Server) removeProjectMember(c *gin.Context) {
+	if s.projects == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	// No request body: the target and the project are both in the path.
+	if err := s.projects.RemoveMember(c.Request.Context(), actorFrom(c), c.Param("id"), c.Param("userId")); err != nil {
+		s.memberError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"removed": true})
 }
 
 // buildError maps pipeline errors; the pipeline is optional infrastructure
@@ -486,7 +581,7 @@ func (s *Server) buildError(c *gin.Context, err error) {
 	case errors.Is(err, builds.ErrValidation):
 		s.fail(c, 400, "validation_failed", "project has no build command configured, or invalid ids or branch")
 	case errors.Is(err, builds.ErrConflict):
-		s.fail(c, 409, "conflict", "archived project cannot start builds, or only queued/running builds can be cancelled")
+		s.fail(c, 409, "conflict", "archived project cannot start builds, only queued or running builds can be cancelled, and only terminal builds can be retried")
 	case errors.Is(err, builds.ErrNotFound):
 		s.fail(c, 404, "not_found", "resource not found")
 	default:
@@ -523,7 +618,7 @@ func (s *Server) listBuilds(c *gin.Context) {
 	if !ok {
 		return
 	}
-	list, total, err := s.builds.List(c.Request.Context(), c.Query("projectId"), limit, offset)
+	list, total, err := s.builds.List(c.Request.Context(), actorFrom(c), c.Query("projectId"), limit, offset)
 	if err != nil {
 		s.buildError(c, err)
 		return
@@ -536,7 +631,7 @@ func (s *Server) getBuild(c *gin.Context) {
 		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
 		return
 	}
-	build, err := s.builds.Get(c.Request.Context(), c.Param("id"))
+	build, err := s.builds.Get(c.Request.Context(), actorFrom(c), c.Param("id"))
 	if err != nil {
 		s.buildError(c, err)
 		return
@@ -568,11 +663,7 @@ func (s *Server) getBuildLogs(c *gin.Context) {
 		limit = parsed
 	}
 	buildID := c.Param("id")
-	if _, err := s.builds.Get(c.Request.Context(), buildID); err != nil {
-		s.buildError(c, err)
-		return
-	}
-	events, err := s.builds.Logs(c.Request.Context(), buildID, after, limit)
+	events, err := s.builds.Logs(c.Request.Context(), actorFrom(c), buildID, after, limit)
 	if err != nil {
 		s.buildError(c, err)
 		return
@@ -604,7 +695,8 @@ func (s *Server) streamBuildEvents(c *gin.Context) {
 		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
 		return
 	}
-	build, err := s.builds.Get(c.Request.Context(), c.Param("id"))
+	actor := actorFrom(c)
+	build, err := s.builds.Get(c.Request.Context(), actor, c.Param("id"))
 	if err != nil {
 		s.buildError(c, err)
 		return
@@ -649,7 +741,7 @@ func (s *Server) streamBuildEvents(c *gin.Context) {
 			}
 			c.Writer.Flush()
 		case <-poll.C:
-			events, err := s.builds.Logs(c.Request.Context(), build.ID, after, sseLogBatch)
+			events, err := s.builds.Logs(c.Request.Context(), actor, build.ID, after, sseLogBatch)
 			if err != nil {
 				return
 			}
@@ -660,7 +752,7 @@ func (s *Server) streamBuildEvents(c *gin.Context) {
 				}
 				quietSince = time.Time{}
 			}
-			current, err := s.builds.Get(c.Request.Context(), build.ID)
+			current, err := s.builds.Get(c.Request.Context(), actor, build.ID)
 			if err != nil {
 				return
 			}
@@ -750,6 +842,24 @@ func (s *Server) cancelBuild(c *gin.Context) {
 		return
 	}
 	s.respond(c, 200, build)
+}
+
+// retryBuild enqueues a new build for a terminal build's branch, using the
+// project's current command; the original row stays as the historical record.
+func (s *Server) retryBuild(c *gin.Context) {
+	if s.builds == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	if !s.decode(c, &struct{}{}) {
+		return
+	}
+	build, err := s.builds.Retry(c.Request.Context(), actorFrom(c), c.Param("id"))
+	if err != nil {
+		s.buildError(c, err)
+		return
+	}
+	s.respond(c, 201, build)
 }
 
 func (s *Server) changePassword(c *gin.Context) {

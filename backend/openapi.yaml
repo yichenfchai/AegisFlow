@@ -523,7 +523,7 @@ paths:
       tags: [Projects]
       operationId: listProjects
       summary: List projects (all roles)
-      description: Ordered by name case-insensitively, then id. Authorization uses global roles only; per-project membership is not implemented.
+      description: Ordered by name case-insensitively, then id. Only projects the caller can see are listed; global admins see every project, every other role sees public projects plus the ones it created or joined. A private project the caller cannot see is never listed and, by id, answers 404.
       security:
         - bearerAuth: []
       parameters:
@@ -714,6 +714,160 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/projects/{projectId}/members:
+    get:
+      tags: [Projects]
+      operationId: listProjectMembers
+      summary: List project members (anyone who can see the project)
+      description: |
+        Maintainers first, then by username. An invisible project answers 404,
+        so a private project's member list cannot be probed.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Members, maintainers first
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProjectMember' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Projects]
+      operationId: addProjectMember
+      summary: Add a project member (admin or member)
+      description: |
+        The target account must exist. Membership is a read grant: it never
+        raises the caller's global role, and a private project is invisible
+        until a row exists for the caller.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectMemberInput' }
+      responses:
+        '201':
+          description: Membership created
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ProjectMember' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: User is already a member of this project; error.code is conflict
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/projects/{projectId}/members/{userId}:
+    patch:
+      tags: [Projects]
+      operationId: updateProjectMember
+      summary: Change one membership role (admin or member)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectMemberPatch' }
+      responses:
+        '200':
+          description: Updated membership
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ProjectMember' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Projects]
+      operationId: removeProjectMember
+      summary: Remove one membership (admin or member)
+      description: The project creator keeps owner access and cannot be removed (400).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Membership removed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [removed]
+                    properties:
+                      removed: { type: boolean }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/builds:
     get:
       tags: [Builds]
@@ -899,6 +1053,50 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/builds/{buildId}/retry:
+    post:
+      tags: [Builds]
+      operationId: retryBuild
+      summary: Retry a terminal build (admin or member)
+      description: |
+        Enqueues a new build for the original build's branch, using the
+        project's **current** buildCommand, so fixing the command and retrying
+        builds the fix. The original build row stays as the historical record of
+        what ran. The project must be active and still carry a build command;
+        queued or running builds cannot be retried (409). A successful retry
+        writes a build.retry audit entry (objectType build) whose detail names
+        the original build number, in the same transaction as the new row.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '201':
+          description: New build enqueued
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Build' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Build is still queued or running, the project is archived, or it has no build command; error.code is conflict or validation_failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
 components:
   securitySchemes:
     bearerAuth:
@@ -1062,7 +1260,7 @@ components:
     Project:
       type: object
       additionalProperties: false
-      required: [id, name, description, repoUrl, defaultBranch, status, createdBy, createdAt, updatedAt]
+      required: [id, name, description, repoUrl, defaultBranch, status, visibility, createdBy, createdAt, updatedAt]
       properties:
         id: { type: string }
         name:
@@ -1081,6 +1279,13 @@ components:
           type: string
           description: Single-line shell command executed in a temporary workdir; builds require it
         status: { type: string, enum: [active, archived] }
+        visibility:
+          type: string
+          enum: [public, private]
+          description: |
+            public (default) is readable by every authenticated role. private is
+            visible only to global admins, the creator and project members; an
+            invisible project answers 404 rather than 403.
         createdBy: { type: string, description: Actor id snapshot of the creating user }
         createdAt: { type: integer, format: int64, description: Unix seconds }
         updatedAt: { type: integer, format: int64, description: Unix seconds }
@@ -1094,6 +1299,7 @@ components:
         repoUrl: { type: string }
         defaultBranch: { type: string }
         buildCommand: { type: string, maxLength: 512 }
+        visibility: { type: string, enum: [public, private], description: Defaults to public when omitted }
     ProjectPatch:
       type: object
       additionalProperties: false
@@ -1104,9 +1310,34 @@ components:
         repoUrl: { type: string }
         defaultBranch: { type: string }
         buildCommand: { type: string, maxLength: 512 }
+        visibility: { type: string, enum: [public, private] }
         archived:
           type: boolean
           description: true archives (idempotent); false restores an archived project
+    ProjectMember:
+      type: object
+      additionalProperties: false
+      required: [projectId, userId, username, role, createdBy, createdAt]
+      properties:
+        projectId: { type: string }
+        userId: { type: string }
+        username: { type: string, description: Resolved from the auth account; empty if the account no longer exists }
+        role: { type: string, enum: [maintainer, viewer] }
+        createdBy: { type: string, description: Actor id snapshot of who granted the membership }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+    ProjectMemberInput:
+      type: object
+      additionalProperties: false
+      required: [userId, role]
+      properties:
+        userId: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        role: { type: string, enum: [maintainer, viewer] }
+    ProjectMemberPatch:
+      type: object
+      additionalProperties: false
+      required: [role]
+      properties:
+        role: { type: string, enum: [maintainer, viewer] }
     ProjectPage:
       type: object
       additionalProperties: false
@@ -1163,7 +1394,7 @@ components:
         createdAt: { type: integer, format: int64, description: Unix seconds }
         actorId: { type: string, description: Empty for system rows }
         actorUsername: { type: string }
-        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, build.trigger, build.cancel] }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, build.trigger, build.cancel, build.retry] }
         objectType: { type: string, enum: [user, session, project, build] }
         objectId: { type: string }
         result: { type: string, enum: [success, failure] }

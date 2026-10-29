@@ -72,27 +72,27 @@ func TestListPaginationAndStatusFilter(t *testing.T) {
 	if _, err := s.Update(ctx, testActor, mustID(t, s, "grace"), Patch{Archived: boolPtr(true)}); err != nil {
 		t.Fatal(err)
 	}
-	projects, total, err := s.List(ctx, "", 20, 0)
+	projects, total, err := s.List(ctx, testActor, "", 20, 0)
 	if err != nil || total != 3 || len(projects) != 3 || projects[0].Name != "ada" || projects[2].Name != "grace" {
 		t.Fatalf("list=%+v total=%d err=%v", projects, total, err)
 	}
-	if projects, total, err = s.List(ctx, StatusActive, 20, 0); err != nil || total != 2 || len(projects) != 2 {
+	if projects, total, err = s.List(ctx, testActor, StatusActive, 20, 0); err != nil || total != 2 || len(projects) != 2 {
 		t.Fatalf("active filter: %d %d %v", len(projects), total, err)
 	}
-	if _, total, err = s.List(ctx, StatusArchived, 20, 0); err != nil || total != 1 {
+	if _, total, err = s.List(ctx, testActor, StatusArchived, 20, 0); err != nil || total != 1 {
 		t.Fatalf("archived filter: %d %v", total, err)
 	}
-	if _, _, err = s.List(ctx, "deleted", 20, 0); !errors.Is(err, ErrValidation) {
+	if _, _, err = s.List(ctx, testActor, "deleted", 20, 0); !errors.Is(err, ErrValidation) {
 		t.Fatalf("bad status error = %v", err)
 	}
-	if _, _, err = s.List(ctx, "", 0, 0); !errors.Is(err, ErrValidation) {
+	if _, _, err = s.List(ctx, testActor, "", 0, 0); !errors.Is(err, ErrValidation) {
 		t.Fatalf("bad bounds error = %v", err)
 	}
 }
 
 func mustID(t *testing.T, s *Service, name string) string {
 	t.Helper()
-	projects, _, err := s.List(context.Background(), "", 100, 0)
+	projects, _, err := s.List(context.Background(), testActor, "", 100, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,5 +180,130 @@ func TestAuditTrail(t *testing.T) {
 	}
 	if seen[ActionCreate] != 1 || seen[ActionArchive] != 1 || len(seen) != 2 {
 		t.Fatalf("audit actions = %v", seen)
+	}
+}
+
+// Actors covering the global roles plus one project outsider. IDs must satisfy
+// auth.ValidID so the registry treats them like real accounts.
+var (
+	adminActor    = auth.Actor{ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-admin"}
+	memberActor   = auth.Actor{ID: "member-000000000000001", Username: "mia", Role: "member", RequestID: "req-member"}
+	viewerActor   = auth.Actor{ID: "viewer-000000000000001", Username: "vic", Role: "viewer", RequestID: "req-viewer"}
+	outsiderActor = auth.Actor{ID: "outsider-0000000000001", Username: "otto", Role: "member", RequestID: "req-outsider"}
+)
+
+// seedUser inserts an auth account so membership can reference a real user.
+func seedUser(t *testing.T, db *sql.DB, id, username string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role)
+	 VALUES($1,$2,'unused',$2,'member')`, id, username); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVisibilityFiltersProjectReads(t *testing.T) {
+	s, db := testService(t)
+	ctx := context.Background()
+	seedUser(t, db, memberActor.ID, memberActor.Username)
+	seedUser(t, db, viewerActor.ID, viewerActor.Username)
+	public, err := s.Create(ctx, adminActor, Input{Name: "public-one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if public.Visibility != VisibilityPublic {
+		t.Fatalf("default visibility = %q", public.Visibility)
+	}
+	private, err := s.Create(ctx, adminActor, Input{Name: "private-one", Visibility: VisibilityPrivate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Create(ctx, adminActor, Input{Name: "bogus", Visibility: "secret"}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("invalid visibility error = %v", err)
+	}
+	// Global admin sees every project regardless of visibility.
+	if _, total, err := s.List(ctx, adminActor, "", 20, 0); err != nil || total != 2 {
+		t.Fatalf("admin list total=%d err=%v", total, err)
+	}
+	// A non-member reads the public project only, and the private one is not found.
+	list, total, err := s.List(ctx, memberActor, "", 20, 0)
+	if err != nil || total != 1 || len(list) != 1 || list[0].ID != public.ID {
+		t.Fatalf("member list = %+v total=%d err=%v", list, total, err)
+	}
+	if _, err = s.Get(ctx, memberActor, private.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("invisible private project error = %v", err)
+	}
+	if _, err = s.Update(ctx, outsiderActor, private.ID, Patch{Description: str("hijack")}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("invisible update error = %v", err)
+	}
+	// Viewer membership grants read access without any global write role.
+	if _, err = s.AddMember(ctx, adminActor, private.ID, memberActor.ID, RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Get(ctx, memberActor, private.ID); err != nil || got.ID != private.ID {
+		t.Fatalf("member read after add = %+v err=%v", got, err)
+	}
+	if _, total, err = s.List(ctx, memberActor, "", 20, 0); err != nil || total != 2 {
+		t.Fatalf("member list after add total=%d err=%v", total, err)
+	}
+	// Switching a project back to public restores the old behaviour.
+	if _, err = s.Update(ctx, adminActor, private.ID, Patch{Visibility: str(VisibilityPublic)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Get(ctx, outsiderActor, private.ID); err != nil {
+		t.Fatalf("public read after flip err=%v", err)
+	}
+}
+
+func TestMemberLifecycle(t *testing.T) {
+	s, db := testService(t)
+	ctx := context.Background()
+	seedUser(t, db, memberActor.ID, memberActor.Username)
+	seedUser(t, db, viewerActor.ID, viewerActor.Username)
+	project, err := s.Create(ctx, adminActor, Input{Name: "team", Visibility: VisibilityPrivate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The creator is the first maintainer.
+	members, err := s.ListMembers(ctx, adminActor, project.ID)
+	if err != nil || len(members) != 1 || members[0].UserID != adminActor.ID || members[0].Role != RoleMaintainer {
+		t.Fatalf("initial members = %+v err=%v", members, err)
+	}
+	member, err := s.AddMember(ctx, adminActor, project.ID, memberActor.ID, RoleViewer)
+	if err != nil || member.Username != memberActor.Username || member.Role != RoleViewer {
+		t.Fatalf("add member = %+v err=%v", member, err)
+	}
+	if _, err = s.AddMember(ctx, adminActor, project.ID, memberActor.ID, RoleViewer); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate member error = %v", err)
+	}
+	if _, err = s.AddMember(ctx, adminActor, project.ID, "absent-00000000000001", RoleViewer); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown user error = %v", err)
+	}
+	if _, err = s.AddMember(ctx, adminActor, project.ID, viewerActor.ID, "owner"); !errors.Is(err, ErrValidation) {
+		t.Fatalf("invalid role error = %v", err)
+	}
+	promoted, err := s.UpdateMemberRole(ctx, adminActor, project.ID, memberActor.ID, RoleMaintainer)
+	if err != nil || promoted.Role != RoleMaintainer {
+		t.Fatalf("promote = %+v err=%v", promoted, err)
+	}
+	if _, err = s.UpdateMemberRole(ctx, adminActor, project.ID, viewerActor.ID, RoleViewer); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown membership error = %v", err)
+	}
+	// The creator keeps owner access and cannot be removed.
+	if err = s.RemoveMember(ctx, adminActor, project.ID, adminActor.ID); !errors.Is(err, ErrValidation) {
+		t.Fatalf("creator removal error = %v", err)
+	}
+	if err = s.RemoveMember(ctx, adminActor, project.ID, memberActor.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RemoveMember(ctx, adminActor, project.ID, memberActor.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("repeat removal error = %v", err)
+	}
+	// Removal also removes visibility.
+	if _, err = s.Get(ctx, memberActor, project.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("visibility after removal error = %v", err)
+	}
+	// A non-member cannot probe a private project's member list.
+	if _, err = s.ListMembers(ctx, outsiderActor, project.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("member list enumeration error = %v", err)
 	}
 }

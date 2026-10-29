@@ -102,6 +102,11 @@ func newWithLimits(db *sql.DB, projectRegistry *projects.Service, timeout time.D
 
 const buildColumns = `id,project_id,build_number,status,branch,command,triggered_by,created_at,started_at,finished_at`
 
+// buildColumnsQualified is buildColumns with the table alias needed by the
+// visibility join: reads embed projects.VisiblePredicate, so a build of an
+// invisible project is not found rather than forbidden.
+const buildColumnsQualified = `b.id,b.project_id,b.build_number,b.status,b.branch,b.command,b.triggered_by,b.created_at,b.started_at,b.finished_at`
+
 type rowScanner interface{ Scan(dest ...any) error }
 
 func newID() (string, error) {
@@ -136,6 +141,31 @@ func scanBuild(row rowScanner) (*Build, error) {
 // Trigger enqueues a build. The project must exist, be active, and carry a
 // build command; the row lock serializes the per-project number sequence.
 func (s *Service) Trigger(ctx context.Context, actor auth.Actor, projectID, branch string) (*Build, error) {
+	return s.enqueue(ctx, actor, projectID, branch, "build.trigger", "")
+}
+
+// Retry enqueues a new build for the branch of an existing terminal build. The
+// command comes from the project's current configuration, so a retry after
+// fixing the command builds the fix; the original row stays as the historical
+// record of what ran. Queued and running builds cannot be retried (409).
+func (s *Service) Retry(ctx context.Context, actor auth.Actor, id string) (*Build, error) {
+	if !auth.ValidID(id) {
+		return nil, fmt.Errorf("%w: invalid build id", ErrValidation)
+	}
+	original, err := s.Get(ctx, actor, id)
+	if err != nil {
+		return nil, err
+	}
+	if !Terminal(original.Status) {
+		return nil, fmt.Errorf("%w: only terminal builds can be retried", ErrConflict)
+	}
+	return s.enqueue(ctx, actor, original.ProjectID, original.Branch, "build.retry", fmt.Sprintf(" retry_of=%d", original.BuildNumber))
+}
+
+// enqueue inserts a queued build and commits its audit row in the same
+// transaction. action distinguishes a fresh trigger from a retry; detailSuffix
+// carries the retry provenance and never contains the command.
+func (s *Service) enqueue(ctx context.Context, actor auth.Actor, projectID, branch, action, detailSuffix string) (*Build, error) {
 	if !auth.ValidID(projectID) {
 		return nil, fmt.Errorf("%w: invalid project id", ErrValidation)
 	}
@@ -149,7 +179,11 @@ func (s *Service) Trigger(ctx context.Context, actor auth.Actor, projectID, bran
 	defer tx.Rollback()
 	var status, command, defaultBranch string
 	var count int64
-	err = tx.QueryRowContext(ctx, `SELECT status,build_command,default_branch,build_count FROM projects WHERE id=$1 FOR UPDATE`, projectID).Scan(&status, &command, &defaultBranch, &count)
+	isAdmin, userID := projects.VisibilityArgs(actor)
+	// The visibility predicate runs inside the locking read: triggering a build
+	// on an invisible project is a 404, exactly like reading it.
+	err = tx.QueryRowContext(ctx, `SELECT p.status,p.build_command,p.default_branch,p.build_count FROM projects p
+	 WHERE p.id=$1 AND `+projects.VisiblePredicate("p", 2, 3)+` FOR UPDATE`, projectID, isAdmin, userID).Scan(&status, &command, &defaultBranch, &count)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -178,7 +212,7 @@ func (s *Service) Trigger(ctx context.Context, actor auth.Actor, projectID, bran
 	if _, err = tx.ExecContext(ctx, `UPDATE projects SET build_count=$2 WHERE id=$1`, projectID, build.BuildNumber); err != nil {
 		return nil, err
 	}
-	if err = writeAudit(ctx, tx, actor, "build.trigger", id, fmt.Sprintf("project=%s build=%d", projectID, build.BuildNumber)); err != nil {
+	if err = writeAudit(ctx, tx, actor, action, id, fmt.Sprintf("project=%s build=%d%s", projectID, build.BuildNumber, detailSuffix)); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -196,10 +230,10 @@ func (s *Service) wake() {
 	}
 }
 
-func (s *Service) Get(ctx context.Context, id string) (*Build, error) {
-	if !auth.ValidID(id) {
-		return nil, fmt.Errorf("%w: invalid build id", ErrValidation)
-	}
+// getByID is the internal, visibility-free read used by the worker's status
+// watchdog: the worker must observe cancellation and shutdown regardless of who
+// triggered the build. Request paths always go through Get.
+func (s *Service) getByID(ctx context.Context, id string) (*Build, error) {
 	build, err := scanBuild(s.db.QueryRowContext(ctx, `SELECT `+buildColumns+` FROM builds WHERE id=$1`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -210,19 +244,44 @@ func (s *Service) Get(ctx context.Context, id string) (*Build, error) {
 	return build, nil
 }
 
-// List pages builds newest first; projectID may be empty for all projects.
-func (s *Service) List(ctx context.Context, projectID string, limit, offset int) ([]Build, int, error) {
+// Get returns one build the actor may see. A build whose project is invisible
+// to the actor is reported as ErrNotFound (404) to avoid enumeration.
+func (s *Service) Get(ctx context.Context, actor auth.Actor, id string) (*Build, error) {
+	if !auth.ValidID(id) {
+		return nil, fmt.Errorf("%w: invalid build id", ErrValidation)
+	}
+	isAdmin, userID := projects.VisibilityArgs(actor)
+	build, err := scanBuild(s.db.QueryRowContext(ctx, `SELECT `+buildColumnsQualified+` FROM builds b
+	 JOIN projects p ON p.id=b.project_id
+	 WHERE b.id=$1 AND `+projects.VisiblePredicate("p", 2, 3), id, isAdmin, userID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return build, nil
+}
+
+// List pages the builds of projects the actor may see, newest first; projectID
+// may be empty for all visible projects.
+func (s *Service) List(ctx context.Context, actor auth.Actor, projectID string, limit, offset int) ([]Build, int, error) {
 	if projectID != "" && !auth.ValidID(projectID) {
 		return nil, 0, fmt.Errorf("%w: invalid project id", ErrValidation)
 	}
 	if limit < 1 || limit > 100 || offset < 0 {
 		return nil, 0, fmt.Errorf("%w: limit must be 1-100 and offset non-negative", ErrValidation)
 	}
+	isAdmin, userID := projects.VisibilityArgs(actor)
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM builds WHERE ($1='' OR project_id=$1)`, projectID).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM builds b JOIN projects p ON p.id=b.project_id
+	 WHERE ($1='' OR b.project_id=$1) AND `+projects.VisiblePredicate("p", 2, 3), projectID, isAdmin, userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+buildColumns+` FROM builds WHERE ($1='' OR project_id=$1) ORDER BY created_at DESC,id DESC LIMIT $2 OFFSET $3`, projectID, limit, offset)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+buildColumnsQualified+` FROM builds b
+	 JOIN projects p ON p.id=b.project_id
+	 WHERE ($1='' OR b.project_id=$1) AND `+projects.VisiblePredicate("p", 4, 5)+`
+	 ORDER BY b.created_at DESC,b.id DESC LIMIT $2 OFFSET $3`, projectID, limit, offset, isAdmin, userID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -239,8 +298,9 @@ func (s *Service) List(ctx context.Context, projectID string, limit, offset int)
 }
 
 // Logs returns events after the exclusive cursor, oldest first. The cursor is
-// the last event id the client saw; it doubles as the SSE resume sequence.
-func (s *Service) Logs(ctx context.Context, buildID string, after int64, limit int) ([]LogEvent, error) {
+// the last event id the client saw; it doubles as the SSE resume sequence. The
+// project join keeps the SSE fallback channel behind the same visibility rule.
+func (s *Service) Logs(ctx context.Context, actor auth.Actor, buildID string, after int64, limit int) ([]LogEvent, error) {
 	if !auth.ValidID(buildID) {
 		return nil, fmt.Errorf("%w: invalid build id", ErrValidation)
 	}
@@ -250,8 +310,17 @@ func (s *Service) Logs(ctx context.Context, buildID string, after int64, limit i
 	if limit < 1 || limit > maxLogPageSize {
 		limit = 200
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,build_id,stream,message,created_at FROM build_log_events
-	 WHERE build_id=$1 AND id>$2 ORDER BY id LIMIT $3`, buildID, after, limit)
+	// Resolve the build first so an invisible project yields ErrNotFound rather
+	// than an empty page the client cannot distinguish from "no output yet".
+	if _, err := s.Get(ctx, actor, buildID); err != nil {
+		return nil, err
+	}
+	isAdmin, userID := projects.VisibilityArgs(actor)
+	rows, err := s.db.QueryContext(ctx, `SELECT e.id,e.build_id,e.stream,e.message,e.created_at FROM build_log_events e
+	 JOIN builds b ON b.id=e.build_id
+	 JOIN projects p ON p.id=b.project_id
+	 WHERE e.build_id=$1 AND e.id>$2 AND `+projects.VisiblePredicate("p", 4, 5)+`
+	 ORDER BY e.id LIMIT $3`, buildID, after, limit, isAdmin, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -279,10 +348,15 @@ func (s *Service) Cancel(ctx context.Context, actor auth.Actor, id string) (*Bui
 		return nil, err
 	}
 	defer tx.Rollback()
+	isAdmin, userID := projects.VisibilityArgs(actor)
 	build, err := scanBuild(tx.QueryRowContext(ctx, `UPDATE builds SET status=$2, finished_at=CASE WHEN finished_at=0 THEN $3 ELSE finished_at END
-	 WHERE id=$1 AND status IN ($4,$5) RETURNING `+buildColumns, id, StatusCancelled, time.Now().Unix(), StatusQueued, StatusRunning))
+	 WHERE id=$1 AND status IN ($4,$5)
+	   AND project_id IN (SELECT p.id FROM projects p WHERE `+projects.VisiblePredicate("p", 6, 7)+`)
+	 RETURNING `+buildColumns, id, StatusCancelled, time.Now().Unix(), StatusQueued, StatusRunning, isAdmin, userID))
 	if errors.Is(err, sql.ErrNoRows) {
-		exists, existsErr := s.Get(ctx, id)
+		// Distinguish "already cancelled" from "not visible": Get applies the
+		// same visibility rule, so an invisible build stays a 404 here too.
+		exists, existsErr := s.Get(ctx, actor, id)
 		switch {
 		case existsErr != nil:
 			return nil, existsErr

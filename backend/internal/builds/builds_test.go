@@ -2,6 +2,7 @@ package builds
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -66,7 +67,7 @@ func waitForStatus(t *testing.T, s *Service, id string, want ...string) *Build {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		build, err := s.Get(context.Background(), id)
+		build, err := s.Get(context.Background(), testActor, id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -146,11 +147,11 @@ func TestWorkerSuccessAndLogs(t *testing.T) {
 		}
 	}
 	// Cursor paging: everything after the first event still contains output.
-	events, err := s.Logs(context.Background(), build.ID, 0, 1000)
+	events, err := s.Logs(context.Background(), testActor, build.ID, 0, 1000)
 	if err != nil || len(events) < 3 {
 		t.Fatalf("expected system+stdout+system events: %+v err=%v", events, err)
 	}
-	rest, err := s.Logs(context.Background(), build.ID, events[0].ID, 1000)
+	rest, err := s.Logs(context.Background(), testActor, build.ID, events[0].ID, 1000)
 	if err != nil || len(rest) != len(events)-1 {
 		t.Fatalf("cursor page = %d events, err %v", len(rest), err)
 	}
@@ -171,7 +172,7 @@ func waitForLog(t *testing.T, s *Service, id, want string) string {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		events, err := s.Logs(context.Background(), id, 0, 1000)
+		events, err := s.Logs(context.Background(), testActor, id, 0, 1000)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -271,7 +272,7 @@ func TestRecoverInterruptedAndList(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Simulate a crash mid-execution: running row without a worker.
-	list, total, err := s.List(ctx, "", 20, 0)
+	list, total, err := s.List(ctx, testActor, "", 20, 0)
 	if err != nil || total != 1 || len(list) != 1 || list[0].Status != StatusQueued {
 		t.Fatalf("list = %+v total=%d err=%v", list, total, err)
 	}
@@ -282,11 +283,177 @@ func TestRecoverInterruptedAndList(t *testing.T) {
 	if err != nil || recovered != 1 {
 		t.Fatalf("recovered=%d err=%v", recovered, err)
 	}
-	got, err := s.Get(ctx, build.ID)
+	got, err := s.Get(ctx, testActor, build.ID)
 	if err != nil || got.Status != StatusInterrupted {
 		t.Fatalf("after recovery = %+v err=%v", got, err)
 	}
-	if list, total, err = s.List(ctx, project.ID, 20, 0); err != nil || total != 1 || list[0].Status != StatusInterrupted {
+	if list, total, err = s.List(ctx, testActor, project.ID, 20, 0); err != nil || total != 1 || list[0].Status != StatusInterrupted {
 		t.Fatalf("project filter = %+v err=%v", list, err)
+	}
+}
+
+// secretCommand prints three credential shapes on one line: an environment
+// style assignment, a bearer header and a database URL with a password.
+func secretCommand() string {
+	return `echo AEGIS_JWT_SECRET=super-secret-value Bearer abcdefghijklmnop postgres://aegis:hunter2@127.0.0.1:5432/aegisflow`
+}
+
+func TestBuildOutputIsRedacted(t *testing.T) {
+	s, registry := testService(t)
+	startWorker(t, s)
+	project := createProject(t, registry, "redaction-project", secretCommand())
+	build, err := s.Trigger(context.Background(), testActor, project.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, s, build.ID, StatusSucceeded)
+	waitForLog(t, s, build.ID, "[redacted]")
+	// The tally is written when the writer closes, which can trail the terminal
+	// status by one flush, so wait for it instead of reading once.
+	joined := waitForLog(t, s, build.ID, "sensitive value(s)")
+	for _, secret := range []string{"super-secret-value", "abcdefghijklmnop", "hunter2"} {
+		if strings.Contains(joined, secret) {
+			t.Fatalf("build log leaked %q: %s", secret, joined)
+		}
+	}
+}
+
+// outsiderActor is a global member who is not a member of the private project.
+var outsiderActor = auth.Actor{ID: "outsider-0000000000001", Username: "otto", Role: "member", RequestID: "req-outsider"}
+
+// adminActor bypasses project visibility entirely.
+var adminActor = auth.Actor{ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-admin"}
+
+func TestBuildReadsFollowProjectVisibility(t *testing.T) {
+	s, registry := testService(t)
+	startWorker(t, s)
+	ctx := context.Background()
+	project := createProject(t, registry, "private-builds", "echo secret-output")
+	build, err := s.Trigger(ctx, testActor, project.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, s, build.ID, StatusSucceeded)
+
+	private := projects.VisibilityPrivate
+	if _, err = registry.Update(ctx, testActor, project.ID, projects.Patch{Visibility: &private}); err != nil {
+		t.Fatal(err)
+	}
+	// An outsider sees neither the build nor its logs, and cannot touch it.
+	if list, total, err := s.List(ctx, outsiderActor, "", 20, 0); err != nil || total != 0 || len(list) != 0 {
+		t.Fatalf("outsider list = %+v total=%d err=%v", list, total, err)
+	}
+	if _, err := s.Get(ctx, outsiderActor, build.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("outsider get error = %v", err)
+	}
+	if _, err := s.Logs(ctx, outsiderActor, build.ID, 0, 100); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("outsider logs error = %v", err)
+	}
+	if _, err := s.Trigger(ctx, outsiderActor, project.ID, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("outsider trigger error = %v", err)
+	}
+	if _, err := s.Cancel(ctx, outsiderActor, build.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("outsider cancel error = %v", err)
+	}
+	// The creator still reads everything, including the log stream.
+	if _, err := s.Get(ctx, testActor, build.ID); err != nil {
+		t.Fatal(err)
+	}
+	events, err := s.Logs(ctx, testActor, build.ID, 0, 1000)
+	if err != nil || len(events) == 0 {
+		t.Fatalf("creator logs = %d err=%v", len(events), err)
+	}
+	if list, total, err := s.List(ctx, testActor, "", 20, 0); err != nil || total != 1 || list[0].ID != build.ID {
+		t.Fatalf("creator list = %+v total=%d err=%v", list, total, err)
+	}
+	// A global admin is never filtered.
+	if _, err := s.Get(ctx, adminActor, build.ID); err != nil {
+		t.Fatalf("admin get err=%v", err)
+	}
+	if list, total, err := s.List(ctx, adminActor, "", 20, 0); err != nil || total != 1 || len(list) != 1 {
+		t.Fatalf("admin list = %+v total=%d err=%v", list, total, err)
+	}
+}
+
+func TestRetryEnqueuesANewBuild(t *testing.T) {
+	s, registry := testService(t)
+	startWorker(t, s)
+	ctx := context.Background()
+	project := createProject(t, registry, "retry-project", "echo retry-me")
+	build, err := s.Trigger(ctx, testActor, project.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, s, build.ID, StatusSucceeded)
+
+	retried, err := s.Retry(ctx, testActor, build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.BuildNumber != build.BuildNumber+1 || retried.Status != StatusQueued || retried.Branch != build.Branch {
+		t.Fatalf("retry payload = %+v", retried)
+	}
+	waitForStatus(t, s, retried.ID, StatusSucceeded)
+
+	// A retry runs the project's current command, not the original snapshot:
+	// fixing the command and retrying is the point of the operation.
+	changed := "echo changed-command"
+	if _, err = registry.Update(ctx, testActor, project.ID, projects.Patch{BuildCommand: &changed}); err != nil {
+		t.Fatal(err)
+	}
+	third, err := s.Retry(ctx, testActor, build.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Command != changed {
+		t.Fatalf("retry command = %q, want %q", third.Command, changed)
+	}
+	waitForStatus(t, s, third.ID, StatusSucceeded)
+
+	// Only terminal builds can be retried.
+	long := sleepCommand(30)
+	if _, err = registry.Update(ctx, testActor, project.ID, projects.Patch{BuildCommand: &long}); err != nil {
+		t.Fatal(err)
+	}
+	running, err := s.Trigger(ctx, testActor, project.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, s, running.ID, StatusRunning)
+	if _, err = s.Retry(ctx, testActor, running.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("retry of a running build error = %v", err)
+	}
+	if _, err = s.Cancel(ctx, testActor, running.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = s.Retry(ctx, testActor, "missing-0000000000000001"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown build error = %v", err)
+	}
+
+	// Retries are audited with their provenance and never the command.
+	var rows int
+	var detail string
+	if err = s.db.QueryRowContext(ctx, `SELECT count(*), coalesce(max(detail),'') FROM auth_audit WHERE action='build.retry'`).Scan(&rows, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("build.retry audit rows = %d", rows)
+	}
+	if !strings.Contains(detail, "retry_of=") {
+		t.Fatalf("retry detail = %q", detail)
+	}
+	if strings.Contains(detail, "echo") {
+		t.Fatalf("retry detail leaked the command: %q", detail)
+	}
+
+	// Retry resolves the original build through the visibility predicate: an
+	// outsider gets 404 for a build they cannot see, like every other read.
+	private := projects.VisibilityPrivate
+	if _, err = registry.Update(ctx, testActor, project.ID, projects.Patch{Visibility: &private}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Retry(ctx, outsiderActor, build.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("outsider retry error = %v", err)
 	}
 }
