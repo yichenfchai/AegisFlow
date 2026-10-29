@@ -72,6 +72,8 @@ func TestOpenAPIContractReferencesAndRoutes(t *testing.T) {
 		{"/api/v1/users/{userId}/password-reset", "post"}, {"/api/v1/audit", "get"},
 		{"/api/v1/projects", "get"}, {"/api/v1/projects", "post"}, {"/api/v1/projects/{projectId}", "get"},
 		{"/api/v1/projects/{projectId}", "patch"}, {"/api/v1/projects/{projectId}/builds", "post"},
+		{"/api/v1/projects/{projectId}/members", "get"}, {"/api/v1/projects/{projectId}/members", "post"},
+		{"/api/v1/projects/{projectId}/members/{userId}", "patch"}, {"/api/v1/projects/{projectId}/members/{userId}", "delete"},
 		{"/api/v1/builds", "get"}, {"/api/v1/builds/{buildId}", "get"}, {"/api/v1/builds/{buildId}/logs", "get"},
 		{"/api/v1/builds/{buildId}/events", "get"}, {"/api/v1/builds/{buildId}/cancel", "post"},
 		{"/api/v1/builds/{buildId}/retry", "post"},

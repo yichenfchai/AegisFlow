@@ -1,6 +1,7 @@
 # 受控执行环境与仓库 clone 设计（P3 下一批）
 
-> 状态：**设计草案，待所有者评审**。本文只定义边界、选项与验收标准，不包含实现。
+> 状态：**设计草案，待所有者评审**。本文定义边界、选项与验收标准。
+> 已落地：环境变量白名单、0700 构建目录、**输出脱敏（fail closed）**；④b（专用执行身份/容器 + 资源上限）与 ④c（clone）待所有者确认 D1-D6。
 > 关联：[TODO](../TODO.md) P3 第 3 项、[后端文档](../backend/README.md)「构建执行」、[鉴权契约](auth-contract.md)「构建执行边界」。
 
 ## 1. 现状与风险
@@ -18,11 +19,11 @@
 
 | # | 缺口 | 影响 | 修复批次 |
 | --- | --- | --- | --- |
-| 1 | 构建命令继承服务环境变量 | 任意项目命令可读取 JWT 密钥、数据库/Redis 凭据，等同凭据泄露 | ④a（优先，独立小 PR） |
+| 1 | 构建命令继承服务环境变量 | 任意项目命令可读取 JWT 密钥、数据库/Redis 凭据，等同凭据泄露 | ④a（已实现） |
 | 2 | 以服务账号身份执行 | 命令可读写服务可访问的任何文件；可修改二进制/配置 | ④b |
 | 3 | 无资源上限 | 一个构建可耗尽 CPU/内存/进程数，拖垮同实例的其他请求 | ④b |
-| 4 | 输出未脱敏 | 命令输出可能把自身读到的敏感值写进日志表并被所有角色读取 | ④a/④b |
-| 5 | 临时目录权限 | 同机其他用户可读（默认 0700 于 MkdirTemp，实际已受限，但依赖 umask 与平台） | ④a 验证并显式 chmod |
+| 4 | 输出未脱敏 | 命令输出可能把自身读到的敏感值写进日志表并被所有角色读取 | ④a（已实现，fail closed） |
+| 5 | 临时目录权限 | 同机其他用户可读（默认 0700 于 MkdirTemp，实际已受限，但依赖 umask 与平台） | ④a（已实现，显式 chmod） |
 | 6 | 不 clone 仓库 | 无法构建真实仓库；直接 clone 会把不可信代码引入执行环境 | ④c（依赖 ④b） |
 
 **结论：在 ④a/④b 完成前，只能把项目命令视为可信输入；不要把不可信仓库或外部贡献者的命令接入当前执行器。** 这一点必须继续写进 README 与鉴权契约。
@@ -86,8 +87,8 @@ worker 调用容器运行时（Docker/Podman）启动一次性容器：只挂载
 
 - `cmd.Env` 只包含显式白名单：`PATH`、`HOME`（指向构建目录）、`LANG`/`LC_ALL`、`TMPDIR`（指向构建目录内），以及未来的项目级构建变量（存储在密钥管理后）。
 - 明确**不继承** `AEGIS_*`、代理变量、云厂商凭据变量。
-- 输出脱敏：对日志行做模式替换（`AEGIS_[A-Z_]+=...`、`Bearer ...`、`postgres://user:pass@`、`redis://:pass@`、常见 token 前缀），替换为 `[redacted]`；脱敏在写入 `build_log_events` 前完成，且统计被替换次数写入 system 行（不写原值）。
-- 验收：构建命令执行 `env` 时，日志中不出现任何 `AEGIS_` 变量；用包含伪凭据的命令验证替换生效。
+- 输出脱敏：对日志行做模式替换（`AEGIS_[A-Z_]+=...`、`Bearer ...`、`postgres://user:pass@`、`redis://:pass@`、常见 token 前缀），替换为 `[redacted]`；脱敏在写入 `build_log_events` 前完成，且统计被替换次数写入 system 行（不写原值）。**已实现**：规则见 `internal/builds/redact.go`，覆盖上述模式并扩展了 JWT 与 PEM 私钥头；命中后若仍能匹配到原值，整行丢弃并计入 system 统计（D6 fail closed）。未覆盖多行私钥正文与自由文本口令。
+- 验收：构建命令执行 `env` 时，日志中不出现任何 `AEGIS_` 变量；用包含伪凭据的命令验证替换生效。（两条均已由 `internal/builds` 的集成测试覆盖。）
 
 ## 6. 仓库 clone（④c）
 
@@ -100,7 +101,7 @@ worker 调用容器运行时（Docker/Podman）启动一次性容器：只挂载
 
 ## 7. 数据模型与配置变更
 
-- 迁移 v5：`builds.repo_url TEXT NOT NULL DEFAULT ''`（触发时快照）。
+- 迁移 **v6**：`builds.repo_url TEXT NOT NULL DEFAULT ''`（触发时快照）。原计划写的是 v5，但 v5 已被项目可见性与成员表占用（[项目级成员权限设计](project-permissions-design.md) §5）；`internal/dbmigrate` 是共享的版本化账本，按落地顺序编号，④c 需追加 v6。
 - 配置新增：
   - `AEGIS_BUILD_SANDBOX=container|user|none`（默认 `none` 用于开发，生产应设 `container`）；
   - `AEGIS_BUILD_CPU`、`AEGIS_BUILD_MEMORY`、`AEGIS_BUILD_PIDS`、`AEGIS_BUILD_DISK`（默认值见 §4）；

@@ -131,7 +131,7 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 			case <-watchCtx.Done():
 				return
 			case <-ticker.C:
-				current, err := s.Get(context.Background(), build.ID)
+				current, err := s.getByID(context.Background(), build.ID)
 				if err != nil || current.Status != StatusRunning {
 					_ = cmd.Process.Kill()
 					closeStreams()
@@ -162,7 +162,7 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 		writer.systemf("interrupted by server shutdown")
 		s.finish(build, StatusInterrupted)
 	default:
-		if current, err := s.Get(context.Background(), build.ID); err == nil && current.Status == StatusCancelled {
+		if current, err := s.getByID(context.Background(), build.ID); err == nil && current.Status == StatusCancelled {
 			writer.systemf("build cancelled")
 			return
 		}
@@ -192,9 +192,13 @@ type logWriter struct {
 	max       int
 	count     int
 	truncated bool
-	done      chan struct{}
-	mu        sync.Mutex
-	pending   []LogEvent
+	// redacted counts credential-shaped values replaced in output; dropped
+	// counts lines withheld because a matched value survived redaction.
+	redacted int
+	dropped  int
+	done     chan struct{}
+	mu       sync.Mutex
+	pending  []LogEvent
 }
 
 func newLogWriter(s *Service, buildID string, max int) *logWriter {
@@ -229,9 +233,20 @@ func (w *logWriter) systemf(format string, args ...any) {
 }
 
 // append caps total events and per-line length; output past the cap drops.
+// Command output is redacted before it is stored: a line whose credential value
+// survives redaction is dropped entirely rather than persisted (fail closed).
 func (w *logWriter) append(stream, message string) {
+	hits, ok := 0, true
+	if stream != "system" {
+		message, hits, ok = redactOutputLine(message)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.redacted += hits
+	if !ok {
+		w.dropped++
+		return
+	}
 	if w.count >= w.max {
 		if !w.truncated {
 			w.truncated = true
@@ -260,8 +275,18 @@ func (w *logWriter) flush() {
 	_ = w.s.appendEvents(batch)
 }
 
-// close stops the flush loop and flushes the tail.
+// close reports the redaction tally, then stops the flush loop and flushes the
+// tail. The tally records counts only, never the replaced values.
 func (w *logWriter) close() {
+	w.mu.Lock()
+	redacted, dropped := w.redacted, w.dropped
+	w.mu.Unlock()
+	if redacted > 0 {
+		w.systemf("redacted %d sensitive value(s) from build output", redacted)
+	}
+	if dropped > 0 {
+		w.systemf("dropped %d output line(s) that still matched a sensitive pattern", dropped)
+	}
 	close(w.done)
 	w.flush()
 }
