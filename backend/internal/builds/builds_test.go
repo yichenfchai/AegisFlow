@@ -292,6 +292,32 @@ func TestRecoverInterruptedAndList(t *testing.T) {
 	}
 }
 
+// secretCommand prints three credential shapes on one line: an environment
+// style assignment, a bearer header and a database URL with a password.
+func secretCommand() string {
+	return `echo AEGIS_JWT_SECRET=super-secret-value Bearer abcdefghijklmnop postgres://aegis:hunter2@127.0.0.1:5432/aegisflow`
+}
+
+func TestBuildOutputIsRedacted(t *testing.T) {
+	s, registry := testService(t)
+	startWorker(t, s)
+	project := createProject(t, registry, "redaction-project", secretCommand())
+	build, err := s.Trigger(context.Background(), testActor, project.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, s, build.ID, StatusSucceeded)
+	waitForLog(t, s, build.ID, "[redacted]")
+	// The tally is written when the writer closes, which can trail the terminal
+	// status by one flush, so wait for it instead of reading once.
+	joined := waitForLog(t, s, build.ID, "sensitive value(s)")
+	for _, secret := range []string{"super-secret-value", "abcdefghijklmnop", "hunter2"} {
+		if strings.Contains(joined, secret) {
+			t.Fatalf("build log leaked %q: %s", secret, joined)
+		}
+	}
+}
+
 // outsiderActor is a global member who is not a member of the private project.
 var outsiderActor = auth.Actor{ID: "outsider-0000000000001", Username: "otto", Role: "member", RequestID: "req-outsider"}
 
