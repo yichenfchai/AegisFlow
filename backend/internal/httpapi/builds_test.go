@@ -242,8 +242,9 @@ func TestBuildRetryRoute(t *testing.T) {
 		t.Fatalf("retry payload: %s", w.Body.String())
 	}
 
-	// A queued or running build cannot be retried.
-	if w = request(h, "PATCH", "/api/v1/projects/"+projectID, `{"buildCommand":"ping -n 30 127.0.0.1 >nul"}`, adminToken); w.Code != 200 {
+	// A queued or running build cannot be retried. auditSleepCommand is the
+	// portable "keep it running" command: `ping -n` fails instantly on Linux.
+	if w = request(h, "PATCH", "/api/v1/projects/"+projectID, `{"buildCommand":"`+auditSleepCommand(30)+`"}`, adminToken); w.Code != 200 {
 		t.Fatalf("set long command: %d %s", w.Code, w.Body.String())
 	}
 	runningID := triggerBuild(t, h, adminToken, projectID, `{}`)
