@@ -41,6 +41,7 @@
 | GET /api/v1/builds/{id}/logs | Bearer（可见者），after/limit | 日志事件 {items}，按事件 id 升序；after 为游标（SSE 回退通道）；不可见 404 |
 | GET /api/v1/builds/{id}/events | Bearer（可见者），after 或 Last-Event-ID | SSE：status/logs/done 帧与心跳；按事件 id 续传；不可见 404 |
 | POST /api/v1/builds/{id}/cancel | admin/member Bearer，JSON {} | 取消排队/运行中的构建；重复取消幂等，终态 409；不可见 404 |
+| POST /api/v1/builds/{id}/retry | admin/member Bearer，JSON {} | 为终态构建入队新构建（201，queued）；沿用原构建分支、使用项目当前命令；排队/运行中 409；不可见 404 |
 
 accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh token 不返回 JSON，由 HttpOnly、SameSite=Strict、Path=/api/v1/auth 的 Cookie 保存，无 Domain。勾选保持登录时 Cookie 持久化到绝对会话期限，未勾选使用 session Cookie；浏览器恢复会话可能保留 session Cookie，因此不承诺关闭窗口立即退出。主动退出以服务端撤销为准。默认绝对期限 30 天，由后端配置决定，刷新不延长。
 
@@ -51,8 +52,9 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 - 构建状态为 queued/running/succeeded/failed/cancelled/interrupted；interrupted 由持有 worker 租约的实例在启动恢复时产生，表示进程中断而非业务失败。
 - 触发时固化命令、分支与触发人快照，构建号在项目内自增；仓储地址不参与本批执行（不 clone），命令在临时目录用系统 shell 执行，超时由 AEGIS_BUILD_TIMEOUT 控制。
 - 日志与状态提供两条读取通道：`GET /builds/{id}/events` 的 SSE 推送（`status`/`logs`/`done` 帧，`Last-Event-ID` 或 `after` 续传，15s 心跳，终态后静默收尾，单连接上限 10 分钟）与保留的 `after` 游标轮询。SSE 必须携带 Bearer，因此前端用 fetch 流式读取而不是 `EventSource`，token 不放进 URL。
-- 构建不改变账号/权限数据，也不写审计表；触发、取消与日志读取沿用全局角色授权（admin/member 可写，viewer 只读），每次请求由服务端校验，不依赖前端隐藏按钮。
-- 执行环境尚非完全受控：以服务进程身份执行，没有专用执行账号、资源上限或输出脱敏；但构建命令只获得最小环境变量白名单（`PATH`/`HOME`/`TMPDIR`/`TMP`/`TEMP`/`LANG` 等，Windows 另加系统必需变量），不继承 `AEGIS_*` 服务凭据，`HOME` 与临时目录都指向 0700 的构建目录。不要把不可信仓库命令接入本批执行器。
+- 构建不改变账号/权限数据；触发、取消与重试在状态变更的同一事务写入审计（detail 不含命令），日志读取沿用全局角色授权（admin/member 可写，viewer 只读），每次请求由服务端校验，不依赖前端隐藏按钮。
+- 日志脱敏已实现：写入 `build_log_events` 前，对 stdout/stderr 按既定模式（`AEGIS_*=...`、`Bearer ...`、带内联凭据的 `postgres://`/`redis://` URL、常见 token 前缀、JWT、私钥头）替换为 `[redacted]`，构建结束时追加一条 system 统计行（只记数量，不记原值）。命中却无法确认已移除的行整行丢弃并计数（fail closed，D6）。多行私钥正文与自由文本里的口令不在模式覆盖范围内。
+- 执行环境仍非完全受控：以服务进程身份执行，没有专用执行账号与 CPU/内存/进程数上限；构建命令只获得最小环境变量白名单（`PATH`/`HOME`/`TMPDIR`/`TMP`/`TEMP`/`LANG` 等，Windows 另加系统必需变量），不继承 `AEGIS_*` 服务凭据，`HOME` 与临时目录都指向 0700 的构建目录。不要把不可信仓库命令接入本批执行器。
 
 ## 客户端会话生命周期
 

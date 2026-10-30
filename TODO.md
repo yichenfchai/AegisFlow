@@ -1,6 +1,6 @@
 # AegisFlow 开发 TODO
 
-更新日期：2026-10-27（P1、P2 已完成；P3 第一批构建闭环已落地；项目可见性与成员 P1 已落地）。按依赖顺序推进，每项完成后更新勾选和验证结果。当前采用 React + Go/Gin 的模块化单体，真实浏览器鉴权、账号管理（P1）、项目注册表（P2 第一批）、最小构建闭环（P3 第一批）与项目可见性/成员读过滤已打通；其余业务页面恒定显示未实现声明。所有变更走 PR 并由所有者 review（见 AGENTS.md）。
+更新日期：2026-10-30（P1、P2 已完成；P3 最小构建闭环含重试与日志脱敏；项目可见性与成员 P1–P3 已完成）。按依赖顺序推进，每项完成后更新勾选和验证结果。当前采用 React + Go/Gin 的模块化单体，真实浏览器鉴权、账号管理（P1）、项目注册表（P2 第一批）、最小构建闭环（P3 第一批）与项目可见性/成员读过滤及写权限叠加已打通；其余业务页面恒定显示未实现声明。所有变更走 PR 并由所有者 review（见 AGENTS.md）。
 
 ## 已完成
 
@@ -118,6 +118,8 @@ P3 构建操作审计验证记录（2026-10-26）：`go build ./...`、`go vet .
 
 P3 构建 SSE 验证记录（2026-10-26）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（httpapi 新增 2 组 SSE 用例：真实 httptest 服务器配置 200ms 写超时，仍能在延迟命令后收到输出与终态 done；负游标/非数字游标/未知构建/未鉴权分别 400/400/404/401）。前端 `npm run build`、`npm run lint`（0 错误、2 条既有警告）、`npm test`（14 例，含 SSE 分帧解析 3 例）通过；E2E 六组通过（重置 `aegis_e2e`），构建用例断言 `/events` 返回 200 与 `text/event-stream` 且日志经推送到达。
 
+P3 构建重试验证记录（2026-10-27）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿。新增用例：`internal/builds` 1 组（终态构建重试得到下一个构建号、沿用原分支；改命令后重试使用**当前**命令；运行中的构建重试 409；未知构建 404；审计写两条 `build.retry` 且 detail 含 `retry_of=`、不含命令）；`httpapi` 1 组（viewer 403、管理员 201 且 buildNumber=2、运行中 409、未知 404、未鉴权 401）+ OpenAPI 路由契约新增 1 条。前端 `npm run build`、`npm run lint`（0 错误、2 条既有警告）、`npm test`（14 例）通过；E2E 六组通过（重置 `aegis_e2e`），构建用例新增「终态详情页点击重试 → 跳到构建 #2 → 收敛成功 → 重试按钮仍在」。
+
 项目可见性与成员 P1 验证记录（2026-10-27）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17（5433）+ Redis 8.8 下 `go test -race ./... -count=1` 全绿。新增用例：`internal/projects` 2 组（可见性过滤：admin 全见、非成员只见 public、非成员 Get/Update 均 404、成员 viewer 读、切回 public 恢复；成员生命周期：创建者为 maintainer、添加/重复 409/账号不存在 404/非法角色 400/改角色/未知成员 404/创建者不可移除 400/移除后失去可见性/非成员列成员 404）；`internal/builds` 1 组（private 项目下 outsider 的 List 为空、Get/Logs/Trigger/Cancel 全 404，创建者与 admin 不受影响）；`httpapi` 1 组（私有项目对非成员四条路径全 404、成员列表、重复 409、未知账号 404、非法角色 400、成员可读、全局 viewer 仍 403 写、提升/移除成员、创建者不可移除、public 项目对所有角色行为不变）。OpenAPI 契约用例新增 4 条成员路由。前端未改动；E2E 六组在重置 `aegis_e2e` 后通过，验证 public 项目行为未变。
 
 构建输出脱敏验证记录（2026-10-27）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿（internal/builds 新增 15 个单元子用例覆盖 `AEGIS_*=`/`Bearer`/`postgres://`/`redis://`/GitHub token/AWS key/JWT/私钥头/同行多凭据/普通输出不误伤/短词不误伤，另加 1 组真实执行用例：命令打印三类伪凭据，日志中出现 `[redacted]`、原值全部不出现、并写入只含数量的 system 统计行；`valuesSurvive` 单独覆盖 fail-closed 判定）。E2E 六组通过（重置 `aegis_e2e`），确认既有构建用例行为不变。
@@ -125,6 +127,8 @@ P3 构建 SSE 验证记录（2026-10-26）：`go build ./...`、`go vet ./...`�
 项目写权限叠加 P2 验证记录（2026-10-27）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 下 `go test -race ./... -count=1` 全绿。新增用例：`internal/projects` 1 组（非成员写 404、viewer 成员更新与加成员均 403、全局 viewer 即使被加为 maintainer 仍 403、提升 maintainer 后可写、public 项目任意 member 可写、创建者仍不可移除、`project.member_add/update/remove` 三条审计齐全）；`internal/builds` 1 组（private 项目 viewer 成员触发/取消均 403，提升 maintainer 后触发成功）；`httpapi` 1 组（非成员 PATCH 404；viewer 成员在改项目、触发构建、加成员、改角色、移除成员五条路径全部 403 且 code=forbidden；提升后 PATCH 与触发均 200/201）。前端未改动；E2E 六组回归通过（public 项目行为不变）。
 
 项目可见性与成员 P3 验证记录（2026-10-27）：前端 `npm run build` 通过（模块数 99，产物体积 +336 B gzip 约 +1.7 kB），`npm run lint` 0 错误 2 条既有警告，`npm test` 14 例通过。新增 `tests/e2e/permissions.spec.ts`（第七组）：向导创建私有项目并断言列表徽章「私有」；成员页显示创建者自动为维护者；管理员从用户目录添加查看者；非成员新上下文深链 `/projects/{id}/members` 得到「未找到该项目」；查看者成员可进成员页但无「添加成员」控件，且直接调用触发构建接口返回 403；提设为维护者后同一账号能在项目行触发构建并跳到构建列表。`npm run test:e2e` 七组全过（重置 `aegis_e2e`，1.4m）。后端沿用 P1/P2 的 race 结果，本批只改前端与文档。
+
+项目写权限与成员前端 rebase 复验（2026-10-30）：把 2026-10-27 基于 #24 tip 的分支重放到当前 main（含 #24–#29）后，`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17（5433）+ Redis 8.8 下 `go test -race ./... -count=1` 全绿（cmd/server 17.6s、auth 52.6s、builds 6.6s、config 1.4s、httpapi 75.6s、projects 3.0s、ratelimit 4.7s、testutil 1.4s）。前端 `npm run build`、`npm run lint`（0 错误、2 条既有警告）、`npm test`（14 例）通过。重置 `aegis_e2e` 后 `npm run test:e2e` 七组通过（2.1m），第七组覆盖私有项目徽章、邀请查看者、非成员 404、查看者触发 403、提升 maintainer 后可触发。冲突处理：`builds_test.go` 同时保留重试与成员写权限测试；`httpapi/server.go` 合并 retry 的 409 文案与新增 403 分支；`openapi.yaml` 审计枚举取并集（`project.member_*` + `build.retry`）；`TODO.md`/`README.md`/`backend/README.md`/`docs/auth-contract.md` 逐行合并，补回 #27–#29 的重试、脱敏与沙箱说明。
 
 - [鉴权、部署与权限约定](docs/auth-contract.md)
 - [OpenAPI](backend/openapi.yaml)
