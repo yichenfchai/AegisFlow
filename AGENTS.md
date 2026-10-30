@@ -1,6 +1,6 @@
 # AegisFlow 项目约束
 
-适用于本项目的一切贡献者，**包括 AI 编码代理**。与 [TODO.md](TODO.md)、[鉴权契约](docs/auth-contract.md)、[后端文档](backend/README.md) 配套阅读；如有冲突，以本文与鉴权契约为准。
+适用于本项目的一切贡献者，**包括 AI 编码代理**。与 [鉴权契约](docs/auth-contract.md)、[后端文档](backend/README.md) 配套阅读；如有冲突，以本文与鉴权契约为准。
 
 ## 协作纪律（硬性）
 
@@ -27,7 +27,9 @@
 
 ## 文档同步（与代码同一 PR）
 
-接口或行为变更必须同步：`backend/openapi.yaml`（`openapi_test.go` 强制校验路由已写入契约）、`docs/auth-contract.md`、`backend/README.md`、根 `README.md` 与 `TODO.md`（勾选状态与验证记录）。
+接口或行为变更必须同步：`backend/openapi.yaml`（`openapi_test.go` 强制校验路由已写入契约）、`docs/auth-contract.md`、`backend/README.md` 与根 `README.md`。
+
+开发过程文档（`TODO.md`、`HANDOFF.md`、`docs/*-design.md`）只在本地维护、**不入库**（见 `.gitignore`），避免每次合并都在同一批文档上冲突；进度、阶段验收与验证记录写在 PR 正文里（协作纪律第 4 条）。
 
 ## 约束变更
 

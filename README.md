@@ -19,4 +19,4 @@
 
 构建：`npm run build`；规范检查：`npm run lint`；单元测试：`npm test`；浏览器测试：`npx playwright install chromium` 后运行 `npm run test:e2e`（需设置专用测试服务的 `AEGIS_E2E_DATABASE_URL`、`AEGIS_E2E_REDIS_URL`，并保持 5173 和 8080 端口空闲）。
 
-开发进度、优先级及各阶段验收标准见 [开发 TODO](TODO.md)。贡献流程与协作约束见 [项目约束](AGENTS.md)：所有变更走 PR，且每个 PR 需仓库所有者 review 后合并。
+开发进度、阶段验收与验证记录随 PR 维护（过程文档只在本地，不入库，见 [项目约束](AGENTS.md)）。贡献流程与协作约束见 [项目约束](AGENTS.md)：所有变更走 PR，且每个 PR 需仓库所有者 review 后合并。
