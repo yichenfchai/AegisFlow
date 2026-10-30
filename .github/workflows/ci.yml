@@ -48,6 +48,9 @@ jobs:
       # restart persistence) runs in the public schema of the same database.
       AEGIS_OPS_DATABASE_URL: postgres://test:test@localhost:5432/aegis_test?sslmode=disable
       AEGIS_OPS_REDIS_URL: redis://localhost:6379/2
+      # The runner has a Docker daemon. Forcing the flag makes the container
+      # sandbox test fail rather than skip when the runtime disappears.
+      AEGIS_TEST_DOCKER: "1"
       GIN_MODE: release
     defaults:
       run:
