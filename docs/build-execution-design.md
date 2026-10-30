@@ -1,7 +1,7 @@
 # 受控执行环境与仓库 clone 设计（P3 下一批）
 
-> 状态：**设计草案，待所有者评审**。本文定义边界、选项与验收标准。
-> 已落地：环境变量白名单、0700 构建目录、**输出脱敏（fail closed）**；④b（专用执行身份/容器 + 资源上限）与 ④c（clone）待所有者确认 D1-D6。
+> 状态：**④a、④b 已实现；④c 待开工**。本文定义边界、选项与验收标准。
+> 已落地：环境变量白名单、0700 构建目录、**输出脱敏（fail closed）**、**④b 容器执行器**（`AEGIS_BUILD_SANDBOX=container`，按 D1/D2/D4 建议实现：容器隔离、2 核/2 GiB/512 进程默认配额、启动探测 fail closed）。仍待 ④c（clone，迁移 v6）。
 > 关联：[TODO](../TODO.md) P3 第 3 项、[后端文档](../backend/README.md)「构建执行」、[鉴权契约](auth-contract.md)「构建执行边界」。
 
 ## 1. 现状与风险
@@ -103,11 +103,12 @@ worker 调用容器运行时（Docker/Podman）启动一次性容器：只挂载
 
 - 迁移 **v6**：`builds.repo_url TEXT NOT NULL DEFAULT ''`（触发时快照）。原计划写的是 v5，但 v5 已被项目可见性与成员表占用（[项目级成员权限设计](project-permissions-design.md) §5）；`internal/dbmigrate` 是共享的版本化账本，按落地顺序编号，④c 需追加 v6。
 - 配置新增：
-  - `AEGIS_BUILD_SANDBOX=container|user|none`（默认 `none` 用于开发，生产应设 `container`）。**已落地（仅 `none` 可用）**：`user`/`container` 在启动校验中被拒绝并说明“尚未实现”，`none` 启动打印警告；资源与 clone 开关待执行器落地后一起加，避免出现不被执行的配置项。
-  - `AEGIS_BUILD_CPU`、`AEGIS_BUILD_MEMORY`、`AEGIS_BUILD_PIDS`、`AEGIS_BUILD_DISK`（默认值见 §4；待执行器实现时加入）；
+  - `AEGIS_BUILD_SANDBOX=container|user|none`（默认 `none` 用于开发，生产应设 `container`）。**已落地**：`container` 与 `none` 可用，`user` 仍在启动校验中被拒绝；`none` 启动打印警告。
+  - `AEGIS_BUILD_IMAGE`（默认 `alpine:3.20`）、`AEGIS_BUILD_CPU`（默认 2）、`AEGIS_BUILD_MEMORY`（默认 `2g`）、`AEGIS_BUILD_PIDS`（默认 512）——**已落地**，仅在 `container` 模式生效。
+  - `AEGIS_BUILD_DISK`（默认 2 GiB）：容器临时层与目录配额尚未强制执行，留到 ④c 一并处理；
   - `AEGIS_BUILD_ALLOW_LOCAL_REPO=true|false`（默认 false；随 ④c 加入）；
   - `AEGIS_BUILD_CLONE=true|false`（默认 false，④c 灰度用）。
-- 启动校验：`AEGIS_BUILD_SANDBOX=container` 时检查容器运行时可用，否则拒绝启动（fail closed）；`none` 时启动日志明确警告。当前实现只做到后半条与「未实现模式拒绝启动」，容器探测等执行器落地时补。
+- 启动校验：**已落地**——`AEGIS_BUILD_SANDBOX=container` 时探测容器运行时（`docker version`），不可用即拒绝启动；`none` 时启动日志明确警告；`user` 拒绝启动。
 
 ## 8. 验收标准
 
@@ -125,13 +126,13 @@ worker 调用容器运行时（Docker/Podman）启动一次性容器：只挂载
 
 ## 10. 需要所有者拍板的决策
 
-| # | 决策 | 选项 | 建议 |
-| --- | --- | --- | --- |
-| D1 | 生产部署形态 | 单机二进制 / Docker Compose / 容器平台 | 若已有 Compose，选容器执行器 |
-| D2 | 执行隔离 | A 专用账号 / B 容器 / C OS 沙箱 | B；A 作为无容器降级 |
-| D3 | 是否本批支持私有仓库 clone | 否 / 用部署密钥 / 等 P4 密钥管理 | 本批否 |
-| D4 | 默认资源配额 | 2C/2G/512 进程/2G 磁盘 | 按上表，可配置 |
-| D5 | 本地路径仓库 | 默认禁用 / 允许（仅自托管） | 默认禁用 |
-| D6 | 日志脱敏失败策略 | 记录原文并告警 / 丢弃该行 | 丢弃并计数（fail closed） |
+| # | 决策 | 选项 | 建议 | 状态 |
+| --- | --- | --- | --- | --- |
+| D1 | 生产部署形态 | 单机二进制 / Docker Compose / 容器平台 | 若已有 Compose，选容器执行器 | 已按建议实现（2026-10-30） |
+| D2 | 执行隔离 | A 专用账号 / B 容器 / C OS 沙箱 | B；A 作为无容器降级 | B 已实现；A 未做 |
+| D3 | 是否本批支持私有仓库 clone | 否 / 用部署密钥 / 等 P4 密钥管理 | 本批否 | ④c 待办 |
+| D4 | 默认资源配额 | 2C/2G/512 进程/2G 磁盘 | 按上表，可配置 | CPU/内存/进程已实现；磁盘未强制 |
+| D5 | 本地路径仓库 | 默认禁用 / 允许（仅自托管） | 默认禁用 | ④c 待办 |
+| D6 | 日志脱敏失败策略 | 记录原文并告警 / 丢弃该行 | 丢弃并计数（fail closed） | 已实现 |
 
-> 上述决策确认后，④a 可立即开工；④b/④c 按 D2/D3 拆分独立 PR。在此之前，README 与鉴权契约中的「不要把不可信仓库命令接入」限制继续有效。
+> ④a/④b 已按建议落地；④c 仍按 D3/D5 拆分独立 PR，开工前需所有者确认私有仓库与本地路径策略。
