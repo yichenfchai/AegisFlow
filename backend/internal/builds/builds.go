@@ -89,6 +89,7 @@ type Service struct {
 	maxEvents  int
 	notify     chan struct{}
 	leaseRetry time.Duration
+	sandbox    Sandbox
 }
 
 // New uses the default execution timeout of ten minutes.

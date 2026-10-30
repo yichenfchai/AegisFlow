@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"runtime"
 	"sync"
 	"time"
 )
@@ -76,13 +74,13 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 	defer writer.close()
 	writer.systemf("build #%d started (branch=%q)", build.BuildNumber, build.Branch)
 
-	shell, flag := "sh", "-c"
-	if runtime.GOOS == "windows" {
-		shell, flag = "cmd", "/c"
+	containerName := "aegis-build-" + build.ID
+	cmd, err := s.sandbox.commandForBuild(execCtx, containerName, workDir, build.Command)
+	if err != nil {
+		writer.systemf("execution sandbox unavailable: %v", err)
+		s.finish(build, StatusFailed)
+		return
 	}
-	cmd := exec.CommandContext(execCtx, shell, flag, build.Command)
-	cmd.Dir = workDir
-	cmd.Env = buildCommandEnv(workDir)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		s.finish(build, StatusFailed)
@@ -134,6 +132,9 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 				current, err := s.getByID(context.Background(), build.ID)
 				if err != nil || current.Status != StatusRunning {
 					_ = cmd.Process.Kill()
+					// Killing the attached docker client does not stop the
+					// container, so remove it explicitly.
+					s.sandbox.stop(containerName)
 					closeStreams()
 					return
 				}
@@ -154,11 +155,13 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 
 	switch {
 	case execCtx.Err() == context.DeadlineExceeded:
+		s.sandbox.stop(containerName)
 		writer.systemf("build timed out after %s", s.timeout)
 		s.finish(build, StatusFailed)
 	case ctx.Err() != nil:
 		// Server shutdown killed the command; the record must not look
 		// healthy on the next boot.
+		s.sandbox.stop(containerName)
 		writer.systemf("interrupted by server shutdown")
 		s.finish(build, StatusInterrupted)
 	default:

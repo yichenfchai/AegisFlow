@@ -54,7 +54,7 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 - 日志与状态提供两条读取通道：`GET /builds/{id}/events` 的 SSE 推送（`status`/`logs`/`done` 帧，`Last-Event-ID` 或 `after` 续传，15s 心跳，终态后静默收尾，单连接上限 10 分钟）与保留的 `after` 游标轮询。SSE 必须携带 Bearer，因此前端用 fetch 流式读取而不是 `EventSource`，token 不放进 URL。
 - 构建不改变账号/权限数据；触发、取消与重试在状态变更的同一事务写入审计（detail 不含命令），日志读取沿用全局角色授权（admin/member 可写，viewer 只读），每次请求由服务端校验，不依赖前端隐藏按钮。
 - 日志脱敏已实现：写入 `build_log_events` 前，对 stdout/stderr 按既定模式（`AEGIS_*=...`、`Bearer ...`、带内联凭据的 `postgres://`/`redis://` URL、常见 token 前缀、JWT、私钥头）替换为 `[redacted]`，构建结束时追加一条 system 统计行（只记数量，不记原值）。命中却无法确认已移除的行整行丢弃并计数（fail closed，D6）。多行私钥正文与自由文本里的口令不在模式覆盖范围内。
-- 执行环境仍非完全受控：以服务进程身份执行，没有专用执行账号与 CPU/内存/进程数上限；构建命令只获得最小环境变量白名单（`PATH`/`HOME`/`TMPDIR`/`TMP`/`TEMP`/`LANG` 等，Windows 另加系统必需变量），不继承 `AEGIS_*` 服务凭据，`HOME` 与临时目录都指向 0700 的构建目录。不要把不可信仓库命令接入本批执行器。
+- 执行环境：`AEGIS_BUILD_SANDBOX=container`（生产推荐）时每个构建运行在一次性容器中——`--network none`、只读根文件系统、`--cap-drop ALL`、`no-new-privileges`，只有构建目录可写，CPU/内存/进程数由 `--cpus`/`--memory`/`--pids-limit` 硬限制；超时、取消或服务退出时会显式杀掉容器。`none`（默认，仅开发）仍以服务进程身份执行，没有专用执行账号与资源上限。两种模式都只注入最小环境变量白名单（不继承 `AEGIS_*` 服务凭据），`HOME` 与临时目录都指向 0700 的构建目录；`user` 模式尚未实现。构建仍不 clone 仓库，只执行项目配置的命令。
 
 ## 客户端会话生命周期
 

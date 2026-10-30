@@ -21,6 +21,9 @@ type Config struct {
 	AccessTTL, RefreshTTL, BuildTimeout                                                             time.Duration
 	CookieSecure                                                                                    bool
 	BuildSandbox                                                                                    BuildSandbox
+	BuildImage                                                                                      string
+	BuildCPU, BuildMemory                                                                           string
+	BuildPids                                                                                       int
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
@@ -126,19 +129,67 @@ func Load() (Config, error) {
 		}
 		c.AllowedOrigins = append(c.AllowedOrigins, origin)
 	}
-	// Build isolation switch. Only the unisolated mode exists today: accepting
-	// "user" or "container" while the executor still runs commands as the
-	// service account would be a false guarantee, so it fails closed until the
-	// controlled execution environment lands (docs/build-execution-design.md §7).
+	// Build isolation switch (docs/build-execution-design.md). "container" runs
+	// each build in a one-shot container; "none" keeps the developer path that
+	// runs commands as the service account. "user" is still unimplemented, so it
+	// fails closed rather than promising isolation that does not exist.
 	switch value := BuildSandbox(os.Getenv("AEGIS_BUILD_SANDBOX")); value {
 	case "", BuildSandboxNone:
 		c.BuildSandbox = BuildSandboxNone
-	case BuildSandboxUser, BuildSandboxContainer:
-		return c, fmt.Errorf("AEGIS_BUILD_SANDBOX=%s is not implemented yet: builds would still run as the service account; use none", value)
+	case BuildSandboxContainer:
+		c.BuildSandbox = BuildSandboxContainer
+		c.BuildImage = env("AEGIS_BUILD_IMAGE", "alpine:3.20")
+		if c.BuildImage != strings.TrimSpace(c.BuildImage) || c.BuildImage == "" || strings.ContainsAny(c.BuildImage, " \t\r\n") {
+			return c, errors.New("AEGIS_BUILD_IMAGE must be a non-empty container image reference without whitespace")
+		}
+		c.BuildCPU = env("AEGIS_BUILD_CPU", "2")
+		if !validCPU(c.BuildCPU) {
+			return c, errors.New("AEGIS_BUILD_CPU must be a number of cores greater than 0 and at most 64, e.g. 2 or 1.5")
+		}
+		c.BuildMemory = env("AEGIS_BUILD_MEMORY", "2g")
+		if !validMemory(c.BuildMemory) {
+			return c, errors.New("AEGIS_BUILD_MEMORY must be a Docker memory limit such as 512m or 2g")
+		}
+		c.BuildPids, poolErr = intInRange("AEGIS_BUILD_PIDS", "512", 16, 32768)
+		if poolErr != nil {
+			return c, poolErr
+		}
+	case BuildSandboxUser:
+		return c, errors.New("AEGIS_BUILD_SANDBOX=user is not implemented yet: builds would still run as the service account; use none or container")
 	default:
 		return c, fmt.Errorf("AEGIS_BUILD_SANDBOX must be none, user or container, got %q", value)
 	}
 	return c, nil
+}
+
+// validCPU accepts a positive decimal core count; Docker's --cpus takes the
+// same shape, so rejecting anything else here keeps a bad value from reaching
+// the runtime.
+func validCPU(value string) bool {
+	n, err := strconv.ParseFloat(value, 64)
+	return err == nil && n > 0 && n <= 64
+}
+
+// validMemory accepts Docker's byte-suffix form (m/g), which is what the
+// defaults and documentation use.
+func validMemory(value string) bool {
+	if len(value) < 2 {
+		return false
+	}
+	suffix := value[len(value)-1]
+	if suffix != 'm' && suffix != 'g' {
+		return false
+	}
+	n, err := strconv.Atoi(value[:len(value)-1])
+	return err == nil && n > 0
+}
+
+func intInRange(key, fallback string, min, max int) (int, error) {
+	n, err := strconv.Atoi(env(key, fallback))
+	if err != nil || n < min || n > max {
+		return 0, fmt.Errorf("%s must be between %d and %d", key, min, max)
+	}
+	return n, nil
 }
 func env(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {

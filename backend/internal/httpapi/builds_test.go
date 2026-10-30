@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -120,8 +121,18 @@ func TestBuildRoutesLifecycle(t *testing.T) {
 		t.Fatalf("bad project filter: %d", w.Code)
 	}
 
-	// Cancel flow on a long-running build.
-	if w = request(h, "PATCH", "/api/v1/projects/"+projectID, `{"buildCommand":"ping -n 30 127.0.0.1 >nul"}`, adminToken); w.Code != 200 {
+	// Cancel flow on a long-running build. Use a portable blocker: the old
+	// `ping -n 30` relied on Windows semantics and on the ping binary and its
+	// capabilities on Linux, which made this test fail on loaded runners.
+	longCommand := "sleep 30"
+	if runtime.GOOS == "windows" {
+		longCommand = `ping -n 31 127.0.0.1 >nul`
+	}
+	patchBody, err := json.Marshal(map[string]string{"buildCommand": longCommand})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w = request(h, "PATCH", "/api/v1/projects/"+projectID, string(patchBody), adminToken); w.Code != 200 {
 		t.Fatalf("set long command: %d %s", w.Code, w.Body.String())
 	}
 	longID := triggerBuild(t, h, adminToken, projectID, `{"branch":"feature/x"}`)

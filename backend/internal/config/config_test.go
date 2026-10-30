@@ -8,7 +8,7 @@ import (
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS"} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("AEGIS_JWT_SECRET", strings.Repeat("s", 32))
@@ -68,7 +68,7 @@ func TestBuildSandboxConfig(t *testing.T) {
 		{"", BuildSandboxNone, false},
 		{"none", BuildSandboxNone, false},
 		{"user", "", true},
-		{"container", "", true},
+		{"container", BuildSandboxContainer, false},
 		{"docker", "", true},
 		{"Container", "", true},
 	} {
@@ -79,10 +79,46 @@ func TestBuildSandboxConfig(t *testing.T) {
 			if (err != nil) != tc.invalid || (!tc.invalid && c.BuildSandbox != tc.want) {
 				t.Fatalf("sandbox=%q err=%v", c.BuildSandbox, err)
 			}
-			// An unimplemented mode must say so: silently accepting it would
-			// promise isolation the executor does not provide.
-			if tc.invalid && tc.value == "container" && !strings.Contains(err.Error(), "not implemented") {
+			// The unimplemented fallback must say so: silently accepting it
+			// would promise isolation the executor does not provide.
+			if tc.invalid && tc.value == "user" && !strings.Contains(err.Error(), "not implemented") {
 				t.Fatalf("error should explain that the mode is not implemented: %v", err)
+			}
+			if tc.want == BuildSandboxContainer {
+				if c.BuildImage != "alpine:3.20" || c.BuildCPU != "2" || c.BuildMemory != "2g" || c.BuildPids != 512 {
+					t.Fatalf("container defaults = image %q cpu %q memory %q pids %d", c.BuildImage, c.BuildCPU, c.BuildMemory, c.BuildPids)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildContainerLimitConfig(t *testing.T) {
+	for _, tc := range []struct {
+		key, value string
+		invalid    bool
+	}{
+		{"AEGIS_BUILD_CPU", "1.5", false},
+		{"AEGIS_BUILD_CPU", "0", true},
+		{"AEGIS_BUILD_CPU", "65", true},
+		{"AEGIS_BUILD_CPU", "two", true},
+		{"AEGIS_BUILD_MEMORY", "512m", false},
+		{"AEGIS_BUILD_MEMORY", "3g", false},
+		{"AEGIS_BUILD_MEMORY", "0g", true},
+		{"AEGIS_BUILD_MEMORY", "2gb", true},
+		{"AEGIS_BUILD_MEMORY", "2048", true},
+		{"AEGIS_BUILD_PIDS", "1024", false},
+		{"AEGIS_BUILD_PIDS", "8", true},
+		{"AEGIS_BUILD_PIDS", "40000", true},
+		{"AEGIS_BUILD_IMAGE", "alpine:3.20", false},
+		{"AEGIS_BUILD_IMAGE", " alpine:3.20", true},
+	} {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_BUILD_SANDBOX", "container")
+			t.Setenv(tc.key, tc.value)
+			if _, err := Load(); (err != nil) != tc.invalid {
+				t.Fatalf("err=%v invalid=%v", err, tc.invalid)
 			}
 		})
 	}

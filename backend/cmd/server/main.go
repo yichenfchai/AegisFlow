@@ -38,6 +38,18 @@ func run(logger *slog.Logger) error {
 		// Not an error: the controlled execution environment is not built yet.
 		// The warning keeps an operator from assuming isolation that does not exist.
 		logger.Warn("build commands run as the service account without isolation", "sandbox", string(cfg.BuildSandbox))
+	} else {
+		// Fail closed: an operator selecting the container sandbox must not get
+		// a server that silently falls back to the service account.
+		probeCtx, cancelProbe := context.WithTimeout(context.Background(), 15*time.Second)
+		err = builds.ProbeContainerRuntime(probeCtx)
+		cancelProbe()
+		if err != nil {
+			return err
+		}
+		logger.Info("build commands run in a one-shot container",
+			"sandbox", string(cfg.BuildSandbox), "image", cfg.BuildImage,
+			"cpus", cfg.BuildCPU, "memory", cfg.BuildMemory, "pids", cfg.BuildPids)
 	}
 	db, err := sql.Open("pgx", cfg.DatabaseURL)
 	if err != nil {
@@ -82,7 +94,13 @@ func run(logger *slog.Logger) error {
 		}
 	}
 	registry := projects.New(db)
-	pipeline := builds.New(db, registry)
+	pipeline := builds.New(db, registry).WithSandbox(builds.Sandbox{
+		Mode:   builds.SandboxMode(cfg.BuildSandbox),
+		Image:  cfg.BuildImage,
+		CPU:    cfg.BuildCPU,
+		Memory: cfg.BuildMemory,
+		Pids:   cfg.BuildPids,
+	})
 	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -1,6 +1,6 @@
 # AegisFlow 开发 TODO
 
-更新日期：2026-10-30（P1、P2 已完成；P3 最小构建闭环含重试与日志脱敏；项目可见性与成员 P1–P3 已完成）。按依赖顺序推进，每项完成后更新勾选和验证结果。当前采用 React + Go/Gin 的模块化单体，真实浏览器鉴权、账号管理（P1）、项目注册表（P2 第一批）、最小构建闭环（P3 第一批）与项目可见性/成员读过滤及写权限叠加已打通；其余业务页面恒定显示未实现声明。所有变更走 PR 并由所有者 review（见 AGENTS.md）。
+更新日期：2026-10-30（P1、P2 已完成；P3 最小构建闭环含重试、日志脱敏与容器沙箱；项目可见性与成员 P1–P3 已完成）。按依赖顺序推进，每项完成后更新勾选和验证结果。当前采用 React + Go/Gin 的模块化单体，真实浏览器鉴权、账号管理（P1）、项目注册表（P2 第一批）、最小构建闭环（P3 第一批）与项目可见性/成员读过滤及写权限叠加已打通；其余业务页面恒定显示未实现声明。所有变更走 PR 并由所有者 review（见 AGENTS.md）。
 
 ## 已完成
 
@@ -73,8 +73,8 @@
 ## P3：最小构建闭环
 
 - [x] 定义构建任务状态机：排队、执行、成功、失败、取消；明确合法转换及重启恢复规则。（六态含 `interrupted`：由持有 worker 租约的副本在启动时把遗留 `running` 统一转为中断；租约为 PostgreSQL 会话级 advisory lock，保证同一部署只有一个副本执行与恢复。）
-- [ ] 设计任务、阶段、日志及产物数据模型，实现触发、详情、列表、取消和重试接口。（第一批已落地 builds / build_log_events 模型与触发、详情、列表、取消、游标日志接口；阶段、产物与重试未做。）
-- [ ] 建立受控执行环境：工作目录、执行身份、超时、取消传播、资源上限及敏感信息脱敏；隔离不可信仓库代码。（已实现：临时工作目录、超时/取消传播、0700 目录、环境变量白名单（不继承 `AEGIS_*`）。仍待做：专用执行身份、CPU/内存/进程数上限、输出脱敏、仓库 clone 与隔离；设计见 [受控执行环境与 clone 设计](docs/build-execution-design.md)，待所有者确认 D1-D6 后按 ④a/④b/④c 拆 PR。勿把不可信仓库命令接入。）
+- [ ] 设计任务、阶段、日志及产物数据模型，实现触发、详情、列表、取消和重试接口。（第一批已落地 builds / build_log_events 模型与触发、详情、列表、取消、重试、游标日志接口；阶段与产物未做。）
+- [ ] 建立受控执行环境：工作目录、执行身份、超时、取消传播、资源上限及敏感信息脱敏；隔离不可信仓库代码。（已实现：临时工作目录、超时/取消传播、0700 目录、环境变量白名单（不继承 `AEGIS_*`）、输出脱敏（fail closed，只记替换数量）、`AEGIS_BUILD_SANDBOX=container` 容器执行器（无网络、只读根文件系统、cap-drop、CPU/内存/进程数硬上限、超时/取消杀容器、启动探测 fail closed）。仍待做：④c 仓库 clone 与 repoUrl 快照、`user` 降级模式、磁盘配额；设计见 [受控执行环境与 clone 设计](docs/build-execution-design.md)。）
 - [x] 实现最小任务调度与 worker，限制并发；根据实际需求决定是否引入外部队列。（进程内单并发 worker，PostgreSQL 会话锁保证多副本单 worker，`FOR UPDATE SKIP LOCKED` 领取兜底；暂不引入外部队列，也不做多 worker 并行吞吐。）
 - [x] 实现 SSE 日志与状态推送，支持断线恢复、事件序号及权限校验。（`GET /builds/{id}/events`：status/logs/done 帧、事件 id 即续传序号、`Last-Event-ID`/`after` 断点续传、心跳与终态收尾、沿用 Bearer + 全局角色校验；前端失败自动回退轮询。）
 - [x] 接入构建列表和详情，验证一次真实构建从触发到结束，以及失败、取消和服务重启场景。（前端真实列表/详情/取消；E2E 覆盖触发→成功→日志；失败、超时、取消、重启中断由 internal/builds 集成测试覆盖。）
@@ -129,6 +129,8 @@ P3 构建重试验证记录（2026-10-27）：`go build ./...`、`go vet ./...`�
 项目可见性与成员 P3 验证记录（2026-10-27）：前端 `npm run build` 通过（模块数 99，产物体积 +336 B gzip 约 +1.7 kB），`npm run lint` 0 错误 2 条既有警告，`npm test` 14 例通过。新增 `tests/e2e/permissions.spec.ts`（第七组）：向导创建私有项目并断言列表徽章「私有」；成员页显示创建者自动为维护者；管理员从用户目录添加查看者；非成员新上下文深链 `/projects/{id}/members` 得到「未找到该项目」；查看者成员可进成员页但无「添加成员」控件，且直接调用触发构建接口返回 403；提设为维护者后同一账号能在项目行触发构建并跳到构建列表。`npm run test:e2e` 七组全过（重置 `aegis_e2e`，1.4m）。后端沿用 P1/P2 的 race 结果，本批只改前端与文档。
 
 项目写权限与成员前端 rebase 复验（2026-10-30）：把 2026-10-27 基于 #24 tip 的分支重放到当前 main（含 #24–#29）后，`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17（5433）+ Redis 8.8 下 `go test -race ./... -count=1` 全绿（cmd/server 17.6s、auth 52.6s、builds 6.6s、config 1.4s、httpapi 75.6s、projects 3.0s、ratelimit 4.7s、testutil 1.4s）。前端 `npm run build`、`npm run lint`（0 错误、2 条既有警告）、`npm test`（14 例）通过。重置 `aegis_e2e` 后 `npm run test:e2e` 七组通过（2.1m），第七组覆盖私有项目徽章、邀请查看者、非成员 404、查看者触发 403、提升 maintainer 后可触发。冲突处理：`builds_test.go` 同时保留重试与成员写权限测试；`httpapi/server.go` 合并 retry 的 409 文案与新增 403 分支；`openapi.yaml` 审计枚举取并集（`project.member_*` + `build.retry`）；`TODO.md`/`README.md`/`backend/README.md`/`docs/auth-contract.md` 逐行合并，补回 #27–#29 的重试、脱敏与沙箱说明。
+
+容器构建沙箱（④b）验证记录（2026-10-30）：`go build ./...`、`go vet ./...`、gofmt（LF 规范化副本）通过；真实 PostgreSQL 17 + Redis 8.8 + Docker 29.9.2（Linux 引擎）下 `go test -race ./... -count=1` 全绿（cmd/server 19.3s、auth 78.6s、builds 27.9s、config 1.4s、httpapi 106.6s、projects 3.0s、ratelimit 4.7s、testutil 1.4s）。新增用例：config（container 默认值与非法 CPU/内存/进程数/镜像）；cmd/server 进程级（`user` 仍拒绝启动、`container` 无运行时拒绝启动）；internal/builds（命令参数含 `--network none`/`--read-only`/cap-drop/配额且 docker CLI 环境不含 `AEGIS_*`、缺配额报错、真实容器构建成功且根文件系统只读、`env` 输出无服务凭据、超时后容器被清理）。前端 `npm run build`、`npm run lint`（0 错误、2 条既有警告）、`npm test`（14 例）通过；重置 `aegis_e2e` 后 `npm run test:e2e` 七组通过（backend 默认 none，行为不变）。CI backend 增加 `AEGIS_TEST_DOCKER=1`：运行时缺失时容器测试失败而不是跳过。
 
 - [鉴权、部署与权限约定](docs/auth-contract.md)
 - [OpenAPI](backend/openapi.yaml)

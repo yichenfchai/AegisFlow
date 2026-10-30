@@ -336,7 +336,7 @@ func TestUnsupportedBuildSandboxFailsClosed(t *testing.T) {
 	bin := buildServer(t)
 	cmd := exec.Command(bin)
 	cmd.Env = envWith(map[string]string{
-		"AEGIS_BUILD_SANDBOX": "container",
+		"AEGIS_BUILD_SANDBOX": "user",
 		"AEGIS_DATABASE_URL":  "postgres://user:pass@127.0.0.1:1/aegis?sslmode=disable",
 		"AEGIS_REDIS_URL":     "redis://127.0.0.1:1/0",
 		"AEGIS_JWT_SECRET":    strings.Repeat("s", 32),
@@ -349,5 +349,30 @@ func TestUnsupportedBuildSandboxFailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "AEGIS_BUILD_SANDBOX") {
 		t.Fatalf("startup output does not name the switch: %s", output.String())
+	}
+}
+
+// TestContainerSandboxRequiresRuntime proves the container mode fails closed
+// when no usable runtime is reachable, instead of silently running commands as
+// the service account.
+func TestContainerSandboxRequiresRuntime(t *testing.T) {
+	bin := buildServer(t)
+	cmd := exec.Command(bin)
+	cmd.Env = envWith(map[string]string{
+		"AEGIS_BUILD_SANDBOX": "container",
+		"AEGIS_DATABASE_URL":  "postgres://user:pass@127.0.0.1:1/aegis?sslmode=disable",
+		"AEGIS_REDIS_URL":     "redis://127.0.0.1:1/0",
+		"AEGIS_JWT_SECRET":    strings.Repeat("s", 32),
+		// An empty PATH hides docker from the startup probe.
+		"PATH": "",
+	})
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err == nil {
+		t.Fatal("server started with container sandbox and no runtime")
+	}
+	if !strings.Contains(output.String(), "docker") {
+		t.Fatalf("startup output does not explain the missing runtime: %s", output.String())
 	}
 }
