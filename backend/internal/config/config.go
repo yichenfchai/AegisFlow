@@ -27,8 +27,9 @@ type Config struct {
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
-// docs/build-execution-design.md: "none" runs commands as the service account,
-// "user" a dedicated OS account and "container" a one-shot container per build.
+// the build execution design (maintained locally, not committed): "none" runs
+// commands as the service account, "user" a dedicated OS account and
+// "container" a one-shot container per build.
 type BuildSandbox string
 
 const (
@@ -129,7 +130,7 @@ func Load() (Config, error) {
 		}
 		c.AllowedOrigins = append(c.AllowedOrigins, origin)
 	}
-	// Build isolation switch (docs/build-execution-design.md). "container" runs
+	// Build isolation switch (build execution design, local-only). "container" runs
 	// each build in a one-shot container; "none" keeps the developer path that
 	// runs commands as the service account. "user" is still unimplemented, so it
 	// fails closed rather than promising isolation that does not exist.
