@@ -142,6 +142,7 @@ CREATE INDEX project_members_user_idx ON project_members(user_id, project_id);
 - 与本文原稿的两处差异：
   1. `project_members.user_id` **不加外键**，沿用 `created_by` 与审计 actor 的「快照」建模（账号只禁用、不删除）；目标账号是否存在由服务层校验并在缺失时返回 404。
   2. 写权限叠加按计划留在 P2，因此 P1 阶段 private 项目的项目级 viewer 仍按全局角色写入。这是分批交付的**已知中间态**（相对变更前没有放松：原本任何 member 都能改任何项目），P2 立即收口。
-- **P2（待做）**：把写权限叠加到成员 maintainer、`project.member_*` 审计行、OpenAPI 审计枚举。
-- **P3（待做）**：前端可见性徽章与成员管理页、E2E。
-- 决策：P1 按 §9 的建议默认值实现（D1 public、D2 maintainer/viewer、D4 404、D5 保留成员行、D6 仅项目+构建）；D3 的成员管理权在 P2 生效。若所有者在 review 中改变任一决策，改动范围限于可见性谓词与成员读写入口。
+- **P2（已实现）**：写权限叠加到成员 maintainer——`projects.AuthorizeWrite` 是唯一判定（全局角色是上限 + private 项目需要 maintainer），项目修改/归档、触发/取消/重试构建、成员增删改复用同一条规则，构建在自己的事务里传入同一个 `*sql.Tx`；成员变更写 `project.member_add` / `project.member_update` / `project.member_remove` 审计（objectType project，与状态同事务），OpenAPI 审计枚举同步。不可见仍是 404，可见但无权是 403。
+- 与本文原稿的一处差异：public 项目的成员管理仍允许任意 admin/member（P1 行为）。§3.2 矩阵写作「member 允许（仅成员列表）」，若按后者收紧，只需在 `AuthorizeWrite` 增加一个 public 分支判定，其余不变。
+- **P3（已实现）**：项目列表显示公开/私有徽章与「成员」入口；创建向导可选可见性（默认公开）；新增 `/projects/:id/members` 成员管理页（列表、添加、改角色、移除），管理员用用户下拉选择，非管理员 maintainer 通过用户 ID 添加（他们没有全站用户列表权限，这是已知的可用性缺口）；构建列表仍由后端过滤，前端无需额外逻辑。E2E 新增第七组：私有项目徽章、创建者自动维护者、非成员深链得到「未找到」、查看者成员无管理控件且触发构建被服务端 403、提升维护者后可触发。
+- 决策：P1/P2/P3 按 §9 的建议默认值实现（D1 public、D2 maintainer/viewer、D3 admin+maintainer、D4 404、D5 保留成员行、D6 仅项目+构建）。若所有者在 review 中改变任一决策，改动范围限于可见性谓词、`AuthorizeWrite` 与成员读写入口。

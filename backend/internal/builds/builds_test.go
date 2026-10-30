@@ -15,7 +15,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
-var testActor = auth.Actor{ID: "actor-000000000000001", Username: "tester", RequestID: "req-builds"}
+var testActor = auth.Actor{ID: "actor-000000000000001", Username: "tester", Role: "member", RequestID: "req-builds"}
 
 func testService(t *testing.T) (*Service, *projects.Service) {
 	t.Helper()
@@ -65,9 +65,16 @@ func createProject(t *testing.T, registry *projects.Service, name, command strin
 
 func waitForStatus(t *testing.T, s *Service, id string, want ...string) *Build {
 	t.Helper()
+	return waitForStatusAs(t, s, testActor, id, want...)
+}
+
+// waitForStatusAs polls with the given actor: a private project's build is only
+// readable by someone who can see that project.
+func waitForStatusAs(t *testing.T, s *Service, actor auth.Actor, id string, want ...string) *Build {
+	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		build, err := s.Get(context.Background(), testActor, id)
+		build, err := s.Get(context.Background(), actor, id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -455,5 +462,55 @@ func TestRetryEnqueuesANewBuild(t *testing.T) {
 	}
 	if _, err = s.Retry(ctx, outsiderActor, build.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("outsider retry error = %v", err)
+	}
+}
+
+func TestBuildWritesNeedMaintainerOnPrivateProject(t *testing.T) {
+	s, registry := testService(t)
+	startWorker(t, s)
+	ctx := context.Background()
+	private, err := registry.Create(ctx, adminActor, projects.Input{Name: "private-build-writes", BuildCommand: "echo ok", Visibility: projects.VisibilityPrivate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Membership references a real account; builds tests create no users.
+	if _, err = s.db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role)
+	 VALUES($1,$2,'unused',$2,'member')`, outsiderActor.ID, outsiderActor.Username); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = registry.AddMember(ctx, adminActor, private.ID, outsiderActor.ID, projects.RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	// A viewer member sees the project but cannot start work on it.
+	if _, err = s.Trigger(ctx, outsiderActor, private.ID, ""); !errors.Is(err, projects.ErrForbidden) {
+		t.Fatalf("viewer trigger error = %v", err)
+	}
+	if _, err = registry.UpdateMemberRole(ctx, adminActor, private.ID, outsiderActor.ID, projects.RoleMaintainer); err != nil {
+		t.Fatal(err)
+	}
+	build, err := s.Trigger(ctx, outsiderActor, private.ID, "")
+	if err != nil {
+		t.Fatalf("maintainer trigger error = %v", err)
+	}
+	waitForStatusAs(t, s, adminActor, build.ID, StatusSucceeded)
+
+	// Cancelling follows the same overlay.
+	long := sleepCommand(30)
+	if _, err = registry.Update(ctx, adminActor, private.ID, projects.Patch{BuildCommand: &long}); err != nil {
+		t.Fatal(err)
+	}
+	running, err := s.Trigger(ctx, adminActor, private.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatusAs(t, s, adminActor, running.ID, StatusRunning)
+	if _, err = registry.UpdateMemberRole(ctx, adminActor, private.ID, outsiderActor.ID, projects.RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Cancel(ctx, outsiderActor, running.ID); !errors.Is(err, projects.ErrForbidden) {
+		t.Fatalf("viewer cancel error = %v", err)
+	}
+	if _, err = s.Cancel(ctx, adminActor, running.ID); err != nil {
+		t.Fatal(err)
 	}
 }

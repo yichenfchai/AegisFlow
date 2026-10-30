@@ -90,13 +90,15 @@ server: {
 
 **所有 auth POST（包括 login）强制恰好一个 Origin，且精确匹配允许列表**；缺失、不匹配、`null` 或跨站请求返回 `403 origin_denied`，在登录、轮换和退出之前拦截。非浏览器 curl/脚本也必须带该 Origin。其他请求如果携带 Origin 也须符合允许列表。全局拒绝 `Sec-Fetch-Site: cross-site`。允许来源响应包含 `Access-Control-Allow-Origin: <原始允许源>`、`Access-Control-Allow-Credentials: true`，`Vary: Origin, Sec-Fetch-Site`；OPTIONS 额外 Vary 请求方法与请求头，允许 GET/POST/OPTIONS 和 Authorization/Content-Type。
 
-### 项目可见性与成员（P1）
+### 项目可见性与成员（P1 + P2）
 
 - `projects.visibility` 为 `public`（默认）或 `private`。全局 admin 永远可见；其他角色可见 public 项目，以及自己创建或被加入的项目（`project_members`）。
 - 可见性在服务端逐请求解析：项目列表、项目详情、构建列表/详情/日志/SSE、成员列表、触发构建与改项目都带同一条可见性谓词。**不可见一律 404**（而非 403），避免用私有 id 枚举项目。
-- 成员角色 `maintainer`/`viewer` 目前只决定可见性；写操作仍由全局角色决定（admin/member 可写）。把写权限叠加到成员角色属于下一批（P2），届时 private 项目的项目级 viewer 将只读。
+- **写权限叠加（P2）**：全局角色是上限（viewer 永不可写、admin 永远可写）；private 项目另外要求调用者是该项目 `maintainer`，否则 **403**（可见但无权）。public 项目保持「任意 member 可写」。判定集中在 `projects.AuthorizeWrite`，项目修改、归档、触发/取消/重试构建、成员增删改都复用它；构建侧在自己的事务里传入同一个 `*sql.Tx`。
+- 成员变更与状态同事务写审计：`project.member_add` / `project.member_update` / `project.member_remove`（objectType `project`，detail 只写用户名与角色）。
 - 创建者在同一事务内写入 maintainer 成员行，语义上是 owner：不能被移除（400）。成员目标是真实账号（不存在 404），重复添加 409。
 - 迁移 v5 为存量项目补写创建者的 maintainer 行，并把 `visibility` 默认为 `public`，因此升级后行为不变。
+- 已知的决策待确认点：public 项目的成员管理目前允许任意 admin/member（P1 行为），设计稿矩阵写作「member 仅成员列表」；若按后者收紧，只需调整 `AuthorizeWrite` 的一个分支。
 
 ### 构建执行（P3 第一批）
 
@@ -162,7 +164,7 @@ User 字段为 `id/username/displayName/role/disabled/createdAt`，无密码或�
 - SQLite 开发库不会自动导入 PostgreSQL。现阶段开发数据可重新初始化；如有需要保留的用户，必须先备份并单独编写审核过的离线迁移，保留 bcrypt 哈希、校验用户名大小写唯一性并撤销旧会话，不能直接复制文件或将 SQLite 挂共享盘。
 - /readyz 同时检查 PostgreSQL 和 Redis；Redis 故障使就绪返回 503，登录也 503。已存在 Bearer 会话在 PostgreSQL 正常时仍可鉴权；负载均衡是否摘除整个实例取决于运维策略。
 - 请求 ID、slog JSON 访问日志、鉴权操作日志、panic 恢复、安全响应头、HTTP 超时、信号触发优雅退出；日志不记录密码、Cookie、令牌、正文。
-- 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）。构建审计与状态变更在同一事务提交；幂等重复取消不重复记账，detail 只写项目与构建号（重试额外写 `retry_of=<原构建号>`），不写命令。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），保留策略待业务审计里程碑设计。
+- 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）。构建与成员审计都和状态变更在同一事务提交；幂等重复取消不重复记账，detail 只写项目/成员与构建号或角色（重试额外写 `retry_of=<原构建号>`），不写命令。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），保留策略待业务审计里程碑设计。
 - 过期会话与 refresh 历史由后台任务每小时清理（启动时先执行一次）：删除超过绝对期限的会话及其全部 refresh 令牌记录。重放检测只需保留到会话有效期，这与文档化的保留边界一致。
 
 ## 验证

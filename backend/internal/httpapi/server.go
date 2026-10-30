@@ -397,6 +397,8 @@ func (s *Server) projectError(c *gin.Context, err error) {
 		s.fail(c, 400, "validation_failed", "name 3-64 bytes without path or meta characters; repoUrl https://, git@, file:/// URL or absolute path; defaultBranch a plain git ref")
 	case errors.Is(err, projects.ErrConflict):
 		s.fail(c, 409, "conflict", "project name already exists or the project is archived")
+	case errors.Is(err, projects.ErrForbidden):
+		s.fail(c, 403, "forbidden", "only a project maintainer can modify a private project")
 	case errors.Is(err, projects.ErrNotFound):
 		s.fail(c, 404, "not_found", "resource not found")
 	default:
@@ -498,6 +500,8 @@ func (s *Server) memberError(c *gin.Context, err error) {
 		s.fail(c, 400, "validation_failed", "role must be maintainer or viewer; the project creator cannot be removed; ids must be valid")
 	case errors.Is(err, projects.ErrConflict):
 		s.fail(c, 409, "conflict", "user is already a member of this project")
+	case errors.Is(err, projects.ErrForbidden):
+		s.fail(c, 403, "forbidden", "only a project maintainer can manage members of a private project")
 	case errors.Is(err, projects.ErrNotFound):
 		s.fail(c, 404, "not_found", "resource not found")
 	default:
@@ -582,6 +586,8 @@ func (s *Server) buildError(c *gin.Context, err error) {
 		s.fail(c, 400, "validation_failed", "project has no build command configured, or invalid ids or branch")
 	case errors.Is(err, builds.ErrConflict):
 		s.fail(c, 409, "conflict", "archived project cannot start builds, only queued or running builds can be cancelled, and only terminal builds can be retried")
+	case errors.Is(err, projects.ErrForbidden):
+		s.fail(c, 403, "forbidden", "only a project maintainer can start or cancel builds of a private project")
 	case errors.Is(err, builds.ErrNotFound):
 		s.fail(c, 404, "not_found", "resource not found")
 	default:

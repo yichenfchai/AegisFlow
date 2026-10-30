@@ -128,3 +128,59 @@ func TestProjectVisibilityAndMemberRoutes(t *testing.T) {
 		}
 	}
 }
+
+// TestPrivateProjectWriteOverlay covers the maintainer overlay over HTTP: an
+// invisible project is still 404, a viewer member is 403 on every write, and a
+// maintainer gets through.
+func TestPrivateProjectWriteOverlay(t *testing.T) {
+	h, _ := testServer(t)
+	adminToken, _, _ := loginHTTP(t, h, "admin", "a-strong-password")
+	memberID := createUserHTTP(t, h, adminToken, "overlay-member", "member-password-01", "member")
+	_ = createUserHTTP(t, h, adminToken, "overlay-outsider", "outsider-password-1", "member")
+	memberToken, _, _ := loginHTTP(t, h, "overlay-member", "member-password-01")
+	outsiderToken, _, _ := loginHTTP(t, h, "overlay-outsider", "outsider-password-1")
+
+	w := request(h, "POST", "/api/v1/projects", `{"name":"overlay-lab","visibility":"private","buildCommand":"echo overlay"}`, adminToken)
+	if w.Code != 201 {
+		t.Fatalf("create private project: %d %s", w.Code, w.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil || created.Data.ID == "" {
+		t.Fatalf("created payload: %s", w.Body.String())
+	}
+	base := "/api/v1/projects/" + created.Data.ID
+
+	// A non-member cannot tell the project exists: writes answer 404, not 403.
+	if w = request(h, "PATCH", base, `{"description":"nope"}`, outsiderToken); w.Code != 404 || errorCode(t, w) != "not_found" {
+		t.Fatalf("outsider write: %d %s", w.Code, w.Body.String())
+	}
+	// A viewer member sees the project but is forbidden on every write path.
+	if w = request(h, "POST", base+"/members", `{"userId":"`+memberID+`","role":"viewer"}`, adminToken); w.Code != 201 {
+		t.Fatalf("add viewer: %d %s", w.Code, w.Body.String())
+	}
+	for _, route := range []struct{ method, path, body string }{
+		{"PATCH", base, `{"description":"viewer-write"}`},
+		{"POST", base + "/builds", `{}`},
+		{"POST", base + "/members", `{"userId":"` + memberID + `","role":"viewer"}`},
+		{"PATCH", base + "/members/" + memberID, `{"role":"maintainer"}`},
+		{"DELETE", base + "/members/" + memberID, ""},
+	} {
+		if w = request(h, route.method, route.path, route.body, memberToken); w.Code != 403 || errorCode(t, w) != "forbidden" {
+			t.Fatalf("viewer %s %s: %d %s", route.method, route.path, w.Code, w.Body.String())
+		}
+	}
+	// Promotion to maintainer unlocks the same paths.
+	if w = request(h, "PATCH", base+"/members/"+memberID, `{"role":"maintainer"}`, adminToken); w.Code != 200 {
+		t.Fatalf("promote: %d %s", w.Code, w.Body.String())
+	}
+	if w = request(h, "PATCH", base, `{"description":"maintainer-write"}`, memberToken); w.Code != 200 {
+		t.Fatalf("maintainer patch: %d %s", w.Code, w.Body.String())
+	}
+	if w = request(h, "POST", base+"/builds", `{}`, memberToken); w.Code != 201 {
+		t.Fatalf("maintainer trigger: %d %s", w.Code, w.Body.String())
+	}
+}

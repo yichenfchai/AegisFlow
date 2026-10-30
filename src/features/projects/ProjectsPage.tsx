@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Button, ConfirmDialog, DataTable, PageHeader, Pagination, type Column } from '@/components/ui/DataTable'
 import { StatusBadge } from '@/components/ui/Badge'
-import { projectsAPI, type Project } from '@/api/projects'
+import { projectsAPI, PROJECT_VISIBILITY_TEXT, type Project } from '@/api/projects'
 import { buildsAPI } from '@/api/builds'
 import { useSession } from '@/stores/session'
 import { ApiError } from '@/api/http'
@@ -90,6 +90,16 @@ export function ProjectsPage() {
     },
     { key: 'defaultBranch', header: '默认分支', render: (p) => <span className="font-mono text-label-md">{p.defaultBranch || '—'}</span> },
     {
+      key: 'visibility',
+      header: '可见性',
+      render: (p) =>
+        p.visibility === 'private' ? (
+          <StatusBadge tone="warning">{PROJECT_VISIBILITY_TEXT.private}</StatusBadge>
+        ) : (
+          <StatusBadge tone="neutral">{PROJECT_VISIBILITY_TEXT.public}</StatusBadge>
+        ),
+    },
+    {
       key: 'status',
       header: '状态',
       render: (p) => (p.status === 'active' ? <StatusBadge tone="success">活跃</StatusBadge> : <StatusBadge tone="pending">已归档</StatusBadge>),
@@ -101,6 +111,9 @@ export function ProjectsPage() {
       align: 'right',
       render: (p) => (
         <div className="flex items-center justify-end gap-space-sm">
+          <Link to={`/projects/${p.id}/members`} className="text-label-sm text-primary hover:underline">
+            成员
+          </Link>
           {canEdit &&
             (p.buildCommand ? (
               <Button

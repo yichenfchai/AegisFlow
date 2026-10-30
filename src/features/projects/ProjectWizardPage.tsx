@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { useQueryClient } from '@tanstack/react-query'
 import { Button, Field, Input, PageHeader, Select } from '@/components/ui/DataTable'
-import { projectsAPI } from '@/api/projects'
+import { projectsAPI, type ProjectVisibility } from '@/api/projects'
 import { ApiError } from '@/api/http'
 
 function byteLength(value: string): number {
@@ -27,6 +27,7 @@ export function ProjectWizardPage() {
   const [repoUrl, setRepoUrl] = useState('')
   const [defaultBranch, setDefaultBranch] = useState('main')
   const [buildCommand, setBuildCommand] = useState('')
+  const [visibility, setVisibility] = useState<ProjectVisibility>('public')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -54,6 +55,7 @@ export function ProjectWizardPage() {
         repoUrl: repoUrl.trim() || undefined,
         defaultBranch: defaultBranch.trim() || undefined,
         buildCommand: buildCommand.trim() || undefined,
+        visibility,
       })
       await queryClient.invalidateQueries({ queryKey: ['projects'] })
       nav('/', { replace: true })
@@ -82,6 +84,21 @@ export function ProjectWizardPage() {
             <option value="main">main</option>
             <option value="master">master</option>
             <option value="">（不设置）</option>
+          </Select>
+        </Field>
+        <Field
+          label="可见性"
+          hint="公开：所有角色可见；私有：仅管理员、创建者与项目成员可见（非成员访问返回未找到）"
+          htmlFor="project-visibility"
+        >
+          <Select
+            id="project-visibility"
+            value={visibility}
+            onChange={(e) => setVisibility(e.target.value as ProjectVisibility)}
+            disabled={busy}
+          >
+            <option value="public">公开</option>
+            <option value="private">私有</option>
           </Select>
         </Field>
         <Field
