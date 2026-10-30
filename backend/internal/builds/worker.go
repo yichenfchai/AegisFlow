@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,7 +51,7 @@ func (s *Service) claimNext(ctx context.Context) (*Build, error) {
 	row := s.db.QueryRowContext(ctx, `
 	WITH next AS (SELECT id FROM builds WHERE status=$1 ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED)
 	UPDATE builds b SET status=$2, started_at=$3 FROM next WHERE b.id=next.id
-	RETURNING b.id,b.project_id,b.build_number,b.status,b.branch,b.command,b.triggered_by,b.created_at,b.started_at,b.finished_at`, StatusQueued, StatusRunning, time.Now().Unix())
+	RETURNING b.id,b.project_id,b.build_number,b.status,b.branch,b.command,b.repo_url,b.triggered_by,b.created_at,b.started_at,b.finished_at`, StatusQueued, StatusRunning, time.Now().Unix())
 	build, err := scanBuild(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, sql.ErrNoRows
@@ -60,8 +62,8 @@ func (s *Service) claimNext(ctx context.Context) (*Build, error) {
 // execute runs one claimed build to a terminal state. System log lines record
 // the lifecycle so the timeline survives even without process output.
 func (s *Service) execute(ctx context.Context, build *Build) {
-	execCtx, stop := context.WithTimeout(ctx, s.timeout)
-	defer stop()
+	execCtx, stopTimeout := context.WithTimeout(ctx, s.timeout)
+	defer stopTimeout()
 
 	workDir, err := newBuildWorkDir()
 	if err != nil {
@@ -74,8 +76,77 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 	defer writer.close()
 	writer.systemf("build #%d started (branch=%q)", build.BuildNumber, build.Branch)
 
+	// runCtx ends on the wall-clock timeout, server shutdown, a cancelling
+	// operator, or a disk-limit breach; the watchdog and clone share it.
+	runCtx, cancelRun := context.WithCancel(execCtx)
+	defer cancelRun()
+	var diskExceeded atomic.Bool
+	if s.diskLimit > 0 {
+		go watchDiskUsage(runCtx, workDir, s.diskLimit, func() {
+			diskExceeded.Store(true)
+			cancelRun()
+		})
+	}
+
+	execDir := workDir
+	// A cancel or shutdown must also interrupt a long clone: the command
+	// watchdog below only starts once the shell has been launched.
+	cloneWatchDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(300 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-cloneWatchDone:
+				return
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				if current, err := s.getByID(context.Background(), build.ID); err == nil && current.Status != StatusRunning {
+					cancelRun()
+					return
+				}
+			}
+		}
+	}()
+	if s.sandbox.Mode == SandboxUser {
+		if err = s.sandbox.prepareUserWorkspace(workDir); err != nil {
+			writer.systemf("execution sandbox unavailable: %v", err)
+			s.finish(build, StatusFailed)
+			return
+		}
+	}
+	if build.RepoURL != "" {
+		if !s.cloneEnabled {
+			writer.systemf("repository configured but cloning is disabled (AEGIS_BUILD_CLONE=false); running in an empty workspace")
+		} else {
+			writer.systemf("cloning %s (branch %q)", displayRepoURL(build.RepoURL), build.Branch)
+			if err = s.cloneRepository(runCtx, build.RepoURL, build.Branch, workDir); err != nil {
+				switch {
+				case diskExceeded.Load():
+					writer.systemf("build exceeded the disk limit of %s during clone", formatBytes(s.diskLimit))
+				case execCtx.Err() == context.DeadlineExceeded:
+					writer.systemf("build timed out after %s during clone", s.timeout)
+				case ctx.Err() != nil:
+					writer.systemf("interrupted by server shutdown")
+					s.finish(build, StatusInterrupted)
+					return
+				case s.cancelled(build.ID):
+					writer.systemf("build cancelled")
+					return
+				default:
+					writer.systemf("git clone failed: %v", err)
+				}
+				s.finish(build, StatusFailed)
+				return
+			}
+			execDir = filepath.Join(workDir, "repo")
+			writer.systemf("repository cloned; running the build command in repo/")
+		}
+	}
+
 	containerName := "aegis-build-" + build.ID
-	cmd, err := s.sandbox.commandForBuild(execCtx, containerName, workDir, build.Command)
+	cmd, err := s.sandbox.commandForBuild(runCtx, containerName, workDir, execDir, build.Command)
 	if err != nil {
 		writer.systemf("execution sandbox unavailable: %v", err)
 		s.finish(build, StatusFailed)
@@ -96,6 +167,7 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 		s.finish(build, StatusFailed)
 		return
 	}
+	close(cloneWatchDone)
 	// Closing the parent read ends unblocks the stream readers. Cancelling a
 	// shell command may leave grandchildren (on Windows `cmd /c ping` does)
 	// holding the pipes open, so shutdown must not wait for them.
@@ -110,7 +182,7 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 	defer close(ctxWatch)
 	go func() {
 		select {
-		case <-execCtx.Done():
+		case <-runCtx.Done():
 			closeStreams()
 		case <-ctxWatch:
 		}
@@ -154,6 +226,10 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 	watchWG.Wait()
 
 	switch {
+	case diskExceeded.Load():
+		s.sandbox.stop(containerName)
+		writer.systemf("build exceeded the disk limit of %s", formatBytes(s.diskLimit))
+		s.finish(build, StatusFailed)
 	case execCtx.Err() == context.DeadlineExceeded:
 		s.sandbox.stop(containerName)
 		writer.systemf("build timed out after %s", s.timeout)
@@ -186,6 +262,13 @@ func (s *Service) finish(build *Build, status string) {
 	defer cancel()
 	_, _ = s.db.ExecContext(ctx, `UPDATE builds SET status=$2, finished_at=$3 WHERE id=$1 AND status=$4`,
 		build.ID, status, time.Now().Unix(), StatusRunning)
+}
+
+// cancelled reports whether an operator moved the build out of running while a
+// clone was in flight; the status is authoritative, not the clone error.
+func (s *Service) cancelled(id string) bool {
+	current, err := s.getByID(context.Background(), id)
+	return err == nil && current.Status == StatusCancelled
 }
 
 // logWriter batches output lines into the log table and caps the volume.

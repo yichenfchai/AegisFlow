@@ -69,6 +69,10 @@ jobs:
         run: go test -race ./... -count=1
       - name: Build
         run: go build ./cmd/server
+      # The user sandbox only works as root (chown + setpriv); the regular test
+      # run skips that one test, so CI executes it explicitly through sudo.
+      - name: User sandbox privilege drop (root)
+        run: sudo env PATH="$PATH" GOMODCACHE="$(go env GOMODCACHE)" GOCACHE=/tmp/aegis-go-cache HOME=/tmp go test ./internal/builds -run TestUserSandboxRunsAsTargetAccount -count=1 -v
 
   frontend:
     name: frontend

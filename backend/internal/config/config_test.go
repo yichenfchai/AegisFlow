@@ -8,7 +8,7 @@ import (
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO"} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("AEGIS_JWT_SECRET", strings.Repeat("s", 32))
@@ -67,7 +67,7 @@ func TestBuildSandboxConfig(t *testing.T) {
 	}{
 		{"", BuildSandboxNone, false},
 		{"none", BuildSandboxNone, false},
-		{"user", "", true},
+		{"user", "", true}, // AEGIS_BUILD_USER is required, covered below
 		{"container", BuildSandboxContainer, false},
 		{"docker", "", true},
 		{"Container", "", true},
@@ -79,15 +79,91 @@ func TestBuildSandboxConfig(t *testing.T) {
 			if (err != nil) != tc.invalid || (!tc.invalid && c.BuildSandbox != tc.want) {
 				t.Fatalf("sandbox=%q err=%v", c.BuildSandbox, err)
 			}
-			// The unimplemented fallback must say so: silently accepting it
-			// would promise isolation the executor does not provide.
-			if tc.invalid && tc.value == "user" && !strings.Contains(err.Error(), "not implemented") {
-				t.Fatalf("error should explain that the mode is not implemented: %v", err)
-			}
 			if tc.want == BuildSandboxContainer {
 				if c.BuildImage != "alpine:3.20" || c.BuildCPU != "2" || c.BuildMemory != "2g" || c.BuildPids != 512 {
 					t.Fatalf("container defaults = image %q cpu %q memory %q pids %d", c.BuildImage, c.BuildCPU, c.BuildMemory, c.BuildPids)
 				}
+			}
+		})
+	}
+}
+
+func TestBuildUserSandboxConfig(t *testing.T) {
+	t.Run("requires an account name", func(t *testing.T) {
+		setup(t)
+		t.Setenv("AEGIS_BUILD_SANDBOX", "user")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "AEGIS_BUILD_USER") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+	t.Run("accepts a dedicated account", func(t *testing.T) {
+		setup(t)
+		t.Setenv("AEGIS_BUILD_SANDBOX", "user")
+		t.Setenv("AEGIS_BUILD_USER", "aegis-builder")
+		c, err := Load()
+		if err != nil || c.BuildSandbox != BuildSandboxUser || c.BuildUser != "aegis-builder" {
+			t.Fatalf("sandbox=%q user=%q err=%v", c.BuildSandbox, c.BuildUser, err)
+		}
+	})
+	t.Run("account only applies to user mode", func(t *testing.T) {
+		setup(t)
+		t.Setenv("AEGIS_BUILD_SANDBOX", "none")
+		t.Setenv("AEGIS_BUILD_USER", "aegis-builder")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "only applies") {
+			t.Fatalf("err=%v", err)
+		}
+	})
+}
+
+func TestBuildDiskConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    int64
+		invalid bool
+	}{
+		{"", 2 << 30, false},
+		{"512m", 512 << 20, false},
+		{"1g", 1 << 30, false},
+		{"1t", 1 << 40, false},
+		{"16m", 16 << 20, false},
+		{"8m", 0, true},
+		{"0g", 0, true},
+		{"2gb", 0, true},
+		{"2", 0, true},
+		{"-1g", 0, true},
+	} {
+		t.Run("value="+tc.value, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_BUILD_DISK", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid || (!tc.invalid && c.BuildDisk != tc.want) {
+				t.Fatalf("disk=%d err=%v", c.BuildDisk, err)
+			}
+		})
+	}
+}
+
+func TestBuildCloneConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		clone     string
+		allow     string
+		wantClone bool
+		invalid   bool
+	}{
+		{"defaults", "", "", false, false},
+		{"clone on", "true", "", true, false},
+		{"local requires clone", "false", "true", false, true},
+		{"local with clone", "true", "true", true, false},
+		{"bad boolean", "yes", "", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_BUILD_CLONE", tc.clone)
+			t.Setenv("AEGIS_BUILD_ALLOW_LOCAL_REPO", tc.allow)
+			c, err := Load()
+			if (err != nil) != tc.invalid || (!tc.invalid && c.BuildClone != tc.wantClone) {
+				t.Fatalf("clone=%v err=%v", c.BuildClone, err)
 			}
 		})
 	}

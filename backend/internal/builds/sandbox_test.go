@@ -38,7 +38,12 @@ func requireDocker(t *testing.T) string {
 		image = "alpine:3.20"
 	}
 	if out, err := exec.CommandContext(ctx, "docker", "pull", image).CombinedOutput(); err != nil {
-		t.Fatalf("pull %s: %v: %s", image, err, out)
+		// Anonymous Docker Hub pulls are rate limited and fail transiently with
+		// 401/EOF. An image already present proves the runtime can run builds;
+		// a missing image still fails the test.
+		if inspectErr := exec.CommandContext(ctx, "docker", "image", "inspect", image).Run(); inspectErr != nil {
+			t.Fatalf("pull %s: %v: %s", image, err, out)
+		}
 	}
 	return image
 }
@@ -46,7 +51,7 @@ func requireDocker(t *testing.T) string {
 func TestContainerCommandArguments(t *testing.T) {
 	t.Setenv("AEGIS_JWT_SECRET", "must-not-leak")
 	sandbox := Sandbox{Mode: SandboxContainer, Image: "alpine:3.20", CPU: "1.5", Memory: "256m", Pids: 64}
-	cmd, err := sandbox.commandForBuild(context.Background(), "aegis-build-test", "/tmp/work dir", "echo hi")
+	cmd, err := sandbox.commandForBuild(context.Background(), "aegis-build-test", "/tmp/work dir", "/tmp/work dir/repo", "echo hi")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +65,7 @@ func TestContainerCommandArguments(t *testing.T) {
 		"--security-opt no-new-privileges",
 		"--read-only",
 		"-v /tmp/work dir:/workspace",
-		"-w /workspace",
+		"-w /workspace/repo",
 		"alpine:3.20 sh -c echo hi",
 	} {
 		if !strings.Contains(args, want) {
@@ -75,7 +80,7 @@ func TestContainerCommandArguments(t *testing.T) {
 }
 
 func TestContainerCommandRejectsIncompleteLimits(t *testing.T) {
-	_, err := (Sandbox{Mode: SandboxContainer, Image: "alpine:3.20"}).commandForBuild(context.Background(), "n", "/tmp", "true")
+	_, err := (Sandbox{Mode: SandboxContainer, Image: "alpine:3.20"}).commandForBuild(context.Background(), "n", "/tmp", "/tmp", "true")
 	if err == nil {
 		t.Fatal("expected an error for missing limits")
 	}

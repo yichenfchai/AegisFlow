@@ -11,6 +11,8 @@ export interface Build {
   status: BuildStatus
   branch: string
   command: string
+  /** Repository URL snapshot at trigger time; empty means the build ran without cloning. */
+  repoUrl: string
   triggeredBy: string
   createdAt: number
   startedAt: number
