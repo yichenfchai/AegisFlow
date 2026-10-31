@@ -396,12 +396,55 @@ func (s *Server) listAudit(c *gin.Context) {
 	if !ok {
 		return
 	}
-	entries, total, err := s.auth.ListAudit(c.Request.Context(), limit, offset)
+	filter, ok := s.auditFilter(c)
+	if !ok {
+		return
+	}
+	entries, total, err := s.auth.ListAudit(c.Request.Context(), filter, limit, offset)
 	if err != nil {
 		s.authError(c, err)
 		return
 	}
 	s.respond(c, 200, gin.H{"items": entries, "total": total, "limit": limit, "offset": offset})
+}
+
+// auditFilter reads the optional audit query parameters. from/to accept an
+// RFC3339 timestamp or a YYYY-MM-DD date; a date-only "to" includes that whole
+// UTC day so the common "up to today" filter does not drop today's rows.
+func (s *Server) auditFilter(c *gin.Context) (auth.AuditFilter, bool) {
+	filter := auth.AuditFilter{
+		Action:     c.Query("action"),
+		ObjectType: c.Query("objectType"),
+		Result:     c.Query("result"),
+		Actor:      c.Query("actor"),
+	}
+	var err error
+	if filter.From, err = auditBoundary(c.Query("from"), false); err != nil {
+		s.fail(c, 400, "invalid_request", "from must be an RFC3339 timestamp or YYYY-MM-DD date")
+		return auth.AuditFilter{}, false
+	}
+	if filter.To, err = auditBoundary(c.Query("to"), true); err != nil {
+		s.fail(c, 400, "invalid_request", "to must be an RFC3339 timestamp or YYYY-MM-DD date")
+		return auth.AuditFilter{}, false
+	}
+	return filter, true
+}
+
+func auditBoundary(value string, endOfDay bool) (int64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return parsed.Unix(), nil
+	}
+	day, err := time.Parse("2006-01-02", value)
+	if err != nil {
+		return 0, err
+	}
+	if endOfDay {
+		return day.Add(24*time.Hour - time.Second).Unix(), nil
+	}
+	return day.Unix(), nil
 }
 
 // projectError maps registry errors to the shared error envelope.
