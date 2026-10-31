@@ -107,6 +107,12 @@ var Migrations = [][]string{{
 	`CREATE INDEX project_members_user_idx ON project_members(user_id, project_id)`,
 	`INSERT INTO project_members(project_id,user_id,role,created_by,created_at)
 	 SELECT id, created_by, 'maintainer', created_by, created_at FROM projects WHERE created_by <> ''`,
+}, {
+	// Repository snapshot for the controlled executor (P3 ④c): each build keeps
+	// the repoUrl it was triggered with, so editing a project later does not
+	// rewrite what a historical build says it cloned. Empty means "no
+	// repository": the command runs in an empty workspace, the pre-④c behaviour.
+	`ALTER TABLE builds ADD COLUMN repo_url TEXT NOT NULL DEFAULT ''`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped

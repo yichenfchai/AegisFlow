@@ -1,15 +1,7 @@
-// Package builds is the build pipeline: enqueue, claim, execute in a
-// temporary working directory with a timeout, capture logs, and expose
-// polling reads. Business logic never depends on Gin.
-//
-// P3 first-slice boundaries, deliberately: commands run through the system
-// shell without a sandbox (no dedicated execution identity, resource caps, or
-// output redaction yet — that arrives with the controlled-environment batch).
-// The worker runs in-process with concurrency one and is guarded by a
-// PostgreSQL session advisory lock (RunWorker): only the lease holder recovers
-// interrupted builds and claims queued ones, so standby replicas never turn a
-// peer's running build into interrupted. Claiming also uses SELECT ... FOR
-// UPDATE SKIP LOCKED as a second line of defence.
+// Package builds is the build pipeline: enqueue, claim, optionally clone the
+// project repository into a temporary working directory, execute with a
+// timeout and a workspace size cap, capture logs, and expose polling reads.
+// Business logic never depends on Gin.
 package builds
 
 import (
@@ -58,6 +50,9 @@ type Build struct {
 	Status      string `json:"status"`
 	Branch      string `json:"branch"`
 	Command     string `json:"command"`
+	// RepoURL is the project repository snapshot taken at enqueue time. Empty
+	// means the build ran without cloning, in an empty workspace.
+	RepoURL     string `json:"repoUrl"`
 	TriggeredBy string `json:"triggeredBy"`
 	CreatedAt   int64  `json:"createdAt"`
 	StartedAt   int64  `json:"startedAt"`
@@ -90,6 +85,11 @@ type Service struct {
 	notify     chan struct{}
 	leaseRetry time.Duration
 	sandbox    Sandbox
+	// Source policy and workspace cap; zero values mean "no clone, no cap",
+	// which keeps the test helpers on the pre-④c path.
+	cloneEnabled   bool
+	allowLocalRepo bool
+	diskLimit      int64
 }
 
 // New uses the default execution timeout of ten minutes.
@@ -101,12 +101,12 @@ func newWithLimits(db *sql.DB, projectRegistry *projects.Service, timeout time.D
 	return &Service{db: db, projects: projectRegistry, timeout: timeout, maxEvents: maxEvents, notify: make(chan struct{}, 1), leaseRetry: defaultLeaseRetry}
 }
 
-const buildColumns = `id,project_id,build_number,status,branch,command,triggered_by,created_at,started_at,finished_at`
+const buildColumns = `id,project_id,build_number,status,branch,command,repo_url,triggered_by,created_at,started_at,finished_at`
 
 // buildColumnsQualified is buildColumns with the table alias needed by the
 // visibility join: reads embed projects.VisiblePredicate, so a build of an
 // invisible project is not found rather than forbidden.
-const buildColumnsQualified = `b.id,b.project_id,b.build_number,b.status,b.branch,b.command,b.triggered_by,b.created_at,b.started_at,b.finished_at`
+const buildColumnsQualified = `b.id,b.project_id,b.build_number,b.status,b.branch,b.command,b.repo_url,b.triggered_by,b.created_at,b.started_at,b.finished_at`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -133,7 +133,7 @@ func writeAudit(ctx context.Context, tx *sql.Tx, actor auth.Actor, action, objec
 
 func scanBuild(row rowScanner) (*Build, error) {
 	var b Build
-	if err := row.Scan(&b.ID, &b.ProjectID, &b.BuildNumber, &b.Status, &b.Branch, &b.Command, &b.TriggeredBy, &b.CreatedAt, &b.StartedAt, &b.FinishedAt); err != nil {
+	if err := row.Scan(&b.ID, &b.ProjectID, &b.BuildNumber, &b.Status, &b.Branch, &b.Command, &b.RepoURL, &b.TriggeredBy, &b.CreatedAt, &b.StartedAt, &b.FinishedAt); err != nil {
 		return nil, err
 	}
 	return &b, nil
@@ -178,13 +178,13 @@ func (s *Service) enqueue(ctx context.Context, actor auth.Actor, projectID, bran
 		return nil, err
 	}
 	defer tx.Rollback()
-	var status, command, defaultBranch string
+	var status, command, defaultBranch, repoURL string
 	var count int64
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	// The visibility predicate runs inside the locking read: triggering a build
 	// on an invisible project is a 404, exactly like reading it.
-	err = tx.QueryRowContext(ctx, `SELECT p.status,p.build_command,p.default_branch,p.build_count FROM projects p
-	 WHERE p.id=$1 AND `+projects.VisiblePredicate("p", 2, 3)+` FOR UPDATE`, projectID, isAdmin, userID).Scan(&status, &command, &defaultBranch, &count)
+	err = tx.QueryRowContext(ctx, `SELECT p.status,p.build_command,p.default_branch,p.repo_url,p.build_count FROM projects p
+	 WHERE p.id=$1 AND `+projects.VisiblePredicate("p", 2, 3)+` FOR UPDATE`, projectID, isAdmin, userID).Scan(&status, &command, &defaultBranch, &repoURL, &count)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -210,9 +210,9 @@ func (s *Service) enqueue(ctx context.Context, actor auth.Actor, projectID, bran
 		return nil, err
 	}
 	now := time.Now().Unix()
-	build := &Build{ID: id, ProjectID: projectID, BuildNumber: count + 1, Status: StatusQueued, Branch: branch, Command: command, TriggeredBy: actor.ID, CreatedAt: now}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO builds(id,project_id,build_number,status,branch,command,triggered_by,created_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, id, projectID, build.BuildNumber, StatusQueued, branch, command, actor.ID, now); err != nil {
+	build := &Build{ID: id, ProjectID: projectID, BuildNumber: count + 1, Status: StatusQueued, Branch: branch, Command: command, RepoURL: repoURL, TriggeredBy: actor.ID, CreatedAt: now}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO builds(id,project_id,build_number,status,branch,command,repo_url,triggered_by,created_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, id, projectID, build.BuildNumber, StatusQueued, branch, command, repoURL, actor.ID, now); err != nil {
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE projects SET build_count=$2 WHERE id=$1`, projectID, build.BuildNumber); err != nil {

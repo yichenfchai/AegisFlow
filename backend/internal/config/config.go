@@ -24,6 +24,15 @@ type Config struct {
 	BuildImage                                                                                      string
 	BuildCPU, BuildMemory                                                                           string
 	BuildPids                                                                                       int
+	// BuildUser is the dedicated OS account for AEGIS_BUILD_SANDBOX=user.
+	BuildUser string
+	// BuildDisk caps the total size of one build workspace (cloned repo plus
+	// generated files); the worker cancels the build when it is exceeded.
+	BuildDisk int64
+	// BuildClone enables cloning the project repository before running the
+	// command; BuildAllowLocalRepo permits file:/// and absolute local paths.
+	BuildClone          bool
+	BuildAllowLocalRepo bool
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
@@ -130,10 +139,10 @@ func Load() (Config, error) {
 		}
 		c.AllowedOrigins = append(c.AllowedOrigins, origin)
 	}
-	// Build isolation switch (build execution design, local-only). "container" runs
-	// each build in a one-shot container; "none" keeps the developer path that
-	// runs commands as the service account. "user" is still unimplemented, so it
-	// fails closed rather than promising isolation that does not exist.
+	// Build isolation switch (build execution design, local-only). "container"
+	// runs each build in a one-shot container; "user" drops each build to a
+	// dedicated OS account (Linux, service must start as root); "none" is the
+	// developer path that runs commands as the service account.
 	switch value := BuildSandbox(os.Getenv("AEGIS_BUILD_SANDBOX")); value {
 	case "", BuildSandboxNone:
 		c.BuildSandbox = BuildSandboxNone
@@ -156,9 +165,36 @@ func Load() (Config, error) {
 			return c, poolErr
 		}
 	case BuildSandboxUser:
-		return c, errors.New("AEGIS_BUILD_SANDBOX=user is not implemented yet: builds would still run as the service account; use none or container")
+		c.BuildSandbox = BuildSandboxUser
+		c.BuildUser = strings.TrimSpace(os.Getenv("AEGIS_BUILD_USER"))
+		if c.BuildUser == "" || strings.ContainsAny(c.BuildUser, " \t\r\n") {
+			return c, errors.New("AEGIS_BUILD_SANDBOX=user requires AEGIS_BUILD_USER naming a dedicated OS account")
+		}
 	default:
 		return c, fmt.Errorf("AEGIS_BUILD_SANDBOX must be none, user or container, got %q", value)
+	}
+	if c.BuildSandbox != BuildSandboxUser && os.Getenv("AEGIS_BUILD_USER") != "" {
+		return c, errors.New("AEGIS_BUILD_USER only applies to AEGIS_BUILD_SANDBOX=user")
+	}
+	// Workspace cap shared by every sandbox mode: a build must not fill the host
+	// disk even when the command itself is unprivileged.
+	c.BuildDisk, err = parseBytes("AEGIS_BUILD_DISK", "2g")
+	if err != nil {
+		return c, err
+	}
+	if c.BuildDisk < 16<<20 || c.BuildDisk > 1<<40 {
+		return c, errors.New("AEGIS_BUILD_DISK must be between 16MiB and 1TiB")
+	}
+	c.BuildClone, err = parseBool("AEGIS_BUILD_CLONE", false)
+	if err != nil {
+		return c, err
+	}
+	c.BuildAllowLocalRepo, err = parseBool("AEGIS_BUILD_ALLOW_LOCAL_REPO", false)
+	if err != nil {
+		return c, err
+	}
+	if c.BuildAllowLocalRepo && !c.BuildClone {
+		return c, errors.New("AEGIS_BUILD_ALLOW_LOCAL_REPO requires AEGIS_BUILD_CLONE=true")
 	}
 	return c, nil
 }
@@ -211,4 +247,46 @@ func duration(key, fallback string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be a duration of at least one second", key)
 	}
 	return d, nil
+}
+
+// parseBytes accepts the byte-suffix form used across the build settings
+// (512m, 2g, 1t). The fallback is only used when the variable is unset.
+func parseBytes(key, fallback string) (int64, error) {
+	value := strings.ToLower(strings.TrimSpace(env(key, fallback)))
+	if len(value) < 2 {
+		return 0, fmt.Errorf("%s must be a size such as 512m, 2g or 1t", key)
+	}
+	var multiplier int64
+	switch value[len(value)-1] {
+	case 'k':
+		multiplier = 1 << 10
+	case 'm':
+		multiplier = 1 << 20
+	case 'g':
+		multiplier = 1 << 30
+	case 't':
+		multiplier = 1 << 40
+	default:
+		return 0, fmt.Errorf("%s must be a size such as 512m, 2g or 1t", key)
+	}
+	n, err := strconv.ParseInt(value[:len(value)-1], 10, 64)
+	if err != nil || n <= 0 || n > (1<<62)/multiplier {
+		return 0, fmt.Errorf("%s must be a positive whole-number size such as 512m, 2g or 1t", key)
+	}
+	return n * multiplier, nil
+}
+
+// parseBool accepts only the explicit boolean spellings; an empty value falls
+// back to the default so an unset variable never guesses.
+func parseBool(key string, fallback bool) (bool, error) {
+	switch value := os.Getenv(key); value {
+	case "":
+		return fallback, nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be true or false", key)
+	}
 }
