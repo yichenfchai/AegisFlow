@@ -49,12 +49,12 @@ test('部署目标：创建、检查、启停、删除与管理员限制', async
   await expect(page.getByLabel('状态')).toHaveValue('active')
   await expect(page.locator('span').filter({ hasText: /^启用$/ })).toBeVisible()
 
-  // 删除后回到列表：该行消失，空状态出现。
+  // 删除后回到列表：该行消失。断言只针对本用例创建的行，因为同一测试库可能
+  // 保留早前运行创建的其他目标（空状态只在全新数据库时成立）。
   await page.getByRole('button', { name: '删除', exact: true }).click()
   await page.getByRole('button', { name: '确认删除' }).click()
   await expect(page).toHaveURL('/deploy-targets')
   await expect(page.getByRole('row', { name: new RegExp(name) })).toHaveCount(0)
-  await expect(page.getByText('还没有部署目标；点击右上角创建第一个')).toBeVisible()
 
   // 普通成员：管理接口 403，直接访问管理员页面得到无权访问，且没有创建入口。
   const memberName = `target-viewer-${Date.now()}`
