@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -8,7 +10,7 @@ import (
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT"} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("AEGIS_JWT_SECRET", strings.Repeat("s", 32))
@@ -222,6 +224,66 @@ func TestAuditRetentionConfig(t *testing.T) {
 			c, err := Load()
 			if (err != nil) != tc.invalid || (!tc.invalid && c.AuditRetention != tc.want) {
 				t.Fatalf("retention=%v err=%v", c.AuditRetention, err)
+			}
+		})
+	}
+}
+
+func TestSecretKeyConfig(t *testing.T) {
+	encode := func(size int) string { return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, size)) }
+	for _, tc := range []struct {
+		name    string
+		value   string
+		wantLen int
+		invalid bool
+	}{
+		{"unset disables secret storage", "", 0, false},
+		{"valid 32-byte key", encode(32), 32, false},
+		{"short key", encode(16), 0, true},
+		{"long key", encode(33), 0, true},
+		{"not base64", "!!!!", 0, true},
+		{"base64 of non-32 bytes", base64.StdEncoding.EncodeToString([]byte("too-short")), 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_SECRET_KEY", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid {
+				t.Fatalf("err=%v invalid=%v", err, tc.invalid)
+			}
+			if err != nil {
+				if strings.Contains(err.Error(), tc.value) && tc.value != "" {
+					t.Fatalf("error echoed the key: %v", err)
+				}
+				return
+			}
+			if len(c.SecretKey) != tc.wantLen {
+				t.Fatalf("key length = %d, want %d", len(c.SecretKey), tc.wantLen)
+			}
+		})
+	}
+}
+
+func TestDeployCheckTimeoutConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    time.Duration
+		invalid bool
+	}{
+		{"", 5 * time.Second, false},
+		{"30s", 30 * time.Second, false},
+		{"1m", time.Minute, false},
+		{"2m", 0, true},
+		{"0s", 0, true},
+		{"500ms", 0, true},
+		{"soon", 0, true},
+	} {
+		t.Run("value="+tc.value, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_DEPLOY_CHECK_TIMEOUT", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid || (!tc.invalid && c.DeployCheckTimeout != tc.want) {
+				t.Fatalf("timeout=%v err=%v", c.DeployCheckTimeout, err)
 			}
 		})
 	}
