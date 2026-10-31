@@ -10,6 +10,10 @@ import { ProjectWizardPage } from '@/features/projects/ProjectWizardPage'
 import { ProjectsPage } from '@/features/projects/ProjectsPage'
 import { ProjectMembersPage } from '@/features/projects/ProjectMembersPage'
 import { AccountSecurityPage } from '@/features/account/AccountSecurityPage'
+import { DeploymentListPage } from '@/features/deployments/DeploymentListPage'
+import { DeploymentNewPage } from '@/features/deployments/DeploymentNewPage'
+import { DeploymentDetailPage } from '@/features/deployments/DeploymentDetailPage'
+import { ApprovalListPage } from '@/features/approvals/ApprovalListPage'
 
 /**
  * 真实页面（项目、构建、账号、用户与审计）不进 Gate；业务演示页已随 P3
@@ -34,19 +38,20 @@ export const router = createBrowserRouter([
       { path: '/account', element: <AccountSecurityPage /> },
 
       // 非主线业务：恒定未实现
-      { path: '/deploys', element: <UnimplementedPage title="部署记录" /> },
-      { path: '/deploys/:id', element: <UnimplementedPage title="部署详情" /> },
       { path: '/reviews', element: <UnimplementedPage title="审查中心" /> },
       { path: '/reviews/new', element: <UnimplementedPage title="发起审查" /> },
       { path: '/reviews/:id', element: <UnimplementedPage title="审查详情" /> },
       { path: '/scans', element: <UnimplementedPage title="安全扫描" /> },
-      { path: '/approvals', element: <UnimplementedPage title="审批中心" /> },
       { path: '/knowledge', element: <UnimplementedPage title="知识库" /> },
 
-      // 管理员入口：真实用户与审计；其余为未实现占位
+      // 管理员入口：真实部署、审批、用户与审计；其余为未实现占位
       {
         element: <SessionGate adminOnly />,
         children: [
+          { path: '/deploys', element: <DeploymentListPage /> },
+          { path: '/deploys/new', element: <DeploymentNewPage /> },
+          { path: '/deploys/:id', element: <DeploymentDetailPage /> },
+          { path: '/approvals', element: <ApprovalListPage /> },
           { path: '/deploy-targets', element: <UnimplementedPage title="部署目标" /> },
           { path: '/deploy-targets/new', element: <UnimplementedPage title="新建部署目标" /> },
           { path: '/deploy-targets/:id', element: <UnimplementedPage title="部署目标详情" /> },

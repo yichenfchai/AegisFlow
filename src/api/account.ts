@@ -85,6 +85,13 @@ export const AUDIT_ACTION_TEXT: Record<string, string> = {
   'project.member_remove': '移除项目成员',
   'build.trigger': '触发构建',
   'build.cancel': '取消构建',
+  'deployment.create': '创建部署',
+  'deployment.cancel': '取消部署',
+  'deployment.rollback': '回滚部署',
+  'approval.request': '发起审批',
+  'approval.approve': '批准审批',
+  'approval.reject': '拒绝审批',
+  'approval.expire': '审批过期',
 }
 
 export const AUDIT_OBJECT_TEXT: Record<string, string> = {
@@ -92,4 +99,6 @@ export const AUDIT_OBJECT_TEXT: Record<string, string> = {
   session: '会话',
   project: '项目',
   build: '构建',
+  deployment: '部署',
+  approval: '审批',
 }

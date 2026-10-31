@@ -1,16 +1,38 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
 
+// unsetEnv makes a variable genuinely absent, which is distinct from an
+// explicitly empty value for AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS.
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	previous, present := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if present {
+			_ = os.Setenv(key, previous)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	})
+}
+
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_APPROVAL_TTL"} {
 		t.Setenv(key, "")
 	}
+	unsetEnv(t, "AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
 	t.Setenv("AEGIS_JWT_SECRET", strings.Repeat("s", 32))
 	t.Setenv("AEGIS_DATABASE_URL", "postgres://test:test@localhost:5432/aegis_test?sslmode=disable")
 	t.Setenv("AEGIS_REDIS_URL", "redis://localhost:6379/0")
@@ -195,6 +217,149 @@ func TestBuildContainerLimitConfig(t *testing.T) {
 			t.Setenv(tc.key, tc.value)
 			if _, err := Load(); (err != nil) != tc.invalid {
 				t.Fatalf("err=%v invalid=%v", err, tc.invalid)
+			}
+		})
+	}
+}
+
+func TestSecretKeyConfig(t *testing.T) {
+	encode := func(size int) string { return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, size)) }
+	for _, tc := range []struct {
+		name    string
+		value   string
+		wantLen int
+		invalid bool
+	}{
+		{"unset disables secret storage", "", 0, false},
+		{"valid 32-byte key", encode(32), 32, false},
+		{"short key", encode(16), 0, true},
+		{"long key", encode(33), 0, true},
+		{"not base64", "!!!!", 0, true},
+		{"base64 of non-32 bytes", base64.StdEncoding.EncodeToString([]byte("too-short")), 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_SECRET_KEY", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid {
+				t.Fatalf("err=%v invalid=%v", err, tc.invalid)
+			}
+			if err != nil {
+				if strings.Contains(err.Error(), tc.value) && tc.value != "" {
+					t.Fatalf("error echoed the key: %v", err)
+				}
+				return
+			}
+			if len(c.SecretKey) != tc.wantLen {
+				t.Fatalf("key length = %d, want %d", len(c.SecretKey), tc.wantLen)
+			}
+		})
+	}
+}
+
+func TestDeployCheckTimeoutConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    time.Duration
+		invalid bool
+	}{
+		{"", 5 * time.Second, false},
+		{"30s", 30 * time.Second, false},
+		{"1m", time.Minute, false},
+		{"2m", 0, true},
+		{"0s", 0, true},
+		{"500ms", 0, true},
+		{"soon", 0, true},
+	} {
+		t.Run("value="+tc.value, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_DEPLOY_CHECK_TIMEOUT", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid || (!tc.invalid && c.DeployCheckTimeout != tc.want) {
+				t.Fatalf("timeout=%v err=%v", c.DeployCheckTimeout, err)
+			}
+		})
+	}
+}
+
+func TestDeployTimeoutConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    time.Duration
+		invalid bool
+	}{
+		{"", 10 * time.Minute, false},
+		{"30s", 30 * time.Second, false},
+		{"1h", time.Hour, false},
+		{"2h", 0, true},
+		{"0s", 0, true},
+		{"500ms", 0, true},
+		{"soon", 0, true},
+	} {
+		t.Run("value="+tc.value, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_DEPLOY_TIMEOUT", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid || (!tc.invalid && c.DeployTimeout != tc.want) {
+				t.Fatalf("timeout=%v err=%v", c.DeployTimeout, err)
+			}
+		})
+	}
+}
+
+func TestApprovalConfig(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		setup(t)
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(c.ApprovalEnvironments, []string{"production"}) || c.ApprovalTTL != 24*time.Hour {
+			t.Fatalf("approval defaults = %v ttl=%v", c.ApprovalEnvironments, c.ApprovalTTL)
+		}
+	})
+	for _, tc := range []struct {
+		name    string
+		value   string
+		want    []string
+		invalid bool
+	}{
+		{"empty disables approvals", "", nil, false},
+		{"single staging", "staging", []string{"staging"}, false},
+		{"trim and dedupe", " development , production ,production", []string{"development", "production"}, false},
+		{"spaces only disables", "  ,  ", nil, false},
+		{"unknown environment", "qa", nil, true},
+		{"wrong case", "Production", nil, true},
+		{"one unknown among valid", "staging,qa", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid || (!tc.invalid && !slices.Equal(c.ApprovalEnvironments, tc.want)) {
+				t.Fatalf("environments=%v err=%v", c.ApprovalEnvironments, err)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		value   string
+		want    time.Duration
+		invalid bool
+	}{
+		{"", 24 * time.Hour, false},
+		{"1h", time.Hour, false},
+		{"168h", 168 * time.Hour, false},
+		{"30m", 0, true},
+		{"169h", 0, true},
+		{"0s", 0, true},
+		{"soon", 0, true},
+	} {
+		t.Run("ttl="+tc.value, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_APPROVAL_TTL", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid || (!tc.invalid && c.ApprovalTTL != tc.want) {
+				t.Fatalf("ttl=%v err=%v", c.ApprovalTTL, err)
 			}
 		})
 	}

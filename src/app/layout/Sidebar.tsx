@@ -14,28 +14,30 @@ export function Sidebar() {
               {group.title}
             </div>
             <nav className="space-y-0.5">
-              {group.items.map((item) => (
-                <NavLink
-                  key={item.to}
-                  to={item.to}
-                  end={item.to === '/'}
-                  className={({ isActive }) =>
-                    `flex items-center gap-space-md px-space-sm py-[5px] mx-space-xs rounded text-body-md transition-colors ${
-                      isActive
-                        ? 'bg-surface-container-high text-on-surface font-medium border-l-2 border-primary'
-                        : 'text-on-surface-variant hover:bg-surface-container hover:text-on-surface border-l-2 border-transparent'
-                    }`
-                  }
-                >
-                  <Icon name={item.icon} size={16} />
-                  <span className="flex-1">{item.label}</span>
-                  {item.badge ? (
-                    <span className="text-label-sm bg-error-container text-on-error-container rounded px-1">
-                      {item.badge}
-                    </span>
-                  ) : null}
-                </NavLink>
-              ))}
+              {group.items
+                .filter((item) => !item.adminOnly || user?.role === 'admin')
+                .map((item) => (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    end={item.to === '/'}
+                    className={({ isActive }) =>
+                      `flex items-center gap-space-md px-space-sm py-[5px] mx-space-xs rounded text-body-md transition-colors ${
+                        isActive
+                          ? 'bg-surface-container-high text-on-surface font-medium border-l-2 border-primary'
+                          : 'text-on-surface-variant hover:bg-surface-container hover:text-on-surface border-l-2 border-transparent'
+                      }`
+                    }
+                  >
+                    <Icon name={item.icon} size={16} />
+                    <span className="flex-1">{item.label}</span>
+                    {item.badge ? (
+                      <span className="text-label-sm bg-error-container text-on-error-container rounded px-1">
+                        {item.badge}
+                      </span>
+                    ) : null}
+                  </NavLink>
+                ))}
             </nav>
           </section>
         ))}
