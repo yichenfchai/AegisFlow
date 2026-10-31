@@ -125,10 +125,11 @@ test('账号管理：创建、重置、禁用、审计与自助安全', async ({
   await row.getByRole('button', { name: '禁用', exact: true }).click()
   await page.getByRole('button', { name: '确认禁用' }).click()
   await expect(row.getByText('已禁用')).toBeVisible()
-  // 审计页可查询全部管理操作。
+  // 审计页可查询全部管理操作。断言限定在表格内：筛选下拉里也有同名选项。
   await page.getByRole('button', { name: '审计', exact: true }).click()
+  const auditTable = page.getByRole('table')
   for (const action of ['创建用户', '变更角色', '重置密码', '禁用账号']) {
-    await expect(page.getByText(action).first()).toBeVisible()
+    await expect(auditTable.getByText(action).first()).toBeVisible()
   }
   // 禁用账号即使密码正确也无法登录（403 account_disabled）。
   const denied = await page.request.post('/api/v1/auth/login', {
@@ -202,9 +203,10 @@ test('项目管理：创建、归档恢复与角色限制', async ({ page }) => 
   // 管理操作进入审计。
   await page.goto('/settings')
   await page.getByRole('button', { name: '审计', exact: true }).click()
-  await expect(page.getByText('创建项目').first()).toBeVisible()
-  await expect(page.getByText('归档项目').first()).toBeVisible()
-  await expect(page.getByText('恢复项目').first()).toBeVisible()
+  const projectAuditTable = page.getByRole('table')
+  await expect(projectAuditTable.getByText('创建项目').first()).toBeVisible()
+  await expect(projectAuditTable.getByText('归档项目').first()).toBeVisible()
+  await expect(projectAuditTable.getByText('恢复项目').first()).toBeVisible()
   // viewer 可读列表但没有创建入口，直连 API 也被拒绝。
   const username = `proj-viewer-${Date.now()}`
   await page.getByRole('button', { name: '用户管理' }).click()
