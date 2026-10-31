@@ -33,3 +33,8 @@ backend/coverage.out
 # Browser test artifacts
 playwright-report/
 test-results/
+
+# 开发过程文档：只在本地维护，不入库（避免每次合并冲突；进度与验证记录写 PR 正文）
+TODO.md
+HANDOFF.md
+docs/*-design.md
