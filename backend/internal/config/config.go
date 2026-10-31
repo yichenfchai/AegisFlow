@@ -34,6 +34,9 @@ type Config struct {
 	// command; BuildAllowLocalRepo permits file:/// and absolute local paths.
 	BuildClone          bool
 	BuildAllowLocalRepo bool
+	// AuditRetention deletes audit rows older than this window; zero (the
+	// default) keeps them forever.
+	AuditRetention time.Duration
 	// MetricsAddr enables the unauthenticated Prometheus endpoint on a separate
 	// listener; empty (the default) disables it.
 	MetricsAddr string
@@ -139,6 +142,19 @@ func Load() (Config, error) {
 	}
 	if c.BuildTimeout > 24*time.Hour {
 		return c, errors.New("AEGIS_BUILD_TIMEOUT must be at most 24h")
+	}
+	// Audit retention is opt-in deletion: unset or "0" keeps every row forever,
+	// because an audit trail should not lose evidence unless the operator asks.
+	if raw := strings.TrimSpace(os.Getenv("AEGIS_AUDIT_RETENTION")); raw == "" || raw == "0" {
+		c.AuditRetention = 0
+	} else {
+		c.AuditRetention, err = duration("AEGIS_AUDIT_RETENTION", raw)
+		if err != nil {
+			return c, err
+		}
+		if c.AuditRetention < 24*time.Hour || c.AuditRetention > 8760*time.Hour {
+			return c, errors.New("AEGIS_AUDIT_RETENTION must be 0 (keep forever) or between 24h and 8760h")
+		}
 	}
 	// Metrics listen on their own address so the public API origin never exposes
 	// deployment-wide counters; the endpoint itself has no user authentication,

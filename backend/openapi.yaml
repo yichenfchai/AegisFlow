@@ -517,14 +517,48 @@ paths:
         Newest first. Records actor, action, object, result, detail and the
         X-Request-ID of audited operations: login success, user create,
         password change (including wrong-current-password failures), password
-        reset, disable/enable, role change, and session revocation. Failed
-        logins are rate-limited and stay in structured logs only. Retention
-        policy arrives with the business audit milestone.
+        reset, disable/enable, role change, session revocation, plus project
+        and build mutations. Failed logins are rate-limited and stay in
+        structured logs only. Optional filters narrow both the returned page
+        and the total and combine with AND; from/to accept an RFC3339 timestamp
+        or a YYYY-MM-DD date (a date-only to includes that whole UTC day). Rows
+        older than AEGIS_AUDIT_RETENTION are purged hourly when the operator
+        sets it; the default keeps every row.
       security:
         - bearerAuth: []
       parameters:
         - { $ref: '#/components/parameters/Limit' }
         - { $ref: '#/components/parameters/Offset' }
+        - name: action
+          in: query
+          required: false
+          description: Exact action name, e.g. user.create or build.trigger
+          schema: { type: string, maxLength: 128 }
+        - name: objectType
+          in: query
+          required: false
+          description: Exact object type, e.g. user, project or build
+          schema: { type: string, maxLength: 128 }
+        - name: result
+          in: query
+          required: false
+          description: Filter by audit result
+          schema: { type: string, enum: [success, failure] }
+        - name: actor
+          in: query
+          required: false
+          description: Actor id or username; the username match is case-insensitive
+          schema: { type: string, maxLength: 128 }
+        - name: from
+          in: query
+          required: false
+          description: Inclusive lower bound (RFC3339 or YYYY-MM-DD)
+          schema: { type: string, maxLength: 40 }
+        - name: to
+          in: query
+          required: false
+          description: Inclusive upper bound (RFC3339 or YYYY-MM-DD, date-only means end of that UTC day)
+          schema: { type: string, maxLength: 40 }
       responses:
         '200':
           description: Audit page
