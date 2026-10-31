@@ -57,6 +57,14 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 - 日志脱敏已实现：写入 `build_log_events` 前，对 stdout/stderr 按既定模式（`AEGIS_*=...`、`Bearer ...`、带内联凭据的 `postgres://`/`redis://` URL、常见 token 前缀、JWT、私钥头）替换为 `[redacted]`，构建结束时追加一条 system 统计行（只记数量，不记原值）。命中却无法确认已移除的行整行丢弃并计数（fail closed，D6）。多行私钥正文与自由文本里的口令不在模式覆盖范围内。
 - 执行环境：`AEGIS_BUILD_SANDBOX=container`（生产推荐）时每个构建运行在一次性容器中——`--network none`、只读根文件系统、`--cap-drop ALL`、`no-new-privileges`，只有构建目录可写，CPU/内存/进程数由 `--cpus`/`--memory`/`--pids-limit` 硬限制；超时、取消或服务退出时会显式杀掉容器。`user` 模式在 Linux 上把 clone 与命令都经 `setpriv` 降权到 `AEGIS_BUILD_USER`，工作区 chown 给该账号，服务必须以 root 启动、启动时校验账号与 `setpriv`，Windows 不支持。`none`（默认，仅开发）仍以服务进程身份执行，没有专用执行账号与资源上限。所有模式都只注入最小环境变量白名单（不继承 `AEGIS_*` 服务凭据），`HOME` 与临时目录都指向 0700 的构建目录。
 
+### 部署目标与密钥（P4 第一批）
+
+- `/api/v1/deployment-targets` 的列表、创建、详情、修改、删除与探测六个接口仅全局 admin 可用；member/viewer 一律 403。部署任务、回滚与审批流尚未实现（P4.2/P4.3）。
+- 目标是全局对象。字段：name（3–64 字节、单行、大小写不敏感唯一）、kind（目前仅 `http`）、environment（`development`/`staging`/`production`，默认 development）、endpoint（http/https，禁止 userinfo、query、fragment）、healthPath（默认 `/`，必须以 `/` 开头，≤256 字节）、status（`active`/`disabled`）。
+- 凭据加密存储：`AEGIS_SECRET_KEY`（base64 恰好 32 字节）启用 AES-256-GCM，密文布局 `[12 字节随机 nonce][ciphertext+tag]`，AAD 为 `deployment_target:<目标 id>`，因此密文不能跨目标复用。凭据只在探测请求内解密并以 `Authorization: Bearer <secret>` 发送；接口只返回 `hasSecret`，审计、日志与错误信息都不含凭据。未配置密钥时仍可创建无凭据目标，写入凭据返回 400，不会退化为明文存储。带凭据的目标必须使用 `https` 端点（仅回环地址允许 `http`），否则创建/更新返回 400。
+- 连通性探测：`POST /api/v1/deployment-targets/{id}/check` 对 `endpoint + healthPath` 发 GET，超时由 `AEGIS_DEPLOY_CHECK_TIMEOUT`（默认 5s，最大 1m）控制；2xx 记为健康，其余记录 `http <code>`、`timeout` 或脱敏后的网络错误，并更新 `last_check_at/last_check_ok/last_check_detail`。探测结果与 `deployment_target.check` 审计同事务提交。默认客户端最多 3 跳、不跨主机，且拒绝 `https`→`http` 降级。
+- 审计动作：`deployment_target.create` / `deployment_target.update` / `deployment_target.remove` / `deployment_target.check`（objectType `deployment_target`），detail 只写名称或探测结果。删除当前为硬删除——本批尚无部署任务引用目标，P4.2 引入引用时需改为受限删除。
+
 ## 客户端会话生命周期
 
 1. 启动通过 Cookie 刷新，随后 /auth/me 获取真实用户；等待恢复完成才进入业务布局。
@@ -71,12 +79,12 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 - 修改自己密码需验证当前密码，成功后仅保留当前会话；管理员重置密码会撤销目标用户全部会话。两者都要求新密码 12-72 字节。
 - 禁用账号立即撤销其全部会话并阻止登录；禁用状态只在密码正确时通过 403 account_disabled 透露，不会成为账号枚举信号。重新启用不恢复旧会话。
 - 角色为全局角色，每次鉴权实时读取数据库，角色变更对既有会话即时生效，无需撤销会话。禁用或降级最后一个可用管理员被拒绝（400），防止系统失去管理入口。
-- 持久化审计记录操作人（ID/用户名）、时间、动作、对象、结果、详情与请求 ID：登录成功、创建用户、修改密码（含当前密码错误的失败记录）、重置密码、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）。构建与成员审计都和状态变更同事务提交；重复取消幂等且不重复记账，detail 只写项目/成员与角色，不包含构建命令（重试写 `retry_of=<原构建号>`）。失败登录受 Redis 限流约束，只进结构化日志不进审计表；审计保留策略待业务审计里程碑（P4）设计。审计查询仅管理员。
+- 持久化审计记录操作人（ID/用户名）、时间、动作、对象、结果、详情与请求 ID：登录成功、创建用户、修改密码（含当前密码错误的失败记录）、重置密码、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）、部署目标增删改与探测（deployment_target.create / deployment_target.update / deployment_target.remove / deployment_target.check）。构建、成员与部署目标审计都和状态变更同事务提交；重复取消幂等且不重复记账，detail 只写项目/成员与角色或目标名称与探测结果，不包含构建命令或凭据（重试写 `retry_of=<原构建号>`）。失败登录受 Redis 限流约束，只进结构化日志不进审计表；审计保留策略待业务审计里程碑（P4）设计。审计查询仅管理员。
 - 过期会话及其 refresh 令牌历史由后台任务每小时清理（启动时先执行一次）。重放检测只需保留到会话绝对期限，到期即删；清理不影响活跃会话。
 
 ## 角色矩阵
 
-下面是首版权限约定。除已提供的鉴权、账号管理、审计、项目与构建接口，其他服务尚未实现；页面守卫用于交互，不能代替后端对象级授权。角色是**全局的**；项目可见性（public/private）与项目成员（maintainer/viewer）已实现 P1 与 P2（项目级权限设计文档本地维护，不入库）：成员身份既决定「能看哪个项目」，也决定「能改哪个项目」。
+下面是首版权限约定。除已提供的鉴权、账号管理、审计、项目、构建与部署目标接口，其他服务尚未实现；页面守卫用于交互，不能代替后端对象级授权。角色是**全局的**；项目可见性（public/private）与项目成员（maintainer/viewer）已实现 P1 与 P2（项目级权限设计文档本地维护，不入库）：成员身份既决定「能看哪个项目」，也决定「能改哪个项目」。
 
 **可见性规则**：全局 admin 永远可见；其他角色可见 public 项目，以及自己创建或被加入的 private 项目。不可见一律返回 **404**（不是 403），避免用私有 id 枚举项目。构建、日志与 SSE 继承所属项目的可见性。
 
@@ -92,8 +100,8 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 | 读取项目成员、增删改成员 | 允许 | public 允许；private 需项目 maintainer | 只读列表 | 已实现；创建者不可移除；成员变更写审计 |
 | 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 构建与日志已实现（含可见性过滤）；其余待业务接口落实 |
 | 发起/取消/重试构建、发起审查 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 构建已实现（重试仅限终态，不可见 404）；发起审查待业务接口落实 |
-| 发起部署、回滚及执行审批 | 允许 | 禁止 | 禁止 | 后续业务接口落实 |
-| 管理部署目标、密钥、策略、设置、防御及业务审计 | 允许 | 禁止 | 禁止 | 页面明确标记未实现，业务服务待实现 |
+| 发起部署、回滚及执行审批 | 允许 | 禁止 | 禁止 | 后续业务接口落实（P4.2/P4.3） |
+| 管理部署目标、密钥、策略、设置、防御及业务审计 | 允许 | 禁止 | 禁止 | 部署目标已实现（admin-only，凭据加密存储，P4.1）；独立密钥管理、策略、设置、防御与业务审计待实现 |
 
 后续对象涉及具体项目时，需在服务端查询对象所属项目并校验访问权限。不要根据客户端提交的 role 或隐藏按钮决定授权。
 

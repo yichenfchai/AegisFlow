@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -36,6 +37,11 @@ type Config struct {
 	// MetricsAddr enables the unauthenticated Prometheus endpoint on a separate
 	// listener; empty (the default) disables it.
 	MetricsAddr string
+	// SecretKey seals deployment-target credentials at rest (AES-256-GCM).
+	// Empty disables secret storage; targets without a secret still work.
+	SecretKey []byte
+	// DeployCheckTimeout bounds one deployment-target connectivity probe.
+	DeployCheckTimeout time.Duration
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
@@ -147,6 +153,22 @@ func Load() (Config, error) {
 		if convErr != nil || numericPort < 0 || numericPort > 65535 {
 			return c, errors.New("AEGIS_METRICS_ADDR must use a numeric port between 0 and 65535")
 		}
+	}
+	// Deployment-target credential sealing. The key is never echoed in an
+	// error; an unset variable is a valid, secret-storage-disabled start.
+	if rawKey := strings.TrimSpace(os.Getenv("AEGIS_SECRET_KEY")); rawKey != "" {
+		key, decodeErr := base64.StdEncoding.DecodeString(rawKey)
+		if decodeErr != nil || len(key) != 32 {
+			return c, errors.New("AEGIS_SECRET_KEY must be base64 of exactly 32 bytes")
+		}
+		c.SecretKey = key
+	}
+	c.DeployCheckTimeout, err = duration("AEGIS_DEPLOY_CHECK_TIMEOUT", "5s")
+	if err != nil {
+		return c, err
+	}
+	if c.DeployCheckTimeout > time.Minute {
+		return c, errors.New("AEGIS_DEPLOY_CHECK_TIMEOUT must be at most 1m")
 	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {
 		origin = strings.TrimSpace(origin)
