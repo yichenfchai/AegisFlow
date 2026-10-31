@@ -12,7 +12,7 @@ import {
   type Column,
 } from '@/components/ui/DataTable'
 import { Segmented, StatusBadge } from '@/components/ui/Badge'
-import { adminAPI, AUDIT_ACTION_TEXT, AUDIT_OBJECT_TEXT, type AccountUser, type AuditEntry } from '@/api/account'
+import { adminAPI, AUDIT_ACTION_TEXT, AUDIT_OBJECT_TEXT, type AccountUser, type AuditEntry, type AuditFilters } from '@/api/account'
 import { ApiError } from '@/api/http'
 import { useSession } from '@/stores/session'
 import { fmtRel } from '@/api/format'
@@ -292,13 +292,130 @@ const AUDIT_COLUMNS: Column<AuditEntry>[] = [
 
 function AuditTab() {
   const [page, setPage] = useState(1)
+  const [action, setAction] = useState('')
+  const [objectType, setObjectType] = useState('')
+  const [result, setResult] = useState<'' | 'success' | 'failure'>('')
+  const [actor, setActor] = useState('')
+  const [from, setFrom] = useState('')
+  const [to, setTo] = useState('')
+
+  const filters: AuditFilters = {
+    action: action || undefined,
+    objectType: objectType || undefined,
+    result: result || undefined,
+    actor: actor.trim() || undefined,
+    from: from || undefined,
+    to: to || undefined,
+  }
+  const hasFilters = Boolean(
+    filters.action || filters.objectType || filters.result || filters.actor || filters.from || filters.to,
+  )
   const offset = (page - 1) * PAGE_SIZE
   const { data, isLoading, error } = useQuery({
-    queryKey: ['admin-audit', page],
-    queryFn: () => adminAPI.audit(PAGE_SIZE, offset),
+    queryKey: ['admin-audit', filters, page],
+    queryFn: () => adminAPI.audit(filters, PAGE_SIZE, offset),
   })
+  const reset = () => {
+    setAction('')
+    setObjectType('')
+    setResult('')
+    setActor('')
+    setFrom('')
+    setTo('')
+    setPage(1)
+  }
+
   return (
     <div className="max-w-[1080px]">
+      <div className="mb-space-lg rounded-lg border border-surface-container-highest bg-surface-container p-space-xl">
+        <div className="flex flex-wrap items-end gap-space-md">
+          <Field label="动作" htmlFor="audit-action" className="w-[180px]">
+            <Select
+              id="audit-action"
+              value={action}
+              onChange={(e) => {
+                setAction(e.target.value)
+                setPage(1)
+              }}
+            >
+              <option value="">全部</option>
+              {Object.entries(AUDIT_ACTION_TEXT).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="对象" htmlFor="audit-object" className="w-[140px]">
+            <Select
+              id="audit-object"
+              value={objectType}
+              onChange={(e) => {
+                setObjectType(e.target.value)
+                setPage(1)
+              }}
+            >
+              <option value="">全部</option>
+              {Object.entries(AUDIT_OBJECT_TEXT).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="结果" htmlFor="audit-result" className="w-[120px]">
+            <Select
+              id="audit-result"
+              value={result}
+              onChange={(e) => {
+                setResult(e.target.value as '' | 'success' | 'failure')
+                setPage(1)
+              }}
+            >
+              <option value="">全部</option>
+              <option value="success">成功</option>
+              <option value="failure">失败</option>
+            </Select>
+          </Field>
+          <Field label="操作人" htmlFor="audit-actor" className="w-[220px]">
+            <Input
+              id="audit-actor"
+              value={actor}
+              maxLength={128}
+              placeholder="用户名或用户 ID"
+              onChange={(e) => {
+                setActor(e.target.value)
+                setPage(1)
+              }}
+            />
+          </Field>
+          <Field label="从" htmlFor="audit-from" className="w-[160px]">
+            <Input
+              id="audit-from"
+              type="date"
+              value={from}
+              onChange={(e) => {
+                setFrom(e.target.value)
+                setPage(1)
+              }}
+            />
+          </Field>
+          <Field label="到" htmlFor="audit-to" className="w-[160px]">
+            <Input
+              id="audit-to"
+              type="date"
+              value={to}
+              onChange={(e) => {
+                setTo(e.target.value)
+                setPage(1)
+              }}
+            />
+          </Field>
+          <Button variant="secondary" onClick={reset}>
+            重置筛选
+          </Button>
+        </div>
+      </div>
       {error ? (
         <p role="alert" className="text-body-md text-error py-space-lg">
           {error instanceof Error ? error.message : '加载审计失败'}
@@ -307,7 +424,11 @@ function AuditTab() {
         <p className="text-body-md text-outline py-space-lg">加载中...</p>
       ) : (
         <>
-          <DataTable columns={AUDIT_COLUMNS} rows={data?.items ?? []} empty="暂无审计记录" />
+          <DataTable
+            columns={AUDIT_COLUMNS}
+            rows={data?.items ?? []}
+            empty={hasFilters ? '没有符合筛选条件的记录' : '暂无审计记录'}
+          />
           <Pagination page={page} pageSize={PAGE_SIZE} total={data?.total ?? 0} onPage={setPage} />
         </>
       )}

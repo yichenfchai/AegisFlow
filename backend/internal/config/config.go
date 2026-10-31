@@ -33,6 +33,9 @@ type Config struct {
 	// command; BuildAllowLocalRepo permits file:/// and absolute local paths.
 	BuildClone          bool
 	BuildAllowLocalRepo bool
+	// AuditRetention deletes audit rows older than this window; zero (the
+	// default) keeps them forever.
+	AuditRetention time.Duration
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
@@ -130,6 +133,19 @@ func Load() (Config, error) {
 	}
 	if c.BuildTimeout > 24*time.Hour {
 		return c, errors.New("AEGIS_BUILD_TIMEOUT must be at most 24h")
+	}
+	// Audit retention is opt-in deletion: unset or "0" keeps every row forever,
+	// because an audit trail should not lose evidence unless the operator asks.
+	if raw := strings.TrimSpace(os.Getenv("AEGIS_AUDIT_RETENTION")); raw == "" || raw == "0" {
+		c.AuditRetention = 0
+	} else {
+		c.AuditRetention, err = duration("AEGIS_AUDIT_RETENTION", raw)
+		if err != nil {
+			return c, err
+		}
+		if c.AuditRetention < 24*time.Hour || c.AuditRetention > 8760*time.Hour {
+			return c, errors.New("AEGIS_AUDIT_RETENTION must be 0 (keep forever) or between 24h and 8760h")
+		}
 	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {
 		origin = strings.TrimSpace(origin)
