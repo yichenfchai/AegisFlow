@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/builds"
+	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 )
@@ -48,6 +49,7 @@ type Server struct {
 	origins      map[string]bool
 	limiter      ratelimit.Limiter
 	cookieSecure bool
+	metrics      *metrics.Registry
 }
 
 const refreshCookieName = "aegis_refresh"
@@ -64,6 +66,9 @@ type Options struct {
 	// Builds enables the build pipeline routes the same way; the caller owns
 	// starting the worker.
 	Builds *builds.Service
+	// Metrics, when set, records request counters and latency histograms keyed
+	// by the matched route template. Nil disables recording.
+	Metrics *metrics.Registry
 }
 
 // New builds an isolated Gin engine; business services depend only on context.Context.
@@ -72,7 +77,7 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	if len(options) > 0 {
 		opts = options[0]
 	}
-	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure}
+	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure, metrics: opts.Metrics}
 	for _, o := range origins {
 		s.origins[o] = true
 	}
@@ -1007,6 +1012,13 @@ func (s *Server) middleware() gin.HandlerFunc {
 					s.fail(c, 500, "internal_error", "internal server error")
 				}
 			}
+			// Metrics carry the matched route template, never the raw path, so
+			// ids and free-form segments cannot leak into labels.
+			route := c.FullPath()
+			if route == "" {
+				route = "unmatched"
+			}
+			s.metrics.ObserveHTTP(c.Request.Method, route, c.Writer.Status(), time.Since(start))
 			s.logger.Info("http request", "requestId", id, "method", c.Request.Method, "path", c.Request.URL.Path, "status", c.Writer.Status(), "durationMs", time.Since(start).Milliseconds())
 		}()
 		// Vary also on denied/missing origins so intermediaries cannot reuse CORS decisions.
