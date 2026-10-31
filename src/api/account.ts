@@ -85,11 +85,17 @@ export const AUDIT_ACTION_TEXT: Record<string, string> = {
   'project.member_remove': '移除项目成员',
   'build.trigger': '触发构建',
   'build.cancel': '取消构建',
+  'build.retry': '重试构建',
+  'deployment_target.create': '创建部署目标',
+  'deployment_target.update': '更新部署目标',
+  'deployment_target.remove': '删除部署目标',
+  'deployment_target.check': '检查部署目标',
 }
 
 export const AUDIT_OBJECT_TEXT: Record<string, string> = {
   user: '用户',
   session: '会话',
   project: '项目',
+  deployment_target: '部署目标',
   build: '构建',
 }
