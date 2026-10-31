@@ -35,6 +35,31 @@ export interface Page<T> {
   offset: number
 }
 
+/** Optional admin audit filters; all fields are AND-combined by the server. */
+export interface AuditFilters {
+  action?: string
+  objectType?: string
+  result?: 'success' | 'failure'
+  actor?: string
+  from?: string
+  to?: string
+}
+
+/**
+ * Builds the admin audit query string. Empty filters are omitted and limit/
+ * offset are always present. Values are percent-encoded because actor names
+ * and RFC3339 timestamps may contain reserved characters.
+ */
+export function auditQueryString(filters: AuditFilters, limit: number, offset: number): string {
+  const parts = [`limit=${limit}`, `offset=${offset}`]
+  const keys = ['action', 'objectType', 'result', 'actor', 'from', 'to'] as const
+  for (const key of keys) {
+    const value = filters[key]
+    if (value) parts.push(`${key}=${encodeURIComponent(value)}`)
+  }
+  return parts.join('&')
+}
+
 export const accountAPI = {
   changePassword: (currentPassword: string, newPassword: string) =>
     apiRequest<{ changed: boolean }>('/auth/password', {
@@ -62,8 +87,8 @@ export const adminAPI = {
       method: 'POST',
       body: JSON.stringify({ password }),
     }),
-  audit: (limit = 20, offset = 0) =>
-    apiRequest<Page<AuditEntry>>(`/audit?limit=${limit}&offset=${offset}`),
+  audit: (filters: AuditFilters = {}, limit = 20, offset = 0) =>
+    apiRequest<Page<AuditEntry>>(`/audit?${auditQueryString(filters, limit, offset)}`),
 }
 
 export const AUDIT_ACTION_TEXT: Record<string, string> = {

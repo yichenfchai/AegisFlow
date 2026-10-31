@@ -3,6 +3,8 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -255,7 +257,7 @@ func TestAuditTrailAndPagination(t *testing.T) {
 	if err = s.SetUserDisabled(ctx, actor, created.ID, true); err != nil {
 		t.Fatal(err)
 	}
-	entries, total, err := s.ListAudit(ctx, 50, 0)
+	entries, total, err := s.ListAudit(ctx, AuditFilter{}, 50, 0)
 	if err != nil || total != 5 || len(entries) != 5 {
 		t.Fatalf("audit total=%d len=%d err=%v", total, len(entries), err)
 	}
@@ -281,16 +283,16 @@ func TestAuditTrailAndPagination(t *testing.T) {
 			t.Fatalf("action %s count=%d want=%d", action, actions[action], want)
 		}
 	}
-	if entries, total, err = s.ListAudit(ctx, 2, 0); err != nil || total != 5 || len(entries) != 2 {
+	if entries, total, err = s.ListAudit(ctx, AuditFilter{}, 2, 0); err != nil || total != 5 || len(entries) != 2 {
 		t.Fatalf("audit page 1: %d %d %v", len(entries), total, err)
 	}
-	if entries, _, err = s.ListAudit(ctx, 2, 4); err != nil || len(entries) != 1 {
+	if entries, _, err = s.ListAudit(ctx, AuditFilter{}, 2, 4); err != nil || len(entries) != 1 {
 		t.Fatalf("audit page 3: %d %v", len(entries), err)
 	}
-	if _, _, err = s.ListAudit(ctx, 0, 0); !errors.Is(err, ErrValidation) {
+	if _, _, err = s.ListAudit(ctx, AuditFilter{}, 0, 0); !errors.Is(err, ErrValidation) {
 		t.Fatalf("limit 0 accepted: %v", err)
 	}
-	if _, _, err = s.ListAudit(ctx, 101, 0); !errors.Is(err, ErrValidation) {
+	if _, _, err = s.ListAudit(ctx, AuditFilter{}, 101, 0); !errors.Is(err, ErrValidation) {
 		t.Fatalf("limit 101 accepted: %v", err)
 	}
 	users, total, err := s.ListUsersPage(ctx, 50, 0)
@@ -305,6 +307,89 @@ func TestAuditTrailAndPagination(t *testing.T) {
 	}
 	if _, _, err = s.ListUsersPage(ctx, 10, -1); !errors.Is(err, ErrValidation) {
 		t.Fatalf("negative offset accepted: %v", err)
+	}
+}
+
+func TestAuditFiltersAndRetention(t *testing.T) {
+	s, db := testService(t)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	// Insert rows directly so every filter dimension is controlled: two actors,
+	// three actions, two object types, both results, and a spread of timestamps.
+	seed := []struct {
+		action, objectType, actorID, actorUsername, result string
+		createdAt                                          int64
+	}{
+		{ActionLogin, "session", "u1", "Alice", ResultSuccess, now - 900},
+		{ActionUserCreate, "user", "u1", "Alice", ResultSuccess, now - 800},
+		{ActionUserDisable, "user", "u2", "bob", ResultSuccess, now - 700},
+		{ActionPasswordChange, "user", "u2", "bob", ResultFailure, now - 600},
+		{ActionLogin, "session", "u2", "bob", ResultSuccess, now - 500},
+	}
+	for i, row := range seed {
+		if _, err := db.ExecContext(ctx, `INSERT INTO auth_audit(id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
+		 VALUES($1,$2,$3,$4,$5,$6,'obj',$7,'','req')`, fmt.Sprintf("audit-000000000000000%d", i), row.createdAt, row.actorID, row.actorUsername, row.action, row.objectType, row.result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := []struct {
+		name   string
+		filter AuditFilter
+		want   int
+	}{
+		{"action", AuditFilter{Action: ActionLogin}, 2},
+		{"object type", AuditFilter{ObjectType: "user"}, 3},
+		{"result", AuditFilter{Result: ResultFailure}, 1},
+		{"actor username is case-insensitive", AuditFilter{Actor: "alice"}, 2},
+		{"actor id", AuditFilter{Actor: "u2"}, 3},
+		{"time window", AuditFilter{From: now - 700, To: now - 500}, 3},
+		{"combined", AuditFilter{Action: ActionLogin, Actor: "bob"}, 1},
+		{"no match", AuditFilter{Action: ActionRoleChange}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, total, err := s.ListAudit(ctx, tc.filter, 100, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if total != tc.want || len(entries) != tc.want {
+				t.Fatalf("filter %+v: total=%d len=%d want=%d", tc.filter, total, len(entries), tc.want)
+			}
+			for _, entry := range entries {
+				if tc.filter.Action != "" && entry.Action != tc.filter.Action {
+					t.Fatalf("action filter leaked %q", entry.Action)
+				}
+				if tc.filter.Result != "" && entry.Result != tc.filter.Result {
+					t.Fatalf("result filter leaked %q", entry.Result)
+				}
+			}
+		})
+	}
+	// Filters are applied to the page window too, not just the total.
+	entries, total, err := s.ListAudit(ctx, AuditFilter{Actor: "bob"}, 2, 1)
+	if err != nil || total != 3 || len(entries) != 2 {
+		t.Fatalf("filtered page: total=%d len=%d err=%v", total, len(entries), err)
+	}
+	for _, bad := range []AuditFilter{
+		{Result: "maybe"},
+		{From: now, To: now - 10},
+		{Action: strings.Repeat("a", 129)},
+		{Action: "bad\nnewline"},
+	} {
+		if _, _, err = s.ListAudit(ctx, bad, 10, 0); !errors.Is(err, ErrValidation) {
+			t.Fatalf("filter %+v accepted: %v", bad, err)
+		}
+	}
+
+	purged, err := s.PurgeAudit(ctx, now-750)
+	if err != nil || purged != 2 {
+		t.Fatalf("purge = %d, %v", purged, err)
+	}
+	if _, total, err = s.ListAudit(ctx, AuditFilter{}, 100, 0); err != nil || total != 3 {
+		t.Fatalf("rows after purge: total=%d err=%v", total, err)
+	}
+	if _, err = s.PurgeAudit(ctx, 0); !errors.Is(err, ErrValidation) {
+		t.Fatalf("zero cutoff accepted: %v", err)
 	}
 }
 
