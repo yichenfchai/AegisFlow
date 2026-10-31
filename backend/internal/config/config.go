@@ -36,8 +36,9 @@ type Config struct {
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
-// docs/build-execution-design.md: "none" runs commands as the service account,
-// "user" a dedicated OS account and "container" a one-shot container per build.
+// the build execution design (maintained locally, not committed): "none" runs
+// commands as the service account, "user" a dedicated OS account and
+// "container" a one-shot container per build.
 type BuildSandbox string
 
 const (

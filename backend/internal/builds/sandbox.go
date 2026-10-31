@@ -14,8 +14,8 @@ import (
 	"time"
 )
 
-// SandboxMode mirrors the AEGIS_BUILD_SANDBOX switch from
-// docs/build-execution-design.md.
+// SandboxMode mirrors the AEGIS_BUILD_SANDBOX switch from the build execution
+// design (maintained locally, not committed).
 type SandboxMode string
 
 const (
