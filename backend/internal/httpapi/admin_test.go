@@ -248,6 +248,49 @@ func TestAdminUserManagementAndAudit(t *testing.T) {
 			t.Fatalf("audit missing action %s: %+v", action, actions)
 		}
 	}
+	// Server-side filters narrow both the page and the total; the query parser
+	// accepts RFC3339 and date-only boundaries.
+	filtered := func(query string) (int, []auth.AuditEntry) {
+		t.Helper()
+		resp := request(h, "GET", "/api/v1/audit?limit=100&offset=0&"+query, "", adminToken)
+		if resp.Code != 200 {
+			t.Fatalf("audit filter %q: %d %s", query, resp.Code, resp.Body.String())
+		}
+		var payload struct {
+			Data struct {
+				Items []auth.AuditEntry `json:"items"`
+				Total int               `json:"total"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload.Data.Total, payload.Data.Items
+	}
+	if total, items := filtered("action=" + auth.ActionUserCreate); total == 0 || len(items) == 0 {
+		t.Fatalf("action filter returned nothing: total=%d", total)
+	} else {
+		for _, entry := range items {
+			if entry.Action != auth.ActionUserCreate {
+				t.Fatalf("action filter leaked %q", entry.Action)
+			}
+		}
+	}
+	if total, _ := filtered("result=failure"); total != 0 {
+		t.Fatalf("failure filter expected no rows, got %d", total)
+	}
+	if total, _ := filtered("from=2000-01-01&to=2999-12-31"); total == 0 {
+		t.Fatalf("date range returned nothing")
+	}
+	if total, _ := filtered("from=2999-01-01"); total != 0 {
+		t.Fatalf("future range expected no rows, got %d", total)
+	}
+	if w = request(h, "GET", "/api/v1/audit?from=not-a-date", "", adminToken); w.Code != 400 || errorCode(t, w) != "invalid_request" {
+		t.Fatalf("bad from: %d %s", w.Code, w.Body.String())
+	}
+	if w = request(h, "GET", "/api/v1/audit?result=maybe", "", adminToken); w.Code != 400 {
+		t.Fatalf("bad result filter: %d %s", w.Code, w.Body.String())
+	}
 	// Role and disabled changes in one PATCH commit together.
 	if w = request(h, "PATCH", "/api/v1/users/"+memberID, `{"role":"viewer","disabled":true}`, adminToken); w.Code != 200 {
 		t.Fatalf("combined patch: %d %s", w.Code, w.Body.String())

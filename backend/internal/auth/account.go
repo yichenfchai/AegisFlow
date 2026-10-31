@@ -9,7 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -414,19 +417,88 @@ func (s *Service) ListUsersPage(ctx context.Context, limit, offset int) ([]User,
 	return users, total, rows.Err()
 }
 
-func (s *Service) ListAudit(ctx context.Context, limit, offset int) ([]AuditEntry, int, error) {
+// AuditFilter narrows an audit query. Zero values mean "no constraint"; Actor
+// matches the actor id or the username (case-insensitively). From and To are
+// inclusive Unix seconds, used by the admin audit page filters.
+type AuditFilter struct {
+	Action     string
+	ObjectType string
+	Result     string
+	Actor      string
+	From       int64
+	To         int64
+}
+
+func (f AuditFilter) validate() error {
+	for _, pair := range []struct{ name, value string }{
+		{"action", f.Action}, {"objectType", f.ObjectType}, {"actor", f.Actor},
+	} {
+		if len(pair.value) > 128 || !utf8.ValidString(pair.value) || strings.ContainsFunc(pair.value, unicode.IsControl) {
+			return fmt.Errorf("%w: %s must be a single line of at most 128 bytes", ErrValidation, pair.name)
+		}
+	}
+	if f.Result != "" && f.Result != ResultSuccess && f.Result != ResultFailure {
+		return fmt.Errorf("%w: result must be success or failure", ErrValidation)
+	}
+	if f.From < 0 || f.To < 0 || (f.From > 0 && f.To > 0 && f.From > f.To) {
+		return fmt.Errorf("%w: audit time range is invalid", ErrValidation)
+	}
+	return nil
+}
+
+func (f AuditFilter) where() (string, []any) {
+	var clauses []string
+	var args []any
+	if f.Action != "" {
+		args = append(args, f.Action)
+		clauses = append(clauses, fmt.Sprintf("action = $%d", len(args)))
+	}
+	if f.ObjectType != "" {
+		args = append(args, f.ObjectType)
+		clauses = append(clauses, fmt.Sprintf("object_type = $%d", len(args)))
+	}
+	if f.Result != "" {
+		args = append(args, f.Result)
+		clauses = append(clauses, fmt.Sprintf("result = $%d", len(args)))
+	}
+	if f.Actor != "" {
+		args = append(args, f.Actor)
+		clauses = append(clauses, fmt.Sprintf("(actor_id = $%d OR lower(actor_username) = lower($%d))", len(args), len(args)))
+	}
+	if f.From > 0 {
+		args = append(args, f.From)
+		clauses = append(clauses, fmt.Sprintf("created_at >= $%d", len(args)))
+	}
+	if f.To > 0 {
+		args = append(args, f.To)
+		clauses = append(clauses, fmt.Sprintf("created_at <= $%d", len(args)))
+	}
+	if len(clauses) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(clauses, " AND "), args
+}
+
+// ListAudit returns one page of the audit trail, newest first. Filters are
+// applied to both the page query and the total so pagination stays consistent.
+func (s *Service) ListAudit(ctx context.Context, filter AuditFilter, limit, offset int) ([]AuditEntry, int, error) {
 	if err := s.valid(); err != nil {
 		return nil, 0, err
 	}
 	if err := PageBounds(limit, offset); err != nil {
 		return nil, 0, err
 	}
-	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM auth_audit`).Scan(&total); err != nil {
+	if err := filter.validate(); err != nil {
 		return nil, 0, err
 	}
+	where, args := filter.where()
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM auth_audit`+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	pageArgs := append(append([]any{}, args...), limit, offset)
 	rows, err := s.db.QueryContext(ctx, `SELECT id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id
-	 FROM auth_audit ORDER BY created_at DESC,id DESC LIMIT $1 OFFSET $2`, limit, offset)
+	 FROM auth_audit`+where+fmt.Sprintf(` ORDER BY created_at DESC,id DESC LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2), pageArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -440,6 +512,23 @@ func (s *Service) ListAudit(ctx context.Context, limit, offset int) ([]AuditEntr
 		entries = append(entries, e)
 	}
 	return entries, total, rows.Err()
+}
+
+// PurgeAudit deletes audit rows older than the cutoff (inclusive Unix seconds)
+// and returns how many were removed. The cleanup job only calls this when the
+// operator configures AEGIS_AUDIT_RETENTION; zero disables deletion entirely.
+func (s *Service) PurgeAudit(ctx context.Context, before int64) (int64, error) {
+	if err := s.valid(); err != nil {
+		return 0, err
+	}
+	if before <= 0 {
+		return 0, fmt.Errorf("%w: audit purge needs a positive cutoff", ErrValidation)
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM auth_audit WHERE created_at < $1`, before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // CleanupExpired removes sessions past their absolute deadline together with
