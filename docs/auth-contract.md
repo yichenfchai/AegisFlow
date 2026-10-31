@@ -67,7 +67,7 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 ### 部署任务（P4.2）
 
-- 六个接口：`POST|GET /api/v1/projects/{projectId}/deployments`、`GET /api/v1/deployments/{id}`、`GET /api/v1/deployments/{id}/events?after&limit`、`POST /api/v1/deployments/{id}/cancel`、`POST /api/v1/deployments/{id}/rollback`；全部 admin-only，member/viewer 一律 403。
+- 接口：`POST|GET /api/v1/projects/{projectId}/deployments`（项目内列表/触发）、`GET /api/v1/deployments?projectId&status&limit&offset`（管理员全局列表，与构建列表同形）、`GET /api/v1/deployments/{id}`、`GET /api/v1/deployments/{id}/events?after&limit`、`POST /api/v1/deployments/{id}/cancel`、`POST /api/v1/deployments/{id}/rollback`；全部 admin-only，member/viewer 一律 403。
 - 协议：对目标执行 `POST <endpoint 去尾斜杠><deployPath>`（`deployPath` 默认 `/deploy`），JSON 体 `{deploymentId, project, version, environment, rollback, rollbackVersion}`；目标有凭据时携带 `Authorization: Bearer`，只在执行内存解密。2xx 记为成功；其他状态、超时（`AEGIS_DEPLOY_TIMEOUT`，默认 10m，最大 1h）与网络错误记为失败，detail 脱敏且不含凭据；不自动重试。
 - 状态：`queued → running → succeeded/failed/cancelled`，重启恢复把遗留 `running` 置 `interrupted`；命中审批环境时创建即 `awaiting_approval`（见 P4.3），审批通过后转 `queued`，拒绝/过期转 `rejected`。单 worker 持独立 advisory 租约，`SKIP LOCKED` 领取，300ms 看门狗在取消/终态时中止 HTTP 请求。
 - 回滚：仅对 `succeeded`/`failed` 的源部署可用，取同项目+目标中比源更早的最近一次 `succeeded` 版本，新建一条部署（`rollbackOf` 指向源，payload `rollback=true`、`rollbackVersion` 为该版本）；命中审批环境时同样先进入 `awaiting_approval`。无更早成功返回 400，源非终态 409；重复回滚会创建多条部署（部署非幂等）。
