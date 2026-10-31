@@ -44,6 +44,8 @@ tags:
     description: Project registry with global-role authorization
   - name: Builds
     description: Build pipeline (trigger, list, detail, logs, cancel)
+  - name: DeploymentTargets
+    description: Admin-only deployment targets with encrypted credentials and connectivity probes
   - name: Audit
     description: Persistent authentication and account-management audit trail
   - name: Health
@@ -1097,6 +1099,221 @@ paths:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/deployment-targets:
+    get:
+      tags: [DeploymentTargets]
+      operationId: listDeploymentTargets
+      summary: List deployment targets (admin only)
+      description: Ordered by name case-insensitively, then id. Deployment targets are global administrative objects; members and viewers get 403 on every route in this group.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: Deployment target page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/DeploymentTargetPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [DeploymentTargets]
+      operationId: createDeploymentTarget
+      summary: Create a deployment target (admin only)
+      description: |
+        kind defaults to http, environment to development, healthPath to / and
+        status to active. A supplied secret is sealed with AES-256-GCM (AAD
+        bound to the target id) and is never returned; hasSecret only reports
+        its presence. Supplying a secret without AEGIS_SECRET_KEY returns 400.
+        The create writes a deployment_target.create audit row in the same
+        transaction.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeploymentTargetInput' }
+      responses:
+        '201':
+          description: Deployment target created in the active state
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/DeploymentTarget' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Target name already exists case-insensitively; error.code is conflict
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/deployment-targets/{targetId}:
+    get:
+      tags: [DeploymentTargets]
+      operationId: getDeploymentTarget
+      summary: Get one deployment target (admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: targetId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Deployment target
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/DeploymentTarget' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      tags: [DeploymentTargets]
+      operationId: updateDeploymentTarget
+      summary: Update a deployment target (admin only)
+      description: |
+        At least one field is required. Omitted fields are unchanged. secret
+        has three states: omitted keeps the stored secret, an empty string
+        clears it, a non-empty value replaces it. Every accepted update writes
+        a deployment_target.update audit row in the same transaction.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: targetId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeploymentTargetPatch' }
+      responses:
+        '200':
+          description: Updated deployment target (or the unchanged target for a no-op patch)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/DeploymentTarget' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Renaming to an existing name; error.code is conflict
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [DeploymentTargets]
+      operationId: removeDeploymentTarget
+      summary: Delete a deployment target (admin only)
+      description: |
+        Hard delete for this slice: deploy tasks and approvals do not reference
+        targets yet. The delete writes a deployment_target.remove audit row in
+        the same transaction.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: targetId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Deployment target removed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [removed]
+                    properties:
+                      removed: { type: boolean, enum: [true] }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/deployment-targets/{targetId}/check:
+    post:
+      tags: [DeploymentTargets]
+      operationId: checkDeploymentTarget
+      summary: Probe connectivity (admin only)
+      description: |
+        Sends GET endpoint + healthPath with a bounded timeout
+        (AEGIS_DEPLOY_CHECK_TIMEOUT, default 5s, max 1m). A stored secret is
+        decrypted for this request only and sent as Authorization: Bearer. 2xx
+        is healthy; any other outcome records lastCheckAt/lastCheckOk/
+        lastCheckDetail and writes a deployment_target.check audit row in the
+        same transaction. The response never contains the secret.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: targetId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200':
+          description: Probe outcome (ok=true for a 2xx response)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/DeploymentTargetCheck' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
 components:
   securitySchemes:
     bearerAuth:
@@ -1386,6 +1603,68 @@ components:
         total: { type: integer, minimum: 0 }
         limit: { type: integer, minimum: 1, maximum: 100 }
         offset: { type: integer, minimum: 0 }
+    DeploymentTarget:
+      type: object
+      additionalProperties: false
+      required: [id, name, kind, environment, endpoint, healthPath, hasSecret, status, createdBy, createdAt, updatedAt, lastCheckAt, lastCheckOk, lastCheckDetail]
+      properties:
+        id: { type: string }
+        name: { type: string, description: Unique case-insensitively; 3-64 bytes on one line }
+        kind: { type: string, enum: [http] }
+        environment: { type: string, enum: [development, staging, production] }
+        endpoint: { type: string, format: uri, description: http(s) URL without userinfo, query or fragment }
+        healthPath: { type: string, description: Appended to endpoint for the probe; starts with / }
+        hasSecret: { type: boolean, description: Whether a sealed credential is stored; the secret itself is never returned }
+        status: { type: string, enum: [active, disabled] }
+        createdBy: { type: string, description: Actor id snapshot }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+        updatedAt: { type: integer, format: int64, description: Unix seconds }
+        lastCheckAt: { type: integer, format: int64, description: Unix seconds of the last probe; 0 means never probed }
+        lastCheckOk: { type: boolean }
+        lastCheckDetail: { type: string, description: "ok, http <code>, timeout or a sanitized network error" }
+    DeploymentTargetInput:
+      type: object
+      additionalProperties: false
+      required: [name, endpoint]
+      properties:
+        name: { type: string, minLength: 3, maxLength: 64 }
+        kind: { type: string, enum: [http], default: http }
+        environment: { type: string, enum: [development, staging, production], default: development }
+        endpoint: { type: string, format: uri, description: http(s) URL without userinfo, query or fragment }
+        healthPath: { type: string, default: '/', maxLength: 256 }
+        secret: { type: string, writeOnly: true, maxLength: 4096, description: Sent as Authorization Bearer for probes; sealed at rest and never returned }
+        status: { type: string, enum: [active, disabled], default: active }
+    DeploymentTargetPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 3, maxLength: 64 }
+        environment: { type: string, enum: [development, staging, production] }
+        endpoint: { type: string, format: uri, description: http(s) URL without userinfo, query or fragment }
+        healthPath: { type: string, maxLength: 256 }
+        secret: { type: string, writeOnly: true, maxLength: 4096, description: Omit to keep, empty string to clear, non-empty to replace }
+        status: { type: string, enum: [active, disabled] }
+    DeploymentTargetCheck:
+      type: object
+      additionalProperties: false
+      required: [ok, statusCode, latencyMs, detail, checkedAt]
+      properties:
+        ok: { type: boolean }
+        statusCode: { type: integer, minimum: 0, description: 0 when no HTTP response was received }
+        latencyMs: { type: integer, format: int64, minimum: 0 }
+        detail: { type: string, description: "ok, http <code>, timeout or a sanitized network error; never the secret" }
+        checkedAt: { type: integer, format: int64, description: Unix seconds }
+    DeploymentTargetPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DeploymentTarget' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
     AuditEntry:
       type: object
       additionalProperties: false
@@ -1395,8 +1674,8 @@ components:
         createdAt: { type: integer, format: int64, description: Unix seconds }
         actorId: { type: string, description: Empty for system rows }
         actorUsername: { type: string }
-        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry] }
-        objectType: { type: string, enum: [user, session, project, build] }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check] }
+        objectType: { type: string, enum: [user, session, project, build, deployment_target] }
         objectId: { type: string }
         result: { type: string, enum: [success, failure] }
         detail: { type: string, description: Safe context such as role transitions or revoked counts; never secrets }
