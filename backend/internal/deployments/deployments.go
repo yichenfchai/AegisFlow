@@ -73,7 +73,12 @@ type Options struct {
 	CheckTimeout time.Duration
 	// DeployTimeout bounds one deployment execution; zero means 10m.
 	DeployTimeout time.Duration
-	HTTPClient    *http.Client
+	// ApprovalEnvironments lists target environments that require approval.
+	// Nil means ["production"]; an explicitly empty slice disables approvals.
+	ApprovalEnvironments []string
+	// ApprovalTTL bounds a pending approval; zero means 24h.
+	ApprovalTTL time.Duration
+	HTTPClient  *http.Client
 }
 
 // Target is the public view of a deployment target. Secret material is never
@@ -136,6 +141,10 @@ type Service struct {
 	checkTimeout  time.Duration
 	deployTimeout time.Duration
 	httpClient    *http.Client
+	// approvalEnvironments is the set of target environments that need a
+	// pending approval before the worker may claim the deployment.
+	approvalEnvironments map[string]bool
+	approvalTTL          time.Duration
 	// notify wakes the worker after a deployment is enqueued; buffered so the
 	// request path never blocks.
 	notify chan struct{}
@@ -159,14 +168,28 @@ func New(db *sql.DB, opts Options) *Service {
 	if client == nil {
 		client = defaultHTTPClient()
 	}
+	environments := opts.ApprovalEnvironments
+	if environments == nil {
+		environments = []string{EnvironmentProduction}
+	}
+	approvalSet := make(map[string]bool, len(environments))
+	for _, environment := range environments {
+		approvalSet[environment] = true
+	}
+	approvalTTL := opts.ApprovalTTL
+	if approvalTTL <= 0 {
+		approvalTTL = defaultApprovalTTL
+	}
 	return &Service{
-		db:            db,
-		secretKey:     append([]byte(nil), opts.SecretKey...),
-		checkTimeout:  timeout,
-		deployTimeout: deployTimeout,
-		httpClient:    client,
-		notify:        make(chan struct{}, 1),
-		leaseRetry:    defaultLeaseRetry,
+		db:                   db,
+		secretKey:            append([]byte(nil), opts.SecretKey...),
+		checkTimeout:         timeout,
+		deployTimeout:        deployTimeout,
+		httpClient:           client,
+		approvalEnvironments: approvalSet,
+		approvalTTL:          approvalTTL,
+		notify:               make(chan struct{}, 1),
+		leaseRetry:           defaultLeaseRetry,
 	}
 }
 

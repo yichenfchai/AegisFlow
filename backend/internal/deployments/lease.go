@@ -112,5 +112,5 @@ func (s *Service) runAsLeaseHolder(ctx context.Context, lease *WorkerLease, logg
 	if recovered > 0 {
 		logger.Info("interrupted deployments recovered", "count", recovered)
 	}
-	s.run(ctx)
+	s.run(ctx, logger)
 }

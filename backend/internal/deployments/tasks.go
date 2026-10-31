@@ -171,8 +171,7 @@ func (s *Service) CreateDeployment(ctx context.Context, actor auth.Actor, projec
 	if err = validateSecretTransport(target.Endpoint, target.HasSecret); err != nil {
 		return Deployment{}, err
 	}
-	deployment, err := s.enqueueDeployment(ctx, tx, actor, projectID, target, input.Version, input.BuildID, "",
-		ActionDeployCreate, fmt.Sprintf("target=%s version=%s approval=none", target.Name, input.Version))
+	deployment, err := s.enqueueDeployment(ctx, tx, actor, projectID, target, input.Version, input.BuildID, "", ActionDeployCreate)
 	if err != nil {
 		return Deployment{}, err
 	}
@@ -183,11 +182,15 @@ func (s *Service) CreateDeployment(ctx context.Context, actor auth.Actor, projec
 	return deployment, nil
 }
 
-// enqueueDeployment inserts a queued deployment inside the caller's transaction
-// and writes its audit row there. The project row is locked so concurrent
-// enqueues allocate distinct deployment numbers.
+// enqueueDeployment inserts a deployment inside the caller's transaction and
+// writes its audit row there. The project row is locked so concurrent enqueues
+// allocate distinct deployment numbers. When the target environment requires
+// approval, the row starts awaiting_approval, a pending approval is created in
+// the same transaction, approval_id is set, and both the deployment action and
+// approval.request are audited. Detail follows design §8: create records
+// approval=required|none, rollback records the source and version.
 func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.Actor, projectID string, target targetSnapshot,
-	version, buildID, rollbackOf, action, detail string) (Deployment, error) {
+	version, buildID, rollbackOf, action string) (Deployment, error) {
 	var count int64
 	err := tx.QueryRowContext(ctx, `SELECT deploy_count FROM projects WHERE id=$1 FOR UPDATE`, projectID).Scan(&count)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -206,6 +209,15 @@ func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.
 			return Deployment{}, err
 		}
 	}
+	approvalRequired := s.requiresApproval(target.Environment)
+	approvalID := ""
+	status := DeployQueued
+	if approvalRequired {
+		if approvalID, err = newID(); err != nil {
+			return Deployment{}, err
+		}
+		status = DeployAwaitingApproval
+	}
 	id, err := newID()
 	if err != nil {
 		return Deployment{}, err
@@ -214,20 +226,42 @@ func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.
 	deployment := Deployment{
 		ID: id, ProjectID: projectID, TargetID: target.ID, TargetName: target.Name,
 		TargetEndpoint: target.Endpoint, TargetEnvironment: target.Environment, DeploymentNumber: count + 1,
-		Status: DeployQueued, Version: version, BuildID: buildID, RollbackOf: rollbackOf, TriggeredBy: actor.ID,
-		CreatedAt: now,
+		Status: status, Version: version, BuildID: buildID, RollbackOf: rollbackOf, ApprovalID: approvalID,
+		TriggeredBy: actor.ID, CreatedAt: now,
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO deployments(id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,build_id,rollback_of,approval_id,triggered_by,detail,created_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'',$12,'',$13)`,
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'',$14)`,
 		deployment.ID, projectID, deployment.TargetID, deployment.TargetName, deployment.TargetEndpoint, deployment.TargetEnvironment,
-		deployment.DeploymentNumber, DeployQueued, version, buildID, rollbackOf, actor.ID, now); err != nil {
+		deployment.DeploymentNumber, status, version, buildID, rollbackOf, approvalID, actor.ID, now); err != nil {
 		return Deployment{}, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE projects SET deploy_count=$2 WHERE id=$1`, projectID, deployment.DeploymentNumber); err != nil {
 		return Deployment{}, err
 	}
+	detail := ""
+	switch action {
+	case ActionDeployCreate:
+		approvalWord := "none"
+		if approvalRequired {
+			approvalWord = "required"
+		}
+		detail = fmt.Sprintf("target=%s version=%s approval=%s", target.Name, version, approvalWord)
+	case ActionDeployRollback:
+		detail = fmt.Sprintf("rollback_of=%s version=%s", rollbackOf, version)
+	}
 	if err = writeAuditObject(ctx, tx, actor, action, "deployment", deployment.ID, detail); err != nil {
 		return Deployment{}, err
+	}
+	if approvalRequired {
+		expiresAt := now + int64(s.approvalTTL/time.Second)
+		if _, err = tx.ExecContext(ctx, `INSERT INTO approvals(id,deployment_id,project_id,status,requested_by,decided_by,reason,created_at,expires_at,decided_at)
+		 VALUES($1,$2,$3,'pending',$4,'','',$5,$6,0)`,
+			approvalID, deployment.ID, projectID, actor.ID, now, expiresAt); err != nil {
+			return Deployment{}, err
+		}
+		if err = writeAuditObject(ctx, tx, actor, ActionApprovalRequest, "approval", approvalID, "deployment="+deployment.ID); err != nil {
+			return Deployment{}, err
+		}
 	}
 	return deployment, nil
 }
@@ -284,8 +318,12 @@ func (s *Service) ListDeployments(ctx context.Context, actor auth.Actor, project
 }
 
 // CancelDeployment moves a queued, awaiting-approval or running deployment to
-// cancelled. Repeating on an already-cancelled deployment is idempotent and
-// writes no second audit row; a terminal deployment is a conflict.
+// cancelled. Cancelling an awaiting deployment also closes its pending approval
+// as expired with reason "deployment cancelled" (the approval state machine has
+// no cancelled state). The approval row is locked before the deployment, the
+// same order approve/reject/expire use. Repeating on an already-cancelled
+// deployment is idempotent and writes no second audit row; any other terminal
+// deployment is a conflict.
 func (s *Service) CancelDeployment(ctx context.Context, actor auth.Actor, id string) (Deployment, error) {
 	if !auth.ValidID(id) {
 		return Deployment{}, fmt.Errorf("%w: invalid deployment id", ErrValidation)
@@ -295,16 +333,55 @@ func (s *Service) CancelDeployment(ctx context.Context, actor auth.Actor, id str
 		return Deployment{}, err
 	}
 	defer tx.Rollback()
-	current, err := scanDeployment(tx.QueryRowContext(ctx, `SELECT `+deploymentColumns+` FROM deployments WHERE id=$1 FOR UPDATE`, id))
+	// approval_id never changes after creation, so it can be read without the
+	// deployment lock; taking the approval lock first keeps the lock order
+	// consistent with approve/reject/expire.
+	var approvalID string
+	err = tx.QueryRowContext(ctx, `SELECT approval_id FROM deployments WHERE id=$1`, id).Scan(&approvalID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, ErrNotFound
 	}
 	if err != nil {
 		return Deployment{}, err
 	}
-	switch current.Status {
-	case DeployCancelled:
+	var approval *Approval
+	if approvalID != "" {
+		locked, lockErr := lockApproval(ctx, tx, approvalID)
+		if lockErr != nil && !errors.Is(lockErr, ErrNotFound) {
+			return Deployment{}, lockErr
+		}
+		if lockErr == nil {
+			approval = &locked
+		}
+	}
+	current, err := lockDeployment(ctx, tx, id)
+	if err != nil {
+		return Deployment{}, err
+	}
+	closePendingApproval := func() error {
+		if approval == nil || approval.Status != ApprovalPending {
+			return nil
+		}
+		now := time.Now().Unix()
+		if _, err := tx.ExecContext(ctx, `UPDATE approvals SET status=$2,reason=$3,decided_at=$4 WHERE id=$1`,
+			approval.ID, ApprovalExpired, "deployment cancelled", now); err != nil {
+			return err
+		}
+		return writeAuditObject(ctx, tx, actor, ActionApprovalExpire, "approval", approval.ID,
+			"deployment="+current.ID+" reason=deployment cancelled")
+	}
+	if current.Status == DeployCancelled {
+		if err := closePendingApproval(); err != nil {
+			return Deployment{}, err
+		}
+		if approval != nil && approval.Status == ApprovalPending {
+			if err := tx.Commit(); err != nil {
+				return Deployment{}, err
+			}
+		}
 		return current, nil
+	}
+	switch current.Status {
 	case DeployQueued, DeployAwaitingApproval, DeployRunning:
 	default:
 		return Deployment{}, fmt.Errorf("%w: only queued, awaiting-approval or running deployments can be cancelled", ErrConflict)
@@ -315,6 +392,9 @@ func (s *Service) CancelDeployment(ctx context.Context, actor auth.Actor, id str
 		return Deployment{}, err
 	}
 	if err = writeAuditObject(ctx, tx, actor, ActionDeployCancel, "deployment", id, "from="+current.Status); err != nil {
+		return Deployment{}, err
+	}
+	if err = closePendingApproval(); err != nil {
 		return Deployment{}, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -364,8 +444,7 @@ func (s *Service) RollbackDeployment(ctx context.Context, actor auth.Actor, id s
 	if err = validateSecretTransport(target.Endpoint, target.HasSecret); err != nil {
 		return Deployment{}, err
 	}
-	deployment, err := s.enqueueDeployment(ctx, tx, actor, source.ProjectID, target, version, "", source.ID,
-		ActionDeployRollback, fmt.Sprintf("rollback_of=%s version=%s", source.ID, version))
+	deployment, err := s.enqueueDeployment(ctx, tx, actor, source.ProjectID, target, version, "", source.ID, ActionDeployRollback)
 	if err != nil {
 		return Deployment{}, err
 	}

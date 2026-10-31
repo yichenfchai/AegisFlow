@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -38,16 +39,23 @@ type executionTarget struct {
 
 // run is the in-process worker loop: it waits for a wake signal (or a slow
 // poll), claims the oldest queued deployment with FOR UPDATE SKIP LOCKED and
-// executes it. Only the lease holder may call it (see RunWorker).
-func (s *Service) run(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+// executes it. The lease holder also expires overdue approvals every 30s (and
+// once at takeover); that scan shares this loop, so it can never outlive the
+// lease. Only the lease holder may call it (see RunWorker).
+func (s *Service) run(ctx context.Context, logger *slog.Logger) {
+	claimTicker := time.NewTicker(2 * time.Second)
+	defer claimTicker.Stop()
+	approvalTicker := time.NewTicker(defaultApprovalScanInterval)
+	defer approvalTicker.Stop()
+	s.expireApprovals(ctx, logger)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-s.notify:
-		case <-ticker.C:
+		case <-claimTicker.C:
+		case <-approvalTicker.C:
+			s.expireApprovals(ctx, logger)
 		}
 		for {
 			deployment, err := s.claimNext(ctx)
@@ -62,6 +70,20 @@ func (s *Service) run(ctx context.Context) {
 			}
 			s.execute(ctx, deployment)
 		}
+	}
+}
+
+// expireApprovals runs one bounded expiry scan and logs a non-zero count.
+func (s *Service) expireApprovals(ctx context.Context, logger *slog.Logger) {
+	expired, err := s.ExpireApprovals(ctx, time.Now().Unix())
+	if err != nil {
+		if ctx.Err() == nil {
+			logger.Error("approval expiry scan failed", "error", err)
+		}
+		return
+	}
+	if expired > 0 {
+		logger.Info("expired approvals", "count", expired)
 	}
 }
 

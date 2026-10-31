@@ -141,9 +141,9 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	buildRoutes.GET("/:id/events", s.streamBuildEvents)
 	buildRoutes.POST("/:id/cancel", s.requireRole("admin", "member"), s.cancelBuild)
 	buildRoutes.POST("/:id/retry", s.requireRole("admin", "member"), s.retryBuild)
-	// Deployment targets and deploy tasks are global administrative objects:
-	// manage, probe, execute and roll back is admin-only. Approvals arrive with
-	// P4.3.
+	// Deployment targets, deploy tasks and approvals are global administrative
+	// objects: manage, probe, execute, roll back and decide approvals is
+	// admin-only.
 	deploymentTargets := api.Group("/deployment-targets", s.authenticate(), s.requireAdmin())
 	deploymentTargets.GET("", s.listDeploymentTargets)
 	deploymentTargets.POST("", s.createDeploymentTarget)
@@ -156,6 +156,10 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	deployRoutes.GET("/:id/events", s.getDeploymentEvents)
 	deployRoutes.POST("/:id/cancel", s.cancelDeployment)
 	deployRoutes.POST("/:id/rollback", s.rollbackDeployment)
+	approvalRoutes := api.Group("/approvals", s.authenticate(), s.requireAdmin())
+	approvalRoutes.GET("", s.listApprovals)
+	approvalRoutes.POST("/:id/approve", s.approveApproval)
+	approvalRoutes.POST("/:id/reject", s.rejectApproval)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }
@@ -1031,9 +1035,9 @@ func (s *Server) checkDeploymentTarget(c *gin.Context) {
 func (s *Server) deploymentError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, deployments.ErrValidation):
-		s.fail(c, 400, "validation_failed", "project, target, version or buildId is invalid, the target is disabled, or no earlier succeeded version can be rolled back to")
+		s.fail(c, 400, "validation_failed", "project, target, version, buildId or approval reason is invalid, the target is disabled, no earlier succeeded version can be rolled back to, or the request is not acceptable")
 	case errors.Is(err, deployments.ErrConflict):
-		s.fail(c, 409, "conflict", "deployment is already terminal, or only succeeded/failed deployments can be rolled back")
+		s.fail(c, 409, "conflict", "deployment or approval is already terminal, is not in the expected state for this operation, or the deployment is no longer awaiting approval")
 	case errors.Is(err, deployments.ErrNotFound):
 		s.fail(c, 404, "not_found", "resource not found")
 	default:
@@ -1156,6 +1160,58 @@ func (s *Server) rollbackDeployment(c *gin.Context) {
 		return
 	}
 	s.respond(c, 201, deployment)
+}
+
+func (s *Server) listApprovals(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	limit, offset, ok := s.page(c)
+	if !ok {
+		return
+	}
+	list, total, err := s.deployments.ListApprovals(c.Request.Context(), actorFrom(c), c.Query("status"), limit, offset)
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": list, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *Server) approveApproval(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	if !s.decode(c, &struct{}{}) {
+		return
+	}
+	approval, err := s.deployments.Approve(c.Request.Context(), actorFrom(c), c.Param("id"))
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, approval)
+}
+
+func (s *Server) rejectApproval(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	var input struct {
+		Reason string `json:"reason"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	approval, err := s.deployments.Reject(c.Request.Context(), actorFrom(c), c.Param("id"), input.Reason)
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, approval)
 }
 
 func (s *Server) changePassword(c *gin.Context) {
