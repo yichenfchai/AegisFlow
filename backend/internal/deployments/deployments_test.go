@@ -84,6 +84,9 @@ func TestCreateValidationAndDefaults(t *testing.T) {
 		{Name: "fragment", Endpoint: "https://example.com/api#frag"},
 		{Name: "healthPath", Endpoint: "https://example.com", HealthPath: "health"},
 		{Name: "healthPath-space", Endpoint: "https://example.com", HealthPath: "/a b"},
+		{Name: "deployPath", Endpoint: "https://example.com", DeployPath: "deploy"},
+		{Name: "deployPath-space", Endpoint: "https://example.com", DeployPath: "/a b"},
+		{Name: "deployPath-long", Endpoint: "https://example.com", DeployPath: "/" + strings.Repeat("p", 256)},
 		{Name: "status", Endpoint: "https://example.com", Status: "paused"},
 		{Name: "secret-too-long", Endpoint: "https://example.com", Secret: strings.Repeat("s", 4097)},
 		{Name: "secret-multiline", Endpoint: "https://example.com", Secret: "line1\nline2"},
@@ -99,7 +102,7 @@ func TestCreateValidationAndDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if target.Kind != KindHTTP || target.Environment != EnvironmentDevelopment || target.HealthPath != "/" ||
-		target.Status != StatusActive || target.HasSecret || target.CreatedBy != testActor.ID || target.CreatedAt == 0 || target.UpdatedAt == 0 {
+		target.DeployPath != defaultDeployPath || target.Status != StatusActive || target.HasSecret || target.CreatedBy != testActor.ID || target.CreatedAt == 0 || target.UpdatedAt == 0 {
 		t.Fatalf("unexpected defaults: %+v", target)
 	}
 	if target.LastCheckAt != 0 || target.LastCheckOK || target.LastCheckDetail != "" {
@@ -138,14 +141,18 @@ func TestUpdateAndRemove(t *testing.T) {
 		Environment: str(EnvironmentStaging),
 		Endpoint:    str("https://staging.example.com/base"),
 		HealthPath:  str("/healthz"),
+		DeployPath:  str("/rollout"),
 		Status:      str(StatusDisabled),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if updated.Name != "web-staging" || updated.Environment != EnvironmentStaging || updated.Endpoint != "https://staging.example.com/base" ||
-		updated.HealthPath != "/healthz" || updated.Status != StatusDisabled || updated.UpdatedAt < target.UpdatedAt {
+		updated.HealthPath != "/healthz" || updated.DeployPath != "/rollout" || updated.Status != StatusDisabled || updated.UpdatedAt < target.UpdatedAt {
 		t.Fatalf("updated target = %+v", updated)
+	}
+	if _, err = s.Update(ctx, testActor, target.ID, Patch{DeployPath: str("rollout")}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("invalid deployPath error = %v", err)
 	}
 	if _, err = s.Update(ctx, testActor, target.ID, Patch{Name: str("x")}); !errors.Is(err, ErrValidation) {
 		t.Fatalf("invalid merged name error = %v", err)

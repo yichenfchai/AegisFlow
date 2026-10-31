@@ -80,6 +80,9 @@ func TestOpenAPIContractReferencesAndRoutes(t *testing.T) {
 		{"/api/v1/deployment-targets", "get"}, {"/api/v1/deployment-targets", "post"},
 		{"/api/v1/deployment-targets/{targetId}", "get"}, {"/api/v1/deployment-targets/{targetId}", "patch"},
 		{"/api/v1/deployment-targets/{targetId}", "delete"}, {"/api/v1/deployment-targets/{targetId}/check", "post"},
+		{"/api/v1/projects/{projectId}/deployments", "get"}, {"/api/v1/projects/{projectId}/deployments", "post"},
+		{"/api/v1/deployments/{deploymentId}", "get"}, {"/api/v1/deployments/{deploymentId}/events", "get"},
+		{"/api/v1/deployments/{deploymentId}/cancel", "post"}, {"/api/v1/deployments/{deploymentId}/rollback", "post"},
 	} {
 		item, ok := paths[route.path].(map[string]any)
 		if !ok || item[route.method] == nil {

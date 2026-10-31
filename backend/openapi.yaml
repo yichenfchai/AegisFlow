@@ -46,6 +46,8 @@ tags:
     description: Build pipeline (trigger, list, detail, logs, cancel)
   - name: DeploymentTargets
     description: Admin-only deployment targets with encrypted credentials and connectivity probes
+  - name: Deployments
+    description: Admin-only deployment tasks, lifecycle events, cancellation and rollback
   - name: Audit
     description: Persistent authentication and account-management audit trail
   - name: Health
@@ -1131,12 +1133,12 @@ paths:
       operationId: createDeploymentTarget
       summary: Create a deployment target (admin only)
       description: |
-        kind defaults to http, environment to development, healthPath to / and
-        status to active. A supplied secret is sealed with AES-256-GCM (AAD
-        bound to the target id) and is never returned; hasSecret only reports
-        its presence. Supplying a secret without AEGIS_SECRET_KEY returns 400.
-        The create writes a deployment_target.create audit row in the same
-        transaction.
+        kind defaults to http, environment to development, healthPath to /,
+        deployPath to /deploy and status to active. A supplied secret is sealed
+        with AES-256-GCM (AAD bound to the target id) and is never returned;
+        hasSecret only reports its presence. Supplying a secret without
+        AEGIS_SECRET_KEY returns 400. The create writes a
+        deployment_target.create audit row in the same transaction.
       security:
         - bearerAuth: []
       requestBody:
@@ -1244,9 +1246,9 @@ paths:
       operationId: removeDeploymentTarget
       summary: Delete a deployment target (admin only)
       description: |
-        Hard delete for this slice: deploy tasks and approvals do not reference
-        targets yet. The delete writes a deployment_target.remove audit row in
-        the same transaction.
+        Hard delete. A target referenced by deployment history returns 409 so
+        the recorded snapshots stay explainable. The delete writes a
+        deployment_target.remove audit row in the same transaction.
       security:
         - bearerAuth: []
       parameters:
@@ -1312,6 +1314,232 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/projects/{projectId}/deployments:
+    get:
+      tags: [Deployments]
+      operationId: listProjectDeployments
+      summary: List a project's deployments (admin only)
+      description: Newest first. Every deployment endpoint is admin-only; the project path only scopes the list.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: status
+          in: query
+          required: false
+          description: Filter by deployment status; omit for all
+          schema: { type: string, enum: [queued, awaiting_approval, running, succeeded, failed, cancelled, interrupted, rejected] }
+      responses:
+        '200':
+          description: Deployment page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/DeploymentPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Deployments]
+      operationId: createDeployment
+      summary: Enqueue a deployment (admin only)
+      description: |
+        The target must exist and be active; its name, endpoint and environment
+        are snapshotted into the new deployment. version is a tag, SHA or
+        semantic version (1-64 chars of A-Z a-z 0-9 . _ + -). buildId is
+        optional and must reference a succeeded build of the same project.
+        deploymentNumber is allocated per project under the project row lock.
+        The deployment starts queued; a single leased worker executes it.
+        deployment.create is audited in the same transaction. Approvals arrive
+        with P4.3; this slice always enqueues directly.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateDeploymentInput' }
+      responses:
+        '201':
+          description: Deployment enqueued in the queued state
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Deployment' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/deployments/{deploymentId}:
+    get:
+      tags: [Deployments]
+      operationId: getDeployment
+      summary: Get one deployment (admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: deploymentId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Deployment with target snapshot and terminal detail
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Deployment' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/deployments/{deploymentId}/events:
+    get:
+      tags: [Deployments]
+      operationId: listDeploymentEvents
+      summary: Read deployment events by cursor (admin only)
+      description: Oldest first. after is the exclusive event id (the same cursor the SSE-style readers use); limit is 1-1000 and defaults to 200.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: deploymentId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - name: after
+          in: query
+          required: false
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+      responses:
+        '200':
+          description: Deployment events after the cursor
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/DeploymentEventPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/deployments/{deploymentId}/cancel:
+    post:
+      tags: [Deployments]
+      operationId: cancelDeployment
+      summary: Cancel a queued, awaiting-approval or running deployment (admin only)
+      description: |
+        Cancelling a running deployment aborts the in-flight HTTP request via a
+        300ms status watchdog. Repeating on an already-cancelled deployment is
+        idempotent and writes no second audit row; terminal deployments are 409.
+        deployment.cancel is audited in the same transaction.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: deploymentId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200':
+          description: Cancelled (or already cancelled) deployment
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Deployment' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/deployments/{deploymentId}/rollback:
+    post:
+      tags: [Deployments]
+      operationId: rollbackDeployment
+      summary: Roll back to the most recent earlier succeeded version (admin only)
+      description: |
+        The source must be succeeded or failed (409 otherwise), and an earlier
+        succeeded deployment for the same project and target must exist (400
+        otherwise). A new queued deployment is created with rollbackOf set to
+        the source id and version set to the version being restored; the source
+        row is unchanged. Repeated rollbacks create multiple rows: deployment is
+        not idempotent, and the audit trail records each attempt.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: deploymentId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RollbackDeploymentInput' }
+      responses:
+        '201':
+          description: Rollback deployment enqueued
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Deployment' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
 components:
@@ -1606,7 +1834,7 @@ components:
     DeploymentTarget:
       type: object
       additionalProperties: false
-      required: [id, name, kind, environment, endpoint, healthPath, hasSecret, status, createdBy, createdAt, updatedAt, lastCheckAt, lastCheckOk, lastCheckDetail]
+      required: [id, name, kind, environment, endpoint, healthPath, deployPath, hasSecret, status, createdBy, createdAt, updatedAt, lastCheckAt, lastCheckOk, lastCheckDetail]
       properties:
         id: { type: string }
         name: { type: string, description: Unique case-insensitively; 3-64 bytes on one line }
@@ -1614,6 +1842,7 @@ components:
         environment: { type: string, enum: [development, staging, production] }
         endpoint: { type: string, format: uri, description: http(s) URL without userinfo, query or fragment }
         healthPath: { type: string, description: Appended to endpoint for the probe; starts with / }
+        deployPath: { type: string, description: Appended to endpoint for the deploy POST; starts with /, default /deploy }
         hasSecret: { type: boolean, description: Whether a sealed credential is stored; the secret itself is never returned }
         status: { type: string, enum: [active, disabled] }
         createdBy: { type: string, description: Actor id snapshot }
@@ -1632,7 +1861,8 @@ components:
         environment: { type: string, enum: [development, staging, production], default: development }
         endpoint: { type: string, format: uri, description: http(s) URL without userinfo, query or fragment }
         healthPath: { type: string, default: '/', maxLength: 256 }
-        secret: { type: string, writeOnly: true, maxLength: 4096, description: Sent as Authorization Bearer for probes; sealed at rest and never returned }
+        deployPath: { type: string, default: '/deploy', maxLength: 256 }
+        secret: { type: string, writeOnly: true, maxLength: 4096, description: Sent as Authorization Bearer for probes and deploys; sealed at rest and never returned }
         status: { type: string, enum: [active, disabled], default: active }
     DeploymentTargetPatch:
       type: object
@@ -1642,6 +1872,7 @@ components:
         environment: { type: string, enum: [development, staging, production] }
         endpoint: { type: string, format: uri, description: http(s) URL without userinfo, query or fragment }
         healthPath: { type: string, maxLength: 256 }
+        deployPath: { type: string, maxLength: 256 }
         secret: { type: string, writeOnly: true, maxLength: 4096, description: Omit to keep, empty string to clear, non-empty to replace }
         status: { type: string, enum: [active, disabled] }
     DeploymentTargetCheck:
@@ -1665,6 +1896,70 @@ components:
         total: { type: integer, minimum: 0 }
         limit: { type: integer, minimum: 1, maximum: 100 }
         offset: { type: integer, minimum: 0 }
+    Deployment:
+      type: object
+      additionalProperties: false
+      required: [id, projectId, targetId, targetName, targetEndpoint, targetEnvironment, deploymentNumber, status, version, buildId, rollbackOf, approvalId, triggeredBy, detail, createdAt, startedAt, finishedAt]
+      properties:
+        id: { type: string }
+        projectId: { type: string }
+        targetId: { type: string }
+        targetName: { type: string, description: Target name snapshot at trigger time }
+        targetEndpoint: { type: string, description: Target endpoint snapshot at trigger time }
+        targetEnvironment: { type: string, description: Target environment snapshot at trigger time }
+        deploymentNumber: { type: integer, format: int64, minimum: 1, description: Per-project monotonic sequence }
+        status: { type: string, enum: [queued, awaiting_approval, running, succeeded, failed, cancelled, interrupted, rejected], description: awaiting_approval and rejected are reserved for P4.3 }
+        version: { type: string }
+        buildId: { type: string, description: Optional succeeded build snapshot; empty when not linked }
+        rollbackOf: { type: string, description: Source deployment id when this is a rollback; empty otherwise }
+        approvalId: { type: string, description: Empty until P4.3 links an approval }
+        triggeredBy: { type: string, description: Actor id snapshot }
+        detail: { type: string, description: "Terminal outcome such as http <code>, timeout or a sanitized network error; never a secret" }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+        startedAt: { type: integer, format: int64, description: Unix seconds; 0 while queued }
+        finishedAt: { type: integer, format: int64, description: Unix seconds; 0 while unfinished }
+    DeploymentPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Deployment' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
+    DeploymentEvent:
+      type: object
+      additionalProperties: false
+      required: [id, deploymentId, stream, message, createdAt]
+      properties:
+        id: { type: integer, format: int64, description: Monotonic event id; the cursor for paging }
+        deploymentId: { type: string }
+        stream: { type: string, enum: [system, response] }
+        message: { type: string, description: At most 4096 bytes per response line; lifecycle system lines are not capped by the response limit }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+    DeploymentEventPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DeploymentEvent' }
+    CreateDeploymentInput:
+      type: object
+      additionalProperties: false
+      required: [targetId, version]
+      properties:
+        targetId: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        version: { type: string, pattern: '^[A-Za-z0-9._+-]{1,64}$' }
+        buildId: { type: string, description: Optional; must be a succeeded build of the same project }
+    RollbackDeploymentInput:
+      type: object
+      additionalProperties: false
+      maxProperties: 0
+      description: Empty object; the version to restore is the most recent earlier succeeded version of the same project and target.
     AuditEntry:
       type: object
       additionalProperties: false
@@ -1674,8 +1969,8 @@ components:
         createdAt: { type: integer, format: int64, description: Unix seconds }
         actorId: { type: string, description: Empty for system rows }
         actorUsername: { type: string }
-        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check] }
-        objectType: { type: string, enum: [user, session, project, build, deployment_target] }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check, deployment.create, deployment.cancel, deployment.rollback] }
+        objectType: { type: string, enum: [user, session, project, build, deployment_target, deployment] }
         objectId: { type: string }
         result: { type: string, enum: [success, failure] }
         detail: { type: string, description: Safe context such as role transitions or revoked counts; never secrets }
@@ -1751,6 +2046,11 @@ components:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
     NotFound:
       description: Unknown resource id; error.code is not_found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    Conflict:
+      description: Conflicting state; error.code is conflict (terminal deployment, duplicate target name, or a target with deployment history)
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }
