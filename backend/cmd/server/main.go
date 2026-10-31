@@ -136,6 +136,17 @@ func run(logger *slog.Logger) error {
 			case removed > 0:
 				logger.Info("expired sessions cleaned", "count", removed)
 			}
+			// Audit retention is opt-in: AEGIS_AUDIT_RETENTION=0 keeps every row.
+			if cfg.AuditRetention <= 0 || cleanupCtx.Err() != nil {
+				return
+			}
+			purged, purgeErr := service.PurgeAudit(cleanupCtx, time.Now().Add(-cfg.AuditRetention).Unix())
+			switch {
+			case purgeErr != nil && cleanupCtx.Err() == nil:
+				logger.Error("audit retention cleanup failed", "error", purgeErr)
+			case purged > 0:
+				logger.Info("expired audit rows purged", "count", purged, "retention", cfg.AuditRetention.String())
+			}
 		}
 		run()
 		ticker := time.NewTicker(time.Hour)

@@ -29,7 +29,7 @@ go run ./cmd/server
 
 默认监听 http://127.0.0.1:8080。PostgreSQL 数据库须预先创建，服务自动执行版本化表迁移；advisory 事务锁保证多实例并发启动安全。首次空库原子创建一位管理员；已有用户时不覆盖。初始化后移除 bootstrap 环境变量。JWT 密钥至少 32 字节，所有实例必须使用同一密钥、issuer/audience、Cookie 与来源配置；通过部署密钥管理保存并保持一致，重启无需粘性会话。
 
-环境配置见 [.env.example](.env.example)。AEGIS_DATABASE_URL 和 AEGIS_REDIS_URL 均必填，无 SQLite/进程内限流自动回退；旧 AEGIS_DATABASE_PATH 会使启动失败。每个实例默认最多 20 个数据库连接、空闲 5 个，可通过 AEGIS_DB_MAX_OPEN/IDLE 调整，连接总数需按副本数控制。AEGIS_BUILD_TIMEOUT 是单次构建的执行上限（默认 10m，最大 24h）；AEGIS_LOGIN_RATE_LIMIT 是每 IP 每分钟的登录配额（默认 10，取值 1-1000，仅供测试环境在单地址多账号时放宽）。**AEGIS_BUILD_SANDBOX** 选择构建执行方式：`none`（默认，开发用）以服务账号执行并在启动时打印警告；`container` 为每个构建启动一次性容器，配合 `AEGIS_BUILD_IMAGE`（默认 `alpine:3.20`）、`AEGIS_BUILD_CPU`（默认 2）、`AEGIS_BUILD_MEMORY`（默认 2g）、`AEGIS_BUILD_PIDS`（默认 512）使用，启动时探测容器运行时，不可用即拒绝启动；`user` 在 Linux 上通过 `setpriv` 降权到 `AEGIS_BUILD_USER` 指定的专用账号，服务必须以 root 启动，否则启动失败（Windows 不支持该模式）。**AEGIS_BUILD_DISK**（默认 2g，范围 16MiB–1TiB）限制单次构建的工作区大小；**AEGIS_BUILD_CLONE**（默认 false）开启仓库 clone，**AEGIS_BUILD_ALLOW_LOCAL_REPO**（默认 false）额外允许 `file:///` 与绝对本地路径。数据库和 Redis 应使用隔离网络、访问控制、TLS 与备份保护。
+环境配置见 [.env.example](.env.example)。AEGIS_DATABASE_URL 和 AEGIS_REDIS_URL 均必填，无 SQLite/进程内限流自动回退；旧 AEGIS_DATABASE_PATH 会使启动失败。每个实例默认最多 20 个数据库连接、空闲 5 个，可通过 AEGIS_DB_MAX_OPEN/IDLE 调整，连接总数需按副本数控制。AEGIS_BUILD_TIMEOUT 是单次构建的执行上限（默认 10m，最大 24h）；AEGIS_LOGIN_RATE_LIMIT 是每 IP 每分钟的登录配额（默认 10，取值 1-1000，仅供测试环境在单地址多账号时放宽）；AEGIS_AUDIT_RETENTION 是审计保留窗口（默认 `0` 永久保留；取值 24h–8760h 时每小时清理更早的审计行）。**AEGIS_BUILD_SANDBOX** 选择构建执行方式：`none`（默认，开发用）以服务账号执行并在启动时打印警告；`container` 为每个构建启动一次性容器，配合 `AEGIS_BUILD_IMAGE`（默认 `alpine:3.20`）、`AEGIS_BUILD_CPU`（默认 2）、`AEGIS_BUILD_MEMORY`（默认 2g）、`AEGIS_BUILD_PIDS`（默认 512）使用，启动时探测容器运行时，不可用即拒绝启动；`user` 在 Linux 上通过 `setpriv` 降权到 `AEGIS_BUILD_USER` 指定的专用账号，服务必须以 root 启动，否则启动失败（Windows 不支持该模式）。**AEGIS_BUILD_DISK**（默认 2g，范围 16MiB–1TiB）限制单次构建的工作区大小；**AEGIS_BUILD_CLONE**（默认 false）开启仓库 clone，**AEGIS_BUILD_ALLOW_LOCAL_REPO**（默认 false）额外允许 `file:///` 与绝对本地路径。数据库和 Redis 应使用隔离网络、访问控制、TLS 与备份保护。
 
 ## 推荐部署：同源代理
 
@@ -167,7 +167,8 @@ User 字段为 `id/username/displayName/role/disabled/createdAt`，无密码或�
 - SQLite 开发库不会自动导入 PostgreSQL。现阶段开发数据可重新初始化；如有需要保留的用户，必须先备份并单独编写审核过的离线迁移，保留 bcrypt 哈希、校验用户名大小写唯一性并撤销旧会话，不能直接复制文件或将 SQLite 挂共享盘。
 - /readyz 同时检查 PostgreSQL 和 Redis；Redis 故障使就绪返回 503，登录也 503。已存在 Bearer 会话在 PostgreSQL 正常时仍可鉴权；负载均衡是否摘除整个实例取决于运维策略。
 - 请求 ID、slog JSON 访问日志、鉴权操作日志、panic 恢复、安全响应头、HTTP 超时、信号触发优雅退出；日志不记录密码、Cookie、令牌、正文。
-- 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）。构建与成员审计都和状态变更在同一事务提交；幂等重复取消不重复记账，detail 只写项目/成员与构建号或角色（重试额外写 `retry_of=<原构建号>`），不写命令。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），保留策略待业务审计里程碑设计。
+- 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）。构建与成员审计都和状态变更在同一事务提交；幂等重复取消不重复记账，detail 只写项目/成员与构建号或角色（重试额外写 `retry_of=<原构建号>`），不写命令。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），支持 `action`/`objectType`/`result`/`actor`/`from`/`to` 服务端筛选（AND 组合，同时作用于分页与 total；`from`/`to` 接受 RFC3339 或 `YYYY-MM-DD`，只给日期时 `to` 覆盖该 UTC 全天）。
+- 审计保留策略可选：`AEGIS_AUDIT_RETENTION` 未设置或为 `0` 时永久保留（默认）；设置 24h–8760h 后，与过期会话清理共用的小时任务会删除早于该窗口的审计行。删除是运维显式选择，默认不丢证据。
 - 过期会话与 refresh 历史由后台任务每小时清理（启动时先执行一次）：删除超过绝对期限的会话及其全部 refresh 令牌记录。重放检测只需保留到会话有效期，这与文档化的保留边界一致。
 
 ## 验证

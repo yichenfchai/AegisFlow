@@ -57,11 +57,13 @@ test('构建闭环：触发、成功日志与 viewer 只读', async ({ page }) =
   await expect(page.getByText('成功', { exact: true })).toBeVisible({ timeout: 20_000 })
   await expect(page.getByRole('button', { name: '重试构建' })).toBeVisible()
 
-  // 触发构建写入持久化审计，管理员可在审计页按中文动作看到。
+  // 触发构建写入持久化审计，管理员可在审计页按中文动作看到。断言限定在表格内：
+  // 审计筛选下拉里也有同名动作选项，直接 getByText 会先命中隐藏的 <option>。
   await page.goto('/settings')
   await page.getByRole('button', { name: '审计', exact: true }).click()
-  await expect(page.getByText('触发构建').first()).toBeVisible()
-  await expect(page.getByText(/构建:/).first()).toBeVisible()
+  const auditTable = page.getByRole('table')
+  await expect(auditTable.getByText('触发构建').first()).toBeVisible()
+  await expect(auditTable.getByText(/构建:/).first()).toBeVisible()
 
   const projectID = await page.evaluate(async (projectName) => {
     const { apiRequest } = await import('/src/stores/session.ts')
