@@ -17,6 +17,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/builds"
 	"github.com/yichenfchai/AegisFlow/backend/internal/config"
+	"github.com/yichenfchai/AegisFlow/backend/internal/deployments"
 	"github.com/yichenfchai/AegisFlow/backend/internal/httpapi"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
@@ -111,7 +112,11 @@ func run(logger *slog.Logger) error {
 		Pids:   cfg.BuildPids,
 		User:   cfg.BuildUser,
 	}).WithSource(cfg.BuildClone, cfg.BuildAllowLocalRepo).WithDiskLimit(cfg.BuildDisk)
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline})
+	// Deployment-target secrets are sealed with AEGIS_SECRET_KEY; when it is
+	// unset the registry still serves targets without credentials. The same
+	// service owns the deploy-task store and its worker.
+	deploymentsService := deployments.New(db, deployments.Options{SecretKey: cfg.SecretKey, CheckTimeout: cfg.DeployCheckTimeout, DeployTimeout: cfg.DeployTimeout})
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -121,8 +126,10 @@ func run(logger *slog.Logger) error {
 	defer stopWorker()
 	// Only the replica holding the PostgreSQL worker lease recovers interrupted
 	// builds and executes queued ones; the others stand by and take over when
-	// the holder stops (see builds.RunWorker).
+	// the holder stops (see builds.RunWorker). The deployment worker uses a
+	// separate lease key so both pipelines run on every replica independently.
 	go pipeline.RunWorker(workerCtx, logger)
+	go deploymentsService.RunWorker(workerCtx, logger)
 	// Expired sessions and their refresh history are pruned hourly; replay
 	// detection never needs history beyond the session deadline.
 	cleanupCtx, stopCleanup := context.WithCancel(signalCtx)
