@@ -113,6 +113,31 @@ var Migrations = [][]string{{
 	// rewrite what a historical build says it cloned. Empty means "no
 	// repository": the command runs in an empty workspace, the pre-④c behaviour.
 	`ALTER TABLE builds ADD COLUMN repo_url TEXT NOT NULL DEFAULT ''`,
+}, {
+	// Deployment targets (P4 first slice): admin-only HTTP endpoints that P4
+	// deploy tasks and approvals will reference. Secrets are encrypted at rest
+	// with AES-256-GCM and an AAD bound to the target id; plaintext is never
+	// stored or returned. last_check_* records the most recent connectivity
+	// probe (HTTP GET, 2xx = healthy) so the UI can show freshness without a
+	// separate status table. created_by is a denormalized actor snapshot like
+	// projects.created_by and the audit actor, not a foreign key.
+	`CREATE TABLE deployment_targets (
+	 id TEXT PRIMARY KEY,
+	 name TEXT NOT NULL,
+	 kind TEXT NOT NULL CHECK(kind IN ('http')),
+	 environment TEXT NOT NULL CHECK(environment IN ('development','staging','production')),
+	 endpoint TEXT NOT NULL,
+	 health_path TEXT NOT NULL DEFAULT '/',
+	 secret_cipher BYTEA NOT NULL DEFAULT '',
+	 status TEXT NOT NULL CHECK(status IN ('active','disabled')),
+	 created_by TEXT NOT NULL DEFAULT '',
+	 created_at BIGINT NOT NULL,
+	 updated_at BIGINT NOT NULL,
+	 last_check_at BIGINT NOT NULL DEFAULT 0,
+	 last_check_ok INTEGER NOT NULL DEFAULT 0 CHECK(last_check_ok IN (0,1)),
+	 last_check_detail TEXT NOT NULL DEFAULT '')`,
+	`CREATE UNIQUE INDEX deployment_targets_name_lower_idx ON deployment_targets(lower(name))`,
+	`CREATE INDEX deployment_targets_status_name_idx ON deployment_targets(status, lower(name))`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped
