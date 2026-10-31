@@ -47,7 +47,7 @@ server: {
 
 必须保留浏览器原始 `Origin`，且将**浏览器看到的前端源**加入 `AEGIS_ALLOWED_ORIGINS`。允许列表使用逗号分隔、精确匹配 scheme/host/port、无路径/尾斜杠/通配符。默认只允许 `http://localhost:5173`；使用 `http://127.0.0.1:5173` 需显式增加。同源请求仍必须带 Origin，代理不得删除或伪造它。
 
-生产在 TLS 反向代理后运行，后端绑定回环或受控内部网络；**显式设 `AEGIS_COOKIE_SECURE=true`**。本地默认 false，服务不会根据 X-Forwarded-Proto、Host 等可伪造头推断 Secure，也没有隐含的“生产环境检测”。代理需要透传 Cookie/Set-Cookie/Origin，不能缓存 auth 响应。请勿用明文 HTTP 传输账号和令牌。
+生产在 TLS 反向代理后运行，后端绑定回环或受控内部网络；**显式设 `AEGIS_COOKIE_SECURE=true`**。本地默认 false，服务不会根据 X-Forwarded-Proto、Host 等可伪造头推断 Secure，也没有隐含的“生产环境检测”。代理需要透传 Cookie/Set-Cookie/Origin，不能缓存 auth 响应。请勿用明文 HTTP 传输账号和令牌。完整的入口代理、证书与 SSE 超时示例见 [deploy/nginx-tls.example.conf](../deploy/nginx-tls.example.conf)，运维步骤（TLS、备份恢复、滚动升级）见 [部署说明](../deploy/README.md)。
 
 `SameSite=Strict` 拒绝跨站发送 Cookie；即使配置允许某源，`Sec-Fetch-Site: cross-site` 仍拒绝。CORS 仅兼容受控同站/调试源，不是跨站部署方案。Gin 默认不信任转发地址；AEGIS_TRUSTED_PROXIES 可配置实际入口代理的精确 CIDR，只在来自可信代理时解析 X-Forwarded-For，忽略 X-Real-IP。代理必须覆盖客户端传入的转发头，不可开放所有地址。登录使用 Redis Lua 原子共享限流，每 IP 固定一分钟最多 10 次（AEGIS_LOGIN_RATE_LIMIT 可调），所有副本共享同一 AEGIS_REDIS_NAMESPACE；Redis 故障登录返回 503，不回退本地计数。
 
