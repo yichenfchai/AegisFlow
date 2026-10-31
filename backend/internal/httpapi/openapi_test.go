@@ -65,7 +65,7 @@ func TestOpenAPIContractReferencesAndRoutes(t *testing.T) {
 		t.Fatal("missing paths")
 	}
 	for _, route := range []struct{ path, method string }{
-		{"/healthz", "get"}, {"/readyz", "get"}, {"/api/v1/auth/login", "post"}, {"/api/v1/auth/refresh", "post"},
+		{"/healthz", "get"}, {"/readyz", "get"}, {"/metrics", "get"}, {"/api/v1/auth/login", "post"}, {"/api/v1/auth/refresh", "post"},
 		{"/api/v1/auth/logout", "post"}, {"/api/v1/auth/me", "get"}, {"/api/v1/auth/password", "post"},
 		{"/api/v1/auth/sessions", "get"}, {"/api/v1/auth/sessions", "delete"}, {"/api/v1/auth/sessions/{sessionId}", "delete"},
 		{"/api/v1/users", "get"}, {"/api/v1/users", "post"}, {"/api/v1/users/{userId}", "patch"},

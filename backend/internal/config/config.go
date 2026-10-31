@@ -33,6 +33,9 @@ type Config struct {
 	// command; BuildAllowLocalRepo permits file:/// and absolute local paths.
 	BuildClone          bool
 	BuildAllowLocalRepo bool
+	// MetricsAddr enables the unauthenticated Prometheus endpoint on a separate
+	// listener; empty (the default) disables it.
+	MetricsAddr string
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
@@ -130,6 +133,20 @@ func Load() (Config, error) {
 	}
 	if c.BuildTimeout > 24*time.Hour {
 		return c, errors.New("AEGIS_BUILD_TIMEOUT must be at most 24h")
+	}
+	// Metrics listen on their own address so the public API origin never exposes
+	// deployment-wide counters; the endpoint itself has no user authentication,
+	// so bind loopback or protect it at the proxy.
+	c.MetricsAddr = strings.TrimSpace(os.Getenv("AEGIS_METRICS_ADDR"))
+	if c.MetricsAddr != "" {
+		_, port, splitErr := net.SplitHostPort(c.MetricsAddr)
+		if splitErr != nil {
+			return c, errors.New("AEGIS_METRICS_ADDR must be host:port, for example 127.0.0.1:9090")
+		}
+		numericPort, convErr := strconv.Atoi(port)
+		if convErr != nil || numericPort < 0 || numericPort > 65535 {
+			return c, errors.New("AEGIS_METRICS_ADDR must use a numeric port between 0 and 65535")
+		}
 	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {
 		origin = strings.TrimSpace(origin)

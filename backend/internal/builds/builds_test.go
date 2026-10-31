@@ -514,3 +514,37 @@ func TestBuildWritesNeedMaintainerOnPrivateProject(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// StatusCounts feeds the metrics gauge: it always reports every status, and
+// counts follow the rows (the worker is not started here, so builds stay queued).
+func TestStatusCounts(t *testing.T) {
+	s, registry := testService(t)
+	ctx := context.Background()
+	counts, err := s.StatusCounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []string{StatusQueued, StatusRunning, StatusSucceeded, StatusFailed, StatusCancelled, StatusInterrupted} {
+		if count, ok := counts[status]; !ok || count != 0 {
+			t.Fatalf("empty database status %s = %d (present=%v)", status, count, ok)
+		}
+	}
+	project := createProject(t, registry, "counts-project", "echo counts")
+	first, err := s.Trigger(ctx, testActor, project.ID, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Trigger(ctx, testActor, project.ID, "main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.ExecContext(ctx, `UPDATE builds SET status=$1 WHERE id=$2`, StatusSucceeded, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	counts, err = s.StatusCounts(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts[StatusQueued] != 1 || counts[StatusSucceeded] != 1 {
+		t.Fatalf("counts = %+v", counts)
+	}
+}
