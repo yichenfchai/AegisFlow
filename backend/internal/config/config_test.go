@@ -10,7 +10,7 @@ import (
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT"} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("AEGIS_JWT_SECRET", strings.Repeat("s", 32))
@@ -197,6 +197,33 @@ func TestBuildContainerLimitConfig(t *testing.T) {
 			t.Setenv(tc.key, tc.value)
 			if _, err := Load(); (err != nil) != tc.invalid {
 				t.Fatalf("err=%v invalid=%v", err, tc.invalid)
+			}
+		})
+	}
+}
+
+func TestAuditRetentionConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    time.Duration
+		invalid bool
+	}{
+		{"", 0, false},
+		{"0", 0, false},
+		{"24h", 24 * time.Hour, false},
+		{"2160h", 2160 * time.Hour, false},
+		{"8760h", 8760 * time.Hour, false},
+		{"23h", 0, true},
+		{"8761h", 0, true},
+		{"30d", 0, true},
+		{"-24h", 0, true},
+	} {
+		t.Run("value="+tc.value, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_AUDIT_RETENTION", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid || (!tc.invalid && c.AuditRetention != tc.want) {
+				t.Fatalf("retention=%v err=%v", c.AuditRetention, err)
 			}
 		})
 	}
