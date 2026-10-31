@@ -253,13 +253,9 @@ func TestBuildDiskLimitStopsBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForStatus(t, service, build.ID, StatusFailed)
-	logs, err := service.Logs(ctx, testActor, build.ID, 0, maxLogPageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(joinLogs(logs), "disk limit") {
-		t.Fatal("expected a disk limit system line")
-	}
+	// The worker flushes the batch log after the terminal status update, so poll
+	// instead of racing the final flush on a slow CI runner.
+	waitForLog(t, service, build.ID, "disk limit")
 }
 
 func TestBuildSnapshotsRepoURL(t *testing.T) {
