@@ -1404,6 +1404,9 @@ paths:
         approval is created in the same transaction and approvalId is set.
         deployment.create (and approval.request when required) is audited in
         the same transaction.
+        The deployment starts queued; a single leased worker executes it.
+        deployment.create is audited in the same transaction. Approvals arrive
+        with P4.3; this slice always enqueues directly.
       security:
         - bearerAuth: []
       parameters:

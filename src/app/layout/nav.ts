@@ -3,7 +3,7 @@ export interface NavItem {
   to: string
   icon: string
   badge?: number
-  /** Admin-only routes are hidden from members and viewers. */
+  /** Admin-only pages are hidden from member/viewer sidebars; the route guard and the API still enforce the role. */
   adminOnly?: boolean
 }
 
@@ -37,7 +37,7 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     title: '运行与治理',
     items: [
-      { label: '部署目标', to: '/deploy-targets', icon: 'dns' },
+      { label: '部署目标', to: '/deploy-targets', icon: 'dns', adminOnly: true },
       { label: '攻击防御', to: '/defense', icon: 'security' },
       { label: '自动化审计', to: '/audit', icon: 'policy' },
       { label: '自动化策略', to: '/policies', icon: 'rule' },

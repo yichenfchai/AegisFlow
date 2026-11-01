@@ -14,6 +14,9 @@ import { DeploymentListPage } from '@/features/deployments/DeploymentListPage'
 import { DeploymentNewPage } from '@/features/deployments/DeploymentNewPage'
 import { DeploymentDetailPage } from '@/features/deployments/DeploymentDetailPage'
 import { ApprovalListPage } from '@/features/approvals/ApprovalListPage'
+import { DeploymentTargetsPage } from '@/features/deployments/DeploymentTargetsPage'
+import { DeploymentTargetWizardPage } from '@/features/deployments/DeploymentTargetWizardPage'
+import { DeploymentTargetDetailPage } from '@/features/deployments/DeploymentTargetDetailPage'
 
 /**
  * 真实页面（项目、构建、账号、用户与审计）不进 Gate；业务演示页已随 P3
@@ -44,17 +47,17 @@ export const router = createBrowserRouter([
       { path: '/scans', element: <UnimplementedPage title="安全扫描" /> },
       { path: '/knowledge', element: <UnimplementedPage title="知识库" /> },
 
-      // 管理员入口：真实部署、审批、用户与审计；其余为未实现占位
+      // 管理员入口：真实部署目标、部署记录、审批、用户与审计；其余为未实现占位
       {
         element: <SessionGate adminOnly />,
         children: [
+          { path: '/deploy-targets', element: <DeploymentTargetsPage /> },
+          { path: '/deploy-targets/new', element: <DeploymentTargetWizardPage /> },
+          { path: '/deploy-targets/:id', element: <DeploymentTargetDetailPage /> },
           { path: '/deploys', element: <DeploymentListPage /> },
           { path: '/deploys/new', element: <DeploymentNewPage /> },
           { path: '/deploys/:id', element: <DeploymentDetailPage /> },
           { path: '/approvals', element: <ApprovalListPage /> },
-          { path: '/deploy-targets', element: <UnimplementedPage title="部署目标" /> },
-          { path: '/deploy-targets/new', element: <UnimplementedPage title="新建部署目标" /> },
-          { path: '/deploy-targets/:id', element: <UnimplementedPage title="部署目标详情" /> },
           { path: '/defense', element: <UnimplementedPage title="攻击防御" /> },
           { path: '/audit', element: <UnimplementedPage title="自动化审计" /> },
           { path: '/audit/report', element: <UnimplementedPage title="昨夜托管报告" /> },
