@@ -48,6 +48,8 @@ tags:
     description: Admin-only deployment targets with encrypted credentials and connectivity probes
   - name: Deployments
     description: Admin-only deployment tasks, lifecycle events, cancellation and rollback
+  - name: Approvals
+    description: Admin-only deployment approval queue (approve, reject, expiry)
   - name: Audit
     description: Persistent authentication and account-management audit trail
   - name: Health
@@ -1396,6 +1398,12 @@ paths:
         semantic version (1-64 chars of A-Z a-z 0-9 . _ + -). buildId is
         optional and must reference a succeeded build of the same project.
         deploymentNumber is allocated per project under the project row lock.
+        The deployment starts queued and a single leased worker executes it;
+        when the target environment is in AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS
+        (default production) it instead starts awaiting_approval, a pending
+        approval is created in the same transaction and approvalId is set.
+        deployment.create (and approval.request when required) is audited in
+        the same transaction.
         The deployment starts queued; a single leased worker executes it.
         deployment.create is audited in the same transaction. Approvals arrive
         with P4.3; this slice always enqueues directly.
@@ -1568,6 +1576,122 @@ paths:
                 required: [data, requestId]
                 properties:
                   data: { $ref: '#/components/schemas/Deployment' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/approvals:
+    get:
+      tags: [Approvals]
+      operationId: listApprovals
+      summary: List deployment approvals (admin only)
+      description: Newest first. Every approval endpoint is admin-only.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: status
+          in: query
+          required: false
+          description: Filter by approval status; omit for all
+          schema: { type: string, enum: [pending, approved, rejected, expired] }
+      responses:
+        '200':
+          description: Approval page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ApprovalPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/approvals/{approvalId}/approve:
+    post:
+      tags: [Approvals]
+      operationId: approveApproval
+      summary: Approve a pending deployment approval (admin only)
+      description: |
+        Moves the approval from pending to approved and its deployment from
+        awaiting_approval to queued (the worker is woken immediately), in one
+        transaction with an approval.approve audit row. Repeating on an already
+        approved approval is idempotent and writes no second audit row. A
+        non-pending approval, or a deployment that is no longer awaiting
+        approval (for example because it was cancelled), returns 409; the
+        approval then stays pending until the expiry scan closes it.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: approvalId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200':
+          description: Approved (or already approved) approval
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Approval' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/approvals/{approvalId}/reject:
+    post:
+      tags: [Approvals]
+      operationId: rejectApproval
+      summary: Reject a pending deployment approval (admin only)
+      description: |
+        Moves the approval from pending to rejected and its deployment from
+        awaiting_approval to rejected, in one transaction with an
+        approval.reject audit row. reason is optional, trimmed, at most 512
+        bytes and single-line; when present it is stored and included in the
+        audit detail. Repeating on an already rejected approval is idempotent
+        and writes no second audit row. Any other non-pending status, or a
+        deployment that is no longer awaiting approval, returns 409.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: approvalId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RejectApprovalInput' }
+      responses:
+        '200':
+          description: Rejected (or already rejected) approval
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Approval' }
                   requestId: { $ref: '#/components/schemas/RequestID' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -1942,11 +2066,11 @@ components:
         targetEndpoint: { type: string, description: Target endpoint snapshot at trigger time }
         targetEnvironment: { type: string, description: Target environment snapshot at trigger time }
         deploymentNumber: { type: integer, format: int64, minimum: 1, description: Per-project monotonic sequence }
-        status: { type: string, enum: [queued, awaiting_approval, running, succeeded, failed, cancelled, interrupted, rejected], description: awaiting_approval and rejected are reserved for P4.3 }
+        status: { type: string, enum: [queued, awaiting_approval, running, succeeded, failed, cancelled, interrupted, rejected], description: awaiting_approval means a pending approval blocks execution; rejected is terminal and set by a rejection or approval expiry }
         version: { type: string }
         buildId: { type: string, description: Optional succeeded build snapshot; empty when not linked }
         rollbackOf: { type: string, description: Source deployment id when this is a rollback; empty otherwise }
-        approvalId: { type: string, description: Empty until P4.3 links an approval }
+        approvalId: { type: string, description: Approval request id when the target environment required approval; empty otherwise }
         triggeredBy: { type: string, description: Actor id snapshot }
         detail: { type: string, description: "Terminal outcome such as http <code>, timeout or a sanitized network error; never a secret" }
         createdAt: { type: integer, format: int64, description: Unix seconds }
@@ -1994,6 +2118,37 @@ components:
       additionalProperties: false
       maxProperties: 0
       description: Empty object; the version to restore is the most recent earlier succeeded version of the same project and target.
+    Approval:
+      type: object
+      additionalProperties: false
+      required: [id, deploymentId, projectId, status, requestedBy, decidedBy, reason, createdAt, expiresAt, decidedAt]
+      properties:
+        id: { type: string }
+        deploymentId: { type: string }
+        projectId: { type: string }
+        status: { type: string, enum: [pending, approved, rejected, expired], description: expired covers both the TTL scan and a deployment cancelled while awaiting approval }
+        requestedBy: { type: string, description: Actor id that requested the deployment }
+        decidedBy: { type: string, description: Admin actor id for approve/reject; empty for expiry }
+        reason: { type: string, description: 'Optional rejection reason, "approval expired" or "deployment cancelled"; never a secret' }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+        expiresAt: { type: integer, format: int64, description: Unix seconds; createdAt + AEGIS_APPROVAL_TTL }
+        decidedAt: { type: integer, format: int64, description: Unix seconds; 0 while pending }
+    ApprovalPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Approval' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
+    RejectApprovalInput:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: string, maxLength: 512, description: 'Optional, trimmed, single line, no control characters; included in the audit detail' }
     AuditEntry:
       type: object
       additionalProperties: false
@@ -2003,8 +2158,8 @@ components:
         createdAt: { type: integer, format: int64, description: Unix seconds }
         actorId: { type: string, description: Empty for system rows }
         actorUsername: { type: string }
-        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check, deployment.create, deployment.cancel, deployment.rollback] }
-        objectType: { type: string, enum: [user, session, project, build, deployment_target, deployment] }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check, deployment.create, deployment.cancel, deployment.rollback, approval.request, approval.approve, approval.reject, approval.expire] }
+        objectType: { type: string, enum: [user, session, project, build, deployment_target, deployment, approval] }
         objectId: { type: string }
         result: { type: string, enum: [success, failure] }
         detail: { type: string, description: Safe context such as role transitions or revoked counts; never secrets }

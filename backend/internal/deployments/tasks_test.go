@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -26,6 +27,11 @@ func taskService(t *testing.T, opts Options) (*Service, *sql.DB, *projects.Servi
 	}
 	if opts.DeployTimeout == 0 {
 		opts.DeployTimeout = 5 * time.Second
+	}
+	// Execution tests predate approvals: keep them on the opt-out path unless a
+	// test explicitly opts in.
+	if opts.ApprovalEnvironments == nil {
+		opts.ApprovalEnvironments = []string{}
 	}
 	s, db := testServiceWith(t, opts)
 	return s, db, projects.New(db)
@@ -54,7 +60,7 @@ func taskTarget(t *testing.T, s *Service, name, endpoint string) Target {
 func startDeployWorker(t *testing.T, s *Service) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	go s.run(ctx)
+	go s.run(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	t.Cleanup(cancel)
 	return cancel
 }

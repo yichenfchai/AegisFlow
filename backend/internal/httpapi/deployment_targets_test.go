@@ -21,8 +21,19 @@ import (
 
 // deploymentTestServer wires the deployment registry next to the real auth
 // service, the way cmd/server does. It starts no worker; deployment-task tests
-// start one explicitly.
+// start one explicitly. Approval tests use deploymentTestServerWith.
 func deploymentTestServer(t *testing.T, client *http.Client) (http.Handler, *auth.Service, *deployments.Service) {
+	t.Helper()
+	return deploymentTestServerWith(t, client, deployments.Options{
+		SecretKey:     bytes.Repeat([]byte{9}, 32),
+		CheckTimeout:  2 * time.Second,
+		DeployTimeout: 5 * time.Second,
+		// P4.2 task tests predate approvals; opt out explicitly.
+		ApprovalEnvironments: []string{},
+	})
+}
+
+func deploymentTestServerWith(t *testing.T, client *http.Client, opts deployments.Options) (http.Handler, *auth.Service, *deployments.Service) {
 	t.Helper()
 	db := testutil.OpenPostgres(t)
 	s := auth.New(db, strings.Repeat("k", 32), time.Minute, time.Hour)
@@ -32,12 +43,20 @@ func deploymentTestServer(t *testing.T, client *http.Client) (http.Handler, *aut
 	if err := s.Bootstrap(context.Background(), "admin", "a-strong-password"); err != nil {
 		t.Fatal(err)
 	}
-	registry := deployments.New(db, deployments.Options{
-		SecretKey:     bytes.Repeat([]byte{9}, 32),
-		CheckTimeout:  2 * time.Second,
-		DeployTimeout: 5 * time.Second,
-		HTTPClient:    client,
-	})
+	if opts.SecretKey == nil {
+		opts.SecretKey = bytes.Repeat([]byte{9}, 32)
+	}
+	if opts.CheckTimeout == 0 {
+		opts.CheckTimeout = 2 * time.Second
+	}
+	if opts.DeployTimeout == 0 {
+		opts.DeployTimeout = 5 * time.Second
+	}
+	if opts.ApprovalEnvironments == nil {
+		opts.ApprovalEnvironments = []string{}
+	}
+	opts.HTTPClient = client
+	registry := deployments.New(db, opts)
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	return New(s, logger, db.PingContext, []string{"http://localhost:5173"}, Options{
 		Limiter:     newTestLimiter(),

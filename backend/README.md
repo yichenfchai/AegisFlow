@@ -1,6 +1,6 @@
 # AegisFlow Go 后端
 
-Go 1.23+，Gin 1.11 + slog，PostgreSQL（pgx）+ Redis 共享限流，多应用实例部署，bcrypt，HS256 JWT。浏览器鉴权采用短期 Bearer access token + HttpOnly refresh Cookie；推荐前后端通过**同源代理**部署。项目注册表与最小构建闭环（触发、列表、详情、取消、游标日志）已实现；部署、审批等其余业务接口及 LDAP 尚未实现。完整接口契约见 [openapi.yaml](openapi.yaml)。
+Go 1.23+，Gin 1.11 + slog，PostgreSQL（pgx）+ Redis 共享限流，多应用实例部署，bcrypt，HS256 JWT。浏览器鉴权采用短期 Bearer access token + HttpOnly refresh Cookie；推荐前后端通过**同源代理**部署。项目注册表、最小构建闭环（触发、列表、详情、取消、游标日志）、部署目标、部署任务与部署审批已实现；LDAP 等其余业务接口尚未实现。完整接口契约见 [openapi.yaml](openapi.yaml)。
 
 ## 本地启动（PowerShell）
 
@@ -119,7 +119,7 @@ server: {
 - 凭据加密存储：`AEGIS_SECRET_KEY`（base64 32 字节）启用 AES-256-GCM；密文布局为 `[12 字节随机 nonce][ciphertext+tag]`，AAD 绑定目标 id（`deployment_target:<id>`），因此密文不能跨行复用。接口只返回 `hasSecret`，从不返回明文或密文；未配置密钥时仍可创建无凭据目标，但写入凭据返回 400。带凭据的目标必须使用 `https` 端点（仅回环地址允许 `http`），否则创建/更新直接 400，避免把 Bearer 凭据以明文发到网络上。
 - 探测：`POST /api/v1/deployment-targets/{id}/check` 对 `endpoint + healthPath` 发 GET，超时由 `AEGIS_DEPLOY_CHECK_TIMEOUT`（默认 5s，最大 1m）控制；有凭据时发送 `Authorization: Bearer <secret>`（仅在本次探测的内存中解密）。2xx 记为健康，其余记录 `http <code>`、`timeout` 或脱敏后的网络错误；结果写入 `last_check_at/last_check_ok/last_check_detail`。默认客户端最多 3 跳、不跨主机，并拒绝 `https`→`http` 降级。
 - 审计：创建、修改、删除、探测分别写 `deployment_target.create|update|remove|check`（objectType `deployment_target`），与状态变更同事务；detail 只含名称或探测结果，绝不含凭据。
-- 本批边界（P4.1 范围）：审批流（P4.3）、独立密钥管理页面、部署策略与业务审计保留策略；删除为硬删除，但被部署历史引用的目标返回 409（保留历史快照）。
+- 本批边界（P4.1 范围）：独立密钥管理页面、部署策略与业务审计保留策略；删除为硬删除，但被部署历史引用的目标返回 409（保留历史快照）。前端页面见「部署目标」相关 UI。
 
 ### 部署任务（P4.2）
 
@@ -129,7 +129,19 @@ server: {
 - 目标快照：创建时固化 `target_name/target_endpoint/target_environment`，之后改名或改端点不影响历史；执行使用目标当前配置，目标在执行前被禁用/删除会置 `failed`。
 - 回滚：`POST /api/v1/deployments/{id}/rollback` 仅接受 `succeeded`/`failed` 源，取同项目+目标中比源部署更早的最近一次 `succeeded` 版本，新建一条 `queued` 部署（`rollbackOf` 指向源，payload `rollback=true`、`rollbackVersion` 为该版本）；无更早成功返回 400，源非终态 409；重复回滚会创建多条部署（非幂等，审计可追溯）。
 - 权限与审计：六个部署端点全部 admin-only（member/viewer 403）；`deployment.create`（detail `target=<name> version=<v> approval=none`）、`deployment.cancel`（`from=<status>`）、`deployment.rollback`（`rollback_of=<id> version=<v>`）与状态变更同事务，重复取消失败不重复记账。
-- 本批边界：审批流（P4.3）、前端部署/审批页面、部署产物与构建强制关联（`buildId` 可选，提供时必须是同项目 `succeeded` 构建）、自定义 HTTP 方法与路径、自动重试均未做。
+- 本批边界：前端部署/审批页面（尚未接入）、部署产物与构建强制关联（`buildId` 可选，提供时必须是同项目 `succeeded` 构建）、自定义 HTTP 方法与路径、自动重试均未做。
+
+
+### 部署审批（P4.3）
+
+- 命中 `AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS` 的环境：创建部署或回滚时在**同一事务**写入 `awaiting_approval` 部署、`pending` 审批（`expiresAt = now + AEGIS_APPROVAL_TTL`）、`deployments.approval_id`，并写 `deployment.create`（或 `deployment.rollback`）与 `approval.request` 两条审计。其余环境保持 `queued` 直接执行。
+- 审批接口全部 admin-only：`GET /api/v1/approvals?status=&limit=&offset=`（按创建时间倒序，可按 pending/approved/rejected/expired 过滤）、`POST /api/v1/approvals/{id}/approve`（body `{}`）、`POST /api/v1/approvals/{id}/reject`（body `{reason?}`，reason 可选、trim、单行、≤512 字节）。
+- 批准：审批 `approved`，部署 `awaiting_approval → queued` 并立即唤醒 worker；重复批准返回同一审批（200）且不重复写审计。拒绝：审批 `rejected` + reason，部署 `rejected`（detail `approval rejected`）；重复拒绝同样幂等。
+- 冲突：非 pending 审批、或审批对应部署已不再 `awaiting_approval`（例如已被取消）时返回 409；此时审批保持 pending，由过期扫描关闭。
+- 过期：持租约 worker 每 30s（接管时先跑一次）扫描 `pending AND expires_at <= now`，每批最多 100 条、`FOR UPDATE SKIP LOCKED`；审批置 `expired`（reason `approval expired`），部署置 `rejected`（detail `approval expired`），并为每行写 `approval.expire` 审计（actor 为空）。
+- 取消交互：取消 `awaiting_approval` 部署时，同一事务把审批置 `expired`（reason `deployment cancelled`，decided_at=now）并写 `approval.expire`；重复取消不会重复记账。审批状态机没有 cancelled，因此复用 `expired`。
+- 审计：`approval.request`（detail `deployment=<id>`）、`approval.approve`（`deployment=<id>`）、`approval.reject`（`deployment=<id> reason=<...>` 可选）、`approval.expire`（`deployment=<id> reason=approval expired|deployment cancelled`），objectType `approval`。
+- 本批边界：多级会签、通知渠道、前端审批页面仍未实现（页面保持未实现声明）。
 
 ### Cookie 与前端对齐
 

@@ -114,8 +114,14 @@ func run(logger *slog.Logger) error {
 	}).WithSource(cfg.BuildClone, cfg.BuildAllowLocalRepo).WithDiskLimit(cfg.BuildDisk)
 	// Deployment-target secrets are sealed with AEGIS_SECRET_KEY; when it is
 	// unset the registry still serves targets without credentials. The same
-	// service owns the deploy-task store and its worker.
-	deploymentsService := deployments.New(db, deployments.Options{SecretKey: cfg.SecretKey, CheckTimeout: cfg.DeployCheckTimeout, DeployTimeout: cfg.DeployTimeout})
+	// service owns the deploy-task store, the approval queue and the worker.
+	deploymentsService := deployments.New(db, deployments.Options{
+		SecretKey:            cfg.SecretKey,
+		CheckTimeout:         cfg.DeployCheckTimeout,
+		DeployTimeout:        cfg.DeployTimeout,
+		ApprovalEnvironments: cfg.ApprovalEnvironments,
+		ApprovalTTL:          cfg.ApprovalTTL,
+	})
 	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
