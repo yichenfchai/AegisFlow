@@ -10,6 +10,9 @@ import { ProjectWizardPage } from '@/features/projects/ProjectWizardPage'
 import { ProjectsPage } from '@/features/projects/ProjectsPage'
 import { ProjectMembersPage } from '@/features/projects/ProjectMembersPage'
 import { AccountSecurityPage } from '@/features/account/AccountSecurityPage'
+import { DeploymentTargetsPage } from '@/features/deployments/DeploymentTargetsPage'
+import { DeploymentTargetWizardPage } from '@/features/deployments/DeploymentTargetWizardPage'
+import { DeploymentTargetDetailPage } from '@/features/deployments/DeploymentTargetDetailPage'
 
 /**
  * 真实页面（项目、构建、账号、用户与审计）不进 Gate；业务演示页已随 P3
@@ -43,13 +46,13 @@ export const router = createBrowserRouter([
       { path: '/approvals', element: <UnimplementedPage title="审批中心" /> },
       { path: '/knowledge', element: <UnimplementedPage title="知识库" /> },
 
-      // 管理员入口：真实用户与审计；其余为未实现占位
+      // 管理员入口：真实部署目标、用户与审计；其余为未实现占位
       {
         element: <SessionGate adminOnly />,
         children: [
-          { path: '/deploy-targets', element: <UnimplementedPage title="部署目标" /> },
-          { path: '/deploy-targets/new', element: <UnimplementedPage title="新建部署目标" /> },
-          { path: '/deploy-targets/:id', element: <UnimplementedPage title="部署目标详情" /> },
+          { path: '/deploy-targets', element: <DeploymentTargetsPage /> },
+          { path: '/deploy-targets/new', element: <DeploymentTargetWizardPage /> },
+          { path: '/deploy-targets/:id', element: <DeploymentTargetDetailPage /> },
           { path: '/defense', element: <UnimplementedPage title="攻击防御" /> },
           { path: '/audit', element: <UnimplementedPage title="自动化审计" /> },
           { path: '/audit/report', element: <UnimplementedPage title="昨夜托管报告" /> },

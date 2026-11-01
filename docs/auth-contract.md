@@ -59,7 +59,7 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 ### 部署目标与密钥（P4 第一批）
 
-- `/api/v1/deployment-targets` 的列表、创建、详情、修改、删除与探测六个接口仅全局 admin 可用；member/viewer 一律 403。部署任务与回滚见下一节（P4.2），审批见再下一节（P4.3）。
+- `/api/v1/deployment-targets` 的列表、创建、详情、修改、删除与探测六个接口仅全局 admin 可用；member/viewer 一律 403。部署任务与回滚见下一节（P4.2），审批流尚未实现（P4.3）。
 - 目标是全局对象。字段：name（3–64 字节、单行、大小写不敏感唯一）、kind（目前仅 `http`）、environment（`development`/`staging`/`production`，默认 development）、endpoint（http/https，禁止 userinfo、query、fragment）、healthPath（默认 `/`，必须以 `/` 开头，≤256 字节）、status（`active`/`disabled`）。
 - 凭据加密存储：`AEGIS_SECRET_KEY`（base64 恰好 32 字节）启用 AES-256-GCM，密文布局 `[12 字节随机 nonce][ciphertext+tag]`，AAD 为 `deployment_target:<目标 id>`，因此密文不能跨目标复用。凭据只在探测请求内解密并以 `Authorization: Bearer <secret>` 发送；接口只返回 `hasSecret`，审计、日志与错误信息都不含凭据。未配置密钥时仍可创建无凭据目标，写入凭据返回 400，不会退化为明文存储。带凭据的目标必须使用 `https` 端点（仅回环地址允许 `http`），否则创建/更新返回 400。
 - 连通性探测：`POST /api/v1/deployment-targets/{id}/check` 对 `endpoint + healthPath` 发 GET，超时由 `AEGIS_DEPLOY_CHECK_TIMEOUT`（默认 5s，最大 1m）控制；2xx 记为健康，其余记录 `http <code>`、`timeout` 或脱敏后的网络错误，并更新 `last_check_at/last_check_ok/last_check_detail`。探测结果与 `deployment_target.check` 审计同事务提交。默认客户端最多 3 跳、不跨主机，且拒绝 `https`→`http` 降级。
@@ -69,9 +69,9 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 - 六个接口：`POST|GET /api/v1/projects/{projectId}/deployments`、`GET /api/v1/deployments/{id}`、`GET /api/v1/deployments/{id}/events?after&limit`、`POST /api/v1/deployments/{id}/cancel`、`POST /api/v1/deployments/{id}/rollback`；全部 admin-only，member/viewer 一律 403。
 - 协议：对目标执行 `POST <endpoint 去尾斜杠><deployPath>`（`deployPath` 默认 `/deploy`），JSON 体 `{deploymentId, project, version, environment, rollback, rollbackVersion}`；目标有凭据时携带 `Authorization: Bearer`，只在执行内存解密。2xx 记为成功；其他状态、超时（`AEGIS_DEPLOY_TIMEOUT`，默认 10m，最大 1h）与网络错误记为失败，detail 脱敏且不含凭据；不自动重试。
-- 状态：`queued → running → succeeded/failed/cancelled`，重启恢复把遗留 `running` 置 `interrupted`；命中审批环境时创建即 `awaiting_approval`（见 P4.3），审批通过后转 `queued`，拒绝/过期转 `rejected`。单 worker 持独立 advisory 租约，`SKIP LOCKED` 领取，300ms 看门狗在取消/终态时中止 HTTP 请求。
-- 回滚：仅对 `succeeded`/`failed` 的源部署可用，取同项目+目标中比源更早的最近一次 `succeeded` 版本，新建一条部署（`rollbackOf` 指向源，payload `rollback=true`、`rollbackVersion` 为该版本）；命中审批环境时同样先进入 `awaiting_approval`。无更早成功返回 400，源非终态 409；重复回滚会创建多条部署（部署非幂等）。
-- 审计：`deployment.create`（detail `target=<name> version=<v> approval=required|none`）、`deployment.cancel`（`from=<status>`）、`deployment.rollback`（`rollback_of=<id> version=<v>`），objectType `deployment`，与状态变更同事务；重复取消幂等且不重复记账。
+- 状态：`queued → running → succeeded/failed/cancelled`，重启恢复把遗留 `running` 置 `interrupted`；`awaiting_approval`/`rejected` 预留给 P4.3，本批创建始终直接排队。单 worker 持独立 advisory 租约，`SKIP LOCKED` 领取，300ms 看门狗在取消/终态时中止 HTTP 请求。
+- 回滚：仅对 `succeeded`/`failed` 的源部署可用，取同项目+目标中比源更早的最近一次 `succeeded` 版本，新建一条 `queued` 部署（`rollbackOf` 指向源，payload `rollback=true`、`rollbackVersion` 为该版本）；无更早成功返回 400，源非终态 409；重复回滚会创建多条部署（部署非幂等）。
+- 审计：`deployment.create`（detail `target=<name> version=<v> approval=none`）、`deployment.cancel`（`from=<status>`）、`deployment.rollback`（`rollback_of=<id> version=<v>`），objectType `deployment`，与状态变更同事务；重复取消幂等且不重复记账。
 
 ### 部署审批（P4.3）
 
@@ -122,6 +122,56 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 | 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 构建、部署与审批已实现（含可见性过滤 / admin-only）；审查、扫描、知识待业务接口落实 |
 | 发起/取消/重试构建、发起审查 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 构建已实现（重试仅限终态，不可见 404）；发起审查待业务接口落实 |
 | 发起部署、回滚及执行审批 | 允许 | 禁止 | 禁止 | 部署触发、回滚与审批已实现（admin-only，P4.2/P4.3） |
+| 管理部署目标、密钥、策略、设置、防御及业务审计 | 允许 | 禁止 | 禁止 | 部署目标已实现（admin-only，凭据加密存储，P4.1）；独立密钥管理、策略、设置、防御与业务审计待实现 |
+
+后续对象涉及具体项目时，需在服务端查询对象所属项目并校验访问权限。不要根据客户端提交的 role 或隐藏按钮决定授权。
+
+## 开发模式和验收
+
+前端不再提供业务演示数据或演示开关：项目、构建、账号与审计始终调用真实接口，未接入模块恒定显示未实现声明，不用演示数据冒充业务结果。登录与鉴权没有 mock 回退。
+
+后端验证：go test ./...、go vet ./...。前端验证：npm run build、npm run lint、npm test（session store 单元测试）。浏览器验证：先 npx playwright install chromium，再 npm run test:e2e；先设置 AEGIS_TEST_DATABASE_URL/AEGIS_TEST_REDIS_URL 运行后端真实集成测试；浏览器测试需另设置 AEGIS_E2E_DATABASE_URL/AEGIS_E2E_REDIS_URL 指向专用可丢弃服务，测试启动本地前后端，要求 8080、5173 端口空闲。E2E 后端显式设置 AEGIS_LOGIN_RATE_LIMIT=100，因为同一地址在一分钟内驱动多个账号登录；生产默认配额仍是 10。测试账号仅存在测试临时库；端到端配置使用随机 JWT 密钥，不使用生产数据。
+
+验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出；构建闭环覆盖 UI 创建带构建命令的项目、触发构建、列表与详情、SSE 推送日志中出现进程输出与 build succeeded、viewer 只读且触发 403；项目可见性与成员覆盖 UI 创建私有项目与徽章、成员页邀请查看者、非成员深链得到「未找到」、查看者成员无管理控件且触发构建 403、提升维护者后可触发。剩余能力（受控执行环境、仓库 clone、多 worker 并行吞吐）、生产备份及业务审计见 PR 记录与本地维护的开发文档（不入库）。
+
+## 客户端会话生命周期
+
+1. 启动通过 Cookie 刷新，随后 /auth/me 获取真实用户；等待恢复完成才进入业务布局。
+2. 登录只调用真实后端，不接受 mock JWT；旧 gp_session 本地缓存会被清理。
+3. access 即将过期时自动刷新；API 客户端对 401 最多刷新并重试一次，403 不刷新。
+4. 同页面共享一次刷新，Web Locks 串行化同源多标签页的 Cookie 轮换，BroadcastChannel 通知账号变更和退出。首版要求支持这些 API 的现代浏览器，且运行于 localhost 或 HTTPS 安全上下文；Web Locks 不可用时明确报错。
+5. refresh 返回 401 时清空内存并回到登录。网络失败可重试，不把断网误判为账号失效。
+6. 退出等待服务端撤销成功才清理状态；网络失败提示重试，不显示虚假退出成功。账号切换和退出清理 React Query 缓存。
+
+## 账号管理、审计与过期清理
+
+- 修改自己密码需验证当前密码，成功后仅保留当前会话；管理员重置密码会撤销目标用户全部会话。两者都要求新密码 12-72 字节。
+- 禁用账号立即撤销其全部会话并阻止登录；禁用状态只在密码正确时通过 403 account_disabled 透露，不会成为账号枚举信号。重新启用不恢复旧会话。
+- 角色为全局角色，每次鉴权实时读取数据库，角色变更对既有会话即时生效，无需撤销会话。禁用或降级最后一个可用管理员被拒绝（400），防止系统失去管理入口。
+- 持久化审计记录操作人（ID/用户名）、时间、动作、对象、结果、详情与请求 ID：登录成功、创建用户、修改密码（含当前密码错误的失败记录）、重置密码、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）、部署目标增删改与探测（deployment_target.create / deployment_target.update / deployment_target.remove / deployment_target.check）、部署创建/取消/回滚（deployment.create / deployment.cancel / deployment.rollback）。构建、成员、部署目标与部署任务审计都和状态变更同事务提交；重复取消幂等且不重复记账，detail 只写项目/成员与角色或目标名称与探测结果，不包含构建命令或凭据（重试写 `retry_of=<原构建号>`）。失败登录受 Redis 限流约束，只进结构化日志不进审计表；审计查询仅管理员。
+- 审计查询支持服务端筛选：`action`、`objectType`、`result`（success/failure）、`actor`（id 或用户名，用户名大小写不敏感）、`from`/`to`（RFC3339 或 `YYYY-MM-DD`，只给日期时 `to` 覆盖该 UTC 全天）。筛选同时作用于分页结果与 total，多个条件按 AND 组合；非法时间或未知 result 返回 400。审计页提供动作/对象/结果/操作人/日期范围筛选与重置。
+- 审计保留策略：`AEGIS_AUDIT_RETENTION` 可选，未设置或为 `0` 时**永久保留**（默认，审计不应默认丢证据）；设置为 24h–8760h 之间的时长时，后台任务每小时删除早于该窗口的审计行（启动时先执行一次），与过期会话清理共用同一个循环。删除是运维显式选择，而不是按业务对象做归档。
+- 过期会话及其 refresh 令牌历史由后台任务每小时清理（启动时先执行一次）。重放检测只需保留到会话绝对期限，到期即删；清理不影响活跃会话。
+
+## 角色矩阵
+
+下面是首版权限约定。除已提供的鉴权、账号管理、审计、项目、构建、部署目标、部署任务与审批接口，其他服务尚未实现；页面守卫用于交互，不能代替后端对象级授权。角色是**全局的**；项目可见性（public/private）与项目成员（maintainer/viewer）已实现 P1 与 P2（项目级权限设计文档本地维护，不入库）：成员身份既决定「能看哪个项目」，也决定「能改哪个项目」。
+
+**可见性规则**：全局 admin 永远可见；其他角色可见 public 项目，以及自己创建或被加入的 private 项目。不可见一律返回 **404**（不是 403），避免用私有 id 枚举项目。构建、日志与 SSE 继承所属项目的可见性。
+
+**写权限**：全局角色是上限——viewer 永不可写、admin 永远可写；private 项目另外要求调用者是该项目 maintainer，否则 **403**（可见但无权）。public 项目保持「任意 member 可写」。项目修改、归档、触发/取消/重试构建、成员增删改都走同一条判定（`projects.AuthorizeWrite`）。成员变更写审计：`project.member_add` / `project.member_update` / `project.member_remove`（objectType project）。
+
+| 操作 | admin | member | viewer | 实现状态 |
+| --- | --- | --- | --- | --- |
+| 读取自己的资料、退出、修改自己密码、查看/撤销自己的会话 | 允许 | 允许 | 允许 | 已实现 |
+| 创建/查询用户、重置密码、禁用/启用、变更角色、查询审计 | 允许 | 禁止 | 禁止 | 已实现 |
+| 读取项目（public，或自己创建/已被加入的 private） | 允许 | 允许 | 允许 | 已实现（可见性过滤） |
+| 读取其他 private 项目 | 允许 | 禁止（404） | 禁止（404） | 已实现（404 防枚举） |
+| 创建/修改项目、归档与恢复、修改可见性 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 已实现（可见性 + maintainer 叠加） |
+| 读取项目成员、增删改成员 | 允许 | public 允许；private 需项目 maintainer | 只读列表 | 已实现；创建者不可移除；成员变更写审计 |
+| 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 构建、部署与审批已实现（含可见性过滤 / admin-only）；审查、扫描、知识待业务接口落实 |
+| 发起/取消/重试构建、发起审查 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 构建已实现（重试仅限终态，不可见 404）；发起审查待业务接口落实 |
+| 发起部署、回滚及执行审批 | 允许 | 禁止 | 禁止 | 部署触发/回滚与审批均已实现（admin-only，P4.2/P4.3） |
 | 管理部署目标、密钥、策略、设置、防御及业务审计 | 允许 | 禁止 | 禁止 | 部署目标已实现（admin-only，凭据加密存储，P4.1）；独立密钥管理、策略、设置、防御与业务审计待实现 |
 
 后续对象涉及具体项目时，需在服务端查询对象所属项目并校验访问权限。不要根据客户端提交的 role 或隐藏按钮决定授权。

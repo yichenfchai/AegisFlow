@@ -14,7 +14,9 @@ export function Sidebar() {
               {group.title}
             </div>
             <nav className="space-y-0.5">
-              {group.items.map((item) => (
+              {group.items
+                .filter((item) => !item.adminOnly || user?.role === 'admin')
+                .map((item) => (
                 <NavLink
                   key={item.to}
                   to={item.to}
