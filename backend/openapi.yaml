@@ -1437,6 +1437,43 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/deployments:
+    get:
+      tags: [Deployments]
+      operationId: listDeployments
+      summary: List deployments across projects (admin only)
+      description: Newest first. projectId and status are optional filters; every deployment endpoint is admin-only and this list mirrors the global build list.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: projectId
+          in: query
+          required: false
+          description: Filter by project id; omit for all projects
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - name: status
+          in: query
+          required: false
+          description: Filter by deployment status; omit for all
+          schema: { type: string, enum: [queued, awaiting_approval, running, succeeded, failed, cancelled, interrupted, rejected] }
+      responses:
+        '200':
+          description: Deployment page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/DeploymentPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/deployments/{deploymentId}:
     get:
       tags: [Deployments]

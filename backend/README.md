@@ -124,12 +124,13 @@ server: {
 ### 部署任务（P4.2）
 
 - 协议：`POST <endpoint 去尾斜杠><deployPath>`（`deployPath` 默认 `/deploy`，可随目标配置），JSON 体 `{deploymentId, project, version, environment, rollback, rollbackVersion}`；目标有凭据时携带 `Authorization: Bearer`，只在执行时内存解密，绝不进入事件、审计或错误信息。2xx 为成功；其他状态码记 `http <code>`，超时（`AEGIS_DEPLOY_TIMEOUT`，默认 10m，最大 1h）与网络错误记脱敏 detail；部署请求不重试。
-- 状态：`queued → running → succeeded/failed/cancelled`，重启恢复把遗留 `running` 置 `interrupted`；`awaiting_approval`/`rejected` 已入库但由 P4.3 使用，本批创建始终直接排队，`approval_id` 留空。
+- 状态：`queued → running → succeeded/failed/cancelled`，重启恢复把遗留 `running` 置 `interrupted`；命中审批环境时创建即 `awaiting_approval`（见下一节），否则直接排队。
 - 单 worker：独立 PostgreSQL advisory 租约 `aegisflow:deployments:worker`，只有持锁副本恢复 `interrupted` 并用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取；300ms 状态看门狗在取消/终态时中止 HTTP 请求；`finish` 用独立 5s 上下文落终态。上游响应按行写入 `deployment_events`（批量 500ms；单行 ≤4096 字节、最多 5000 行 response，system 生命周期行不计入上限）。
+- 查询：项目内列表 `GET /api/v1/projects/{projectId}/deployments`，管理员全局列表 `GET /api/v1/deployments?projectId&status&limit&offset`（与构建列表同形）；详情、事件游标（`after&limit`）与取消/回滚都在 `/api/v1/deployments/{id}` 下。
 - 目标快照：创建时固化 `target_name/target_endpoint/target_environment`，之后改名或改端点不影响历史；执行使用目标当前配置，目标在执行前被禁用/删除会置 `failed`。
 - 回滚：`POST /api/v1/deployments/{id}/rollback` 仅接受 `succeeded`/`failed` 源，取同项目+目标中比源部署更早的最近一次 `succeeded` 版本，新建一条 `queued` 部署（`rollbackOf` 指向源，payload `rollback=true`、`rollbackVersion` 为该版本）；无更早成功返回 400，源非终态 409；重复回滚会创建多条部署（非幂等，审计可追溯）。
 - 权限与审计：六个部署端点全部 admin-only（member/viewer 403）；`deployment.create`（detail `target=<name> version=<v> approval=none`）、`deployment.cancel`（`from=<status>`）、`deployment.rollback`（`rollback_of=<id> version=<v>`）与状态变更同事务，重复取消失败不重复记账。
-- 本批边界：前端部署/审批页面（尚未接入）、部署产物与构建强制关联（`buildId` 可选，提供时必须是同项目 `succeeded` 构建）、自定义 HTTP 方法与路径、自动重试均未做。
+- 本批边界：部署产物与构建强制关联（`buildId` 可选，提供时必须是同项目 `succeeded` 构建）、自定义 HTTP 方法与路径、自动重试均未做。
 
 
 ### 部署审批（P4.3）

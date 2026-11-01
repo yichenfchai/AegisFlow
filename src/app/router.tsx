@@ -10,6 +10,10 @@ import { ProjectWizardPage } from '@/features/projects/ProjectWizardPage'
 import { ProjectsPage } from '@/features/projects/ProjectsPage'
 import { ProjectMembersPage } from '@/features/projects/ProjectMembersPage'
 import { AccountSecurityPage } from '@/features/account/AccountSecurityPage'
+import { DeploymentListPage } from '@/features/deployments/DeploymentListPage'
+import { DeploymentNewPage } from '@/features/deployments/DeploymentNewPage'
+import { DeploymentDetailPage } from '@/features/deployments/DeploymentDetailPage'
+import { ApprovalListPage } from '@/features/approvals/ApprovalListPage'
 import { DeploymentTargetsPage } from '@/features/deployments/DeploymentTargetsPage'
 import { DeploymentTargetWizardPage } from '@/features/deployments/DeploymentTargetWizardPage'
 import { DeploymentTargetDetailPage } from '@/features/deployments/DeploymentTargetDetailPage'
@@ -37,22 +41,23 @@ export const router = createBrowserRouter([
       { path: '/account', element: <AccountSecurityPage /> },
 
       // 非主线业务：恒定未实现
-      { path: '/deploys', element: <UnimplementedPage title="部署记录" /> },
-      { path: '/deploys/:id', element: <UnimplementedPage title="部署详情" /> },
       { path: '/reviews', element: <UnimplementedPage title="审查中心" /> },
       { path: '/reviews/new', element: <UnimplementedPage title="发起审查" /> },
       { path: '/reviews/:id', element: <UnimplementedPage title="审查详情" /> },
       { path: '/scans', element: <UnimplementedPage title="安全扫描" /> },
-      { path: '/approvals', element: <UnimplementedPage title="审批中心" /> },
       { path: '/knowledge', element: <UnimplementedPage title="知识库" /> },
 
-      // 管理员入口：真实部署目标、用户与审计；其余为未实现占位
+      // 管理员入口：真实部署目标、部署记录、审批、用户与审计；其余为未实现占位
       {
         element: <SessionGate adminOnly />,
         children: [
           { path: '/deploy-targets', element: <DeploymentTargetsPage /> },
           { path: '/deploy-targets/new', element: <DeploymentTargetWizardPage /> },
           { path: '/deploy-targets/:id', element: <DeploymentTargetDetailPage /> },
+          { path: '/deploys', element: <DeploymentListPage /> },
+          { path: '/deploys/new', element: <DeploymentNewPage /> },
+          { path: '/deploys/:id', element: <DeploymentDetailPage /> },
+          { path: '/approvals', element: <ApprovalListPage /> },
           { path: '/defense', element: <UnimplementedPage title="攻击防御" /> },
           { path: '/audit', element: <UnimplementedPage title="自动化审计" /> },
           { path: '/audit/report', element: <UnimplementedPage title="昨夜托管报告" /> },

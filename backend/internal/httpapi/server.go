@@ -152,6 +152,9 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	deploymentTargets.DELETE("/:id", s.removeDeploymentTarget)
 	deploymentTargets.POST("/:id/check", s.checkDeploymentTarget)
 	deployRoutes := api.Group("/deployments", s.authenticate(), s.requireAdmin())
+	// The global list mirrors the build list: optional projectId and status
+	// filters, newest first. Deployments themselves stay admin-only.
+	deployRoutes.GET("", s.listDeploymentsGlobal)
 	deployRoutes.GET("/:id", s.getDeployment)
 	deployRoutes.GET("/:id/events", s.getDeploymentEvents)
 	deployRoutes.POST("/:id/cancel", s.cancelDeployment)
@@ -1122,6 +1125,26 @@ func (s *Server) listDeployments(c *gin.Context) {
 		return
 	}
 	list, total, err := s.deployments.ListDeployments(c.Request.Context(), actorFrom(c), c.Param("id"), c.Query("status"), limit, offset)
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": list, "total": total, "limit": limit, "offset": offset})
+}
+
+// listDeploymentsGlobal is the admin-wide deployment list. It mirrors the build
+// list shape so the deployments page can paginate server-side; projectId and
+// status are optional filters.
+func (s *Server) listDeploymentsGlobal(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	limit, offset, ok := s.page(c)
+	if !ok {
+		return
+	}
+	list, total, err := s.deployments.ListDeployments(c.Request.Context(), actorFrom(c), c.Query("projectId"), c.Query("status"), limit, offset)
 	if err != nil {
 		s.deploymentError(c, err)
 		return

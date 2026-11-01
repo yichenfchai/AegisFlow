@@ -210,6 +210,29 @@ func TestDeploymentTaskRoutesAndRBAC(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil || page.Data.Total != 2 {
 		t.Fatalf("filtered payload: %s", w.Body.String())
 	}
+	// The admin-wide list mirrors the build list: optional projectId/status
+	// filters, and it is admin-only like every other deployment endpoint.
+	if w = request(h, "GET", "/api/v1/deployments?limit=10&offset=0", "", adminToken); w.Code != 200 {
+		t.Fatalf("global list: %d %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil || page.Data.Total != 3 {
+		t.Fatalf("global list payload: %s", w.Body.String())
+	}
+	if w = request(h, "GET", "/api/v1/deployments?projectId="+projectID+"&status=cancelled", "", adminToken); w.Code != 200 {
+		t.Fatalf("global filtered list: %d", w.Code)
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil || page.Data.Total != 1 {
+		t.Fatalf("global filtered payload: %s", w.Body.String())
+	}
+	if w = request(h, "GET", "/api/v1/deployments?status=bogus", "", adminToken); w.Code != 400 {
+		t.Fatalf("global invalid status: %d", w.Code)
+	}
+	if w = request(h, "GET", "/api/v1/deployments", "", memberToken); w.Code != 403 {
+		t.Fatalf("member global list: %d", w.Code)
+	}
+	if w = request(h, "GET", "/api/v1/deployments", "", viewerToken); w.Code != 403 {
+		t.Fatalf("viewer global list: %d", w.Code)
+	}
 	if w = request(h, "GET", "/api/v1/projects/"+projectID+"/deployments?status=bogus", "", adminToken); w.Code != 400 {
 		t.Fatalf("bad status: %d", w.Code)
 	}
