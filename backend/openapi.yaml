@@ -112,6 +112,27 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /metrics:
+    get:
+      tags: [Health]
+      operationId: metrics
+      summary: Prometheus text exposition on the separate metrics listener
+      description: |
+        Served only when AEGIS_METRICS_ADDR is set, on that separate listener
+        (never on the API listener), and deliberately unauthenticated so a
+        scraper needs no session. Bind it to loopback or protect it at the
+        proxy. Exposes aegisflow_http_requests_total and
+        aegisflow_http_request_duration_seconds keyed by method, matched route
+        template and status (raw paths never appear as labels), plus
+        aegisflow_builds{status} sampled from the database at scrape time.
+        Responses are text/plain; version=0.0.4 (not the JSON envelope).
+      security: []
+      responses:
+        '200':
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema: { type: string }
   /api/v1/auth/login:
     post:
       tags: [Auth]

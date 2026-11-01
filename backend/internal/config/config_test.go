@@ -29,7 +29,7 @@ func unsetEnv(t *testing.T, key string) {
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_APPROVAL_TTL"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_APPROVAL_TTL"} {
 		t.Setenv(key, "")
 	}
 	unsetEnv(t, "AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
@@ -244,6 +244,32 @@ func TestAuditRetentionConfig(t *testing.T) {
 			c, err := Load()
 			if (err != nil) != tc.invalid || (!tc.invalid && c.AuditRetention != tc.want) {
 				t.Fatalf("retention=%v err=%v", c.AuditRetention, err)
+			}
+		})
+	}
+}
+
+func TestMetricsAddrConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    string
+		invalid bool
+	}{
+		{"", "", false},
+		{"127.0.0.1:9090", "127.0.0.1:9090", false},
+		{"localhost:0", "localhost:0", false},
+		{"[::1]:9090", "[::1]:9090", false},
+		{"9090", "", true},
+		{"127.0.0.1", "", true},
+		{"127.0.0.1:abc", "", true},
+		{"127.0.0.1:70000", "", true},
+	} {
+		t.Run("value="+tc.value, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_METRICS_ADDR", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid || (!tc.invalid && c.MetricsAddr != tc.want) {
+				t.Fatalf("metricsAddr=%q err=%v", c.MetricsAddr, err)
 			}
 		})
 	}

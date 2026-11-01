@@ -144,6 +144,13 @@ server: {
 - 审计：`approval.request`（detail `deployment=<id>`）、`approval.approve`（`deployment=<id>`）、`approval.reject`（`deployment=<id> reason=<...>` 可选）、`approval.expire`（`deployment=<id> reason=approval expired|deployment cancelled`），objectType `approval`。
 - 本批边界：多级会签、通知渠道、前端审批页面仍未实现（页面保持未实现声明）。
 
+### 运行指标（P4）
+
+- 可选启用：`AEGIS_METRICS_ADDR=127.0.0.1:9090` 时服务在**独立监听地址**提供 `GET /metrics`（Prometheus 文本格式，`text/plain; version=0.0.4`）。默认关闭；该端点**没有用户鉴权**（scraper 无法持会话），因此只应绑定回环地址，或仅经受保护的代理暴露，且不要与 API 端口共用。
+- 指标：`aegisflow_http_requests_total{method,route,status}`、`aegisflow_http_request_duration_seconds`（histogram，桶 5ms–10s），标签使用 **Gin 匹配到的路由模板**（如 `/api/v1/builds/:id`），未匹配请求归入 `unmatched`，因此原始路径、资源 id 不会进入标签；另有 `aegisflow_builds{status}` 在抓取时按状态统计构建数（含 0，保证序列稳定）。
+- 抓取失败时 `aegisflow_builds` 整组缺失并记录错误日志，HTTP 计数器不受影响；指标端点自身不计入 HTTP 指标（它不在 API 监听器上）。
+- 不提供告警规则与链路追踪：告警按部署环境在 Prometheus/Alertmanager 侧配置，追踪按需另行引入。
+
 ### Cookie 与前端对齐
 
 - 名称 `aegis_refresh`，host-only（无 Domain），`Path=/api/v1/auth`，`HttpOnly`，`SameSite=Strict`；Secure 完全由 `AEGIS_COOKIE_SECURE` 显式布尔 `true/false` 控制，其他值启动失败。
@@ -223,6 +230,6 @@ go test ./cmd/server/ -run TestRealProcessLifecycle -count=1
 
 ## 架构
 
-cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；worker 通过租约启动并随信号上下文退出；进程生命周期验收测试见 cmd/server/ops_test.go）；internal/config 校验连接 URL、连接数、登录配额、凭据密钥与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、可见性与成员、分页与事务内审计，读写都带可见性谓词，不依赖 Gin）；internal/builds 是构建流水线（触发与编号、单 worker 租约、SKIP LOCKED 领取、临时目录执行、取消看门狗、批量日志与重启恢复，不依赖 Gin）；internal/deployments 是 admin-only 部署目标与部署任务（目标注册表、AES-256-GCM 凭据加密、连通性探测、部署编号/快照/状态机、租约 worker、事件游标、回滚与事务内审计，不依赖 Gin）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.11 与 Go 1.23 兼容。
+cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；worker 通过租约启动并随信号上下文退出；进程生命周期验收测试见 cmd/server/ops_test.go）；internal/config 校验连接 URL、连接数、登录配额、凭据密钥与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、可见性与成员、分页与事务内审计，读写都带可见性谓词，不依赖 Gin）；internal/builds 是构建流水线（触发与编号、单 worker 租约、SKIP LOCKED 领取、临时目录执行、取消看门狗、批量日志与重启恢复，不依赖 Gin）；internal/metrics 是零依赖的 Prometheus 文本暴露（HTTP 计数/延迟直方图 + 构建状态 gauge，独立监听）；internal/deployments 是 admin-only 部署目标与部署任务（目标注册表、AES-256-GCM 凭据加密、连通性探测、部署编号/快照/状态机、租约 worker、事件游标、回滚与事务内审计，不依赖 Gin）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.11 与 Go 1.23 兼容。
 
 本地双实例样例见 [compose.yaml](../compose.yaml) 与 [部署说明](../deploy/README.md)。应用副本可横向扩展，但数据库、Redis、入口网关的高可用需另行部署；样例单节点依赖不等于整套服务高可用。数据库集成测试未配置 URL 会明确 Skip，不能将跳过当作生产验证通过。

@@ -19,6 +19,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/config"
 	"github.com/yichenfchai/AegisFlow/backend/internal/deployments"
 	"github.com/yichenfchai/AegisFlow/backend/internal/httpapi"
+	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 )
@@ -122,8 +123,45 @@ func run(logger *slog.Logger) error {
 		ApprovalEnvironments: cfg.ApprovalEnvironments,
 		ApprovalTTL:          cfg.ApprovalTTL,
 	})
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService})
+	// Metrics are opt-in and live on their own listener: the public API origin
+	// must not expose deployment-wide counters, and scraping needs no session.
+	var monitoring *metrics.Registry
+	if cfg.MetricsAddr != "" {
+		monitoring = metrics.New()
+	}
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Metrics: monitoring})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	if monitoring != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", monitoring.Handler(func(ctx context.Context) []metrics.Gauge {
+			counts, err := pipeline.StatusCounts(ctx)
+			if err != nil {
+				logger.Error("metrics build gauges unavailable", "error", err)
+				return nil
+			}
+			gauges := make([]metrics.Gauge, 0, len(counts))
+			for status, count := range counts {
+				gauges = append(gauges, metrics.Gauge{Name: "aegisflow_builds", Help: "Builds by status.", Labels: map[string]string{"status": status}, Value: float64(count)})
+			}
+			return gauges
+		}))
+		metricsServer := &http.Server{Addr: cfg.MetricsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
+		metricsListener, listenErr := net.Listen("tcp", cfg.MetricsAddr)
+		if listenErr != nil {
+			return listenErr
+		}
+		logger.Info("metrics listening", "address", metricsListener.Addr().String())
+		go func() {
+			if serveErr := metricsServer.Serve(metricsListener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				logger.Error("metrics server stopped", "error", serveErr)
+			}
+		}()
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = metricsServer.Shutdown(shutdownCtx)
+		}()
+	}
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	// The worker finalizes its in-flight build as interrupted when this
