@@ -138,6 +138,61 @@ var Migrations = [][]string{{
 	 last_check_detail TEXT NOT NULL DEFAULT '')`,
 	`CREATE UNIQUE INDEX deployment_targets_name_lower_idx ON deployment_targets(lower(name))`,
 	`CREATE INDEX deployment_targets_status_name_idx ON deployment_targets(status, lower(name))`,
+}, {
+	// Deployment tasks (P4.2, design §2): deployments are new rows per attempt,
+	// never mutated history, and snapshot the target name/endpoint/environment
+	// at trigger time so a later target rename or edit stays explainable.
+	// deployment_number is a per-project monotonic sequence allocated from
+	// projects.deploy_count under the project row lock (the build_count
+	// pattern). deployment_events is the response/lifecycle timeline: the
+	// identity id doubles as the client cursor. approvals is created here, and
+	// awaiting_approval/rejected are part of the status CHECK, so P4.3 can add
+	// the approval service without another migration; P4.2 always enqueues
+	// directly and leaves approval_id empty. deploy_path on the target is the
+	// path appended to its endpoint for the deploy POST (default /deploy).
+	`ALTER TABLE deployment_targets ADD COLUMN deploy_path TEXT NOT NULL DEFAULT '/deploy'`,
+	`ALTER TABLE projects ADD COLUMN deploy_count BIGINT NOT NULL DEFAULT 0`,
+	`CREATE TABLE deployments (
+	 id TEXT PRIMARY KEY,
+	 project_id TEXT NOT NULL REFERENCES projects(id),
+	 target_id TEXT NOT NULL REFERENCES deployment_targets(id),
+	 target_name TEXT NOT NULL DEFAULT '',
+	 target_endpoint TEXT NOT NULL DEFAULT '',
+	 target_environment TEXT NOT NULL DEFAULT '',
+	 deployment_number BIGINT NOT NULL,
+	 status TEXT NOT NULL CHECK(status IN ('queued','awaiting_approval','running','succeeded','failed','cancelled','interrupted','rejected')),
+	 version TEXT NOT NULL,
+	 build_id TEXT NOT NULL DEFAULT '',
+	 rollback_of TEXT NOT NULL DEFAULT '',
+	 approval_id TEXT NOT NULL DEFAULT '',
+	 triggered_by TEXT NOT NULL DEFAULT '',
+	 detail TEXT NOT NULL DEFAULT '',
+	 created_at BIGINT NOT NULL,
+	 started_at BIGINT NOT NULL DEFAULT 0,
+	 finished_at BIGINT NOT NULL DEFAULT 0)`,
+	`CREATE UNIQUE INDEX deployments_project_number_idx ON deployments(project_id, deployment_number)`,
+	`CREATE INDEX deployments_status_created_idx ON deployments(status, created_at)`,
+	`CREATE INDEX deployments_target_created_idx ON deployments(target_id, created_at DESC)`,
+	`CREATE TABLE deployment_events (
+	 id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+	 deployment_id TEXT NOT NULL REFERENCES deployments(id),
+	 stream TEXT NOT NULL CHECK(stream IN ('system','response')),
+	 message TEXT NOT NULL,
+	 created_at BIGINT NOT NULL)`,
+	`CREATE INDEX deployment_events_deployment_idx ON deployment_events(deployment_id, id)`,
+	`CREATE TABLE approvals (
+	 id TEXT PRIMARY KEY,
+	 deployment_id TEXT NOT NULL REFERENCES deployments(id),
+	 project_id TEXT NOT NULL REFERENCES projects(id),
+	 status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','expired')),
+	 requested_by TEXT NOT NULL DEFAULT '',
+	 decided_by TEXT NOT NULL DEFAULT '',
+	 reason TEXT NOT NULL DEFAULT '',
+	 created_at BIGINT NOT NULL,
+	 expires_at BIGINT NOT NULL,
+	 decided_at BIGINT NOT NULL DEFAULT 0)`,
+	`CREATE UNIQUE INDEX approvals_deployment_idx ON approvals(deployment_id)`,
+	`CREATE INDEX approvals_pending_idx ON approvals(status, expires_at)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped

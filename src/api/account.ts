@@ -110,11 +110,26 @@ export const AUDIT_ACTION_TEXT: Record<string, string> = {
   'project.member_remove': '移除项目成员',
   'build.trigger': '触发构建',
   'build.cancel': '取消构建',
+  'deployment.create': '创建部署',
+  'deployment.cancel': '取消部署',
+  'deployment.rollback': '回滚部署',
+  'approval.request': '发起审批',
+  'approval.approve': '批准审批',
+  'approval.reject': '拒绝审批',
+  'approval.expire': '审批过期',
+  'build.retry': '重试构建',
+  'deployment_target.create': '创建部署目标',
+  'deployment_target.update': '更新部署目标',
+  'deployment_target.remove': '删除部署目标',
+  'deployment_target.check': '检查部署目标',
 }
 
 export const AUDIT_OBJECT_TEXT: Record<string, string> = {
   user: '用户',
   session: '会话',
   project: '项目',
+  deployment_target: '部署目标',
   build: '构建',
+  deployment: '部署',
+  approval: '审批',
 }

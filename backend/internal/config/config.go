@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -45,6 +46,14 @@ type Config struct {
 	SecretKey []byte
 	// DeployCheckTimeout bounds one deployment-target connectivity probe.
 	DeployCheckTimeout time.Duration
+	// DeployTimeout bounds one deployment execution (default 10m, max 1h).
+	DeployTimeout time.Duration
+	// ApprovalEnvironments lists target environments that require an approval
+	// before execution. An empty slice disables approvals; when the variable is
+	// unset the default is ["production"].
+	ApprovalEnvironments []string
+	// ApprovalTTL bounds how long a pending approval stays valid (default 24h).
+	ApprovalTTL time.Duration
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
@@ -185,6 +194,42 @@ func Load() (Config, error) {
 	}
 	if c.DeployCheckTimeout > time.Minute {
 		return c, errors.New("AEGIS_DEPLOY_CHECK_TIMEOUT must be at most 1m")
+	}
+	// Deployment execution bound; the worker aborts the HTTP request past it.
+	c.DeployTimeout, err = duration("AEGIS_DEPLOY_TIMEOUT", "10m")
+	if err != nil {
+		return c, err
+	}
+	if c.DeployTimeout > time.Hour {
+		return c, errors.New("AEGIS_DEPLOY_TIMEOUT must be at most 1h")
+	}
+	// Deployment approvals. Presence of the variable is authoritative: an
+	// explicitly empty value disables approvals, while an unset variable uses
+	// the production default. Only the three documented environments are valid.
+	rawEnvironments, present := os.LookupEnv("AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
+	if !present {
+		rawEnvironments = "production"
+	}
+	for _, entry := range strings.Split(rawEnvironments, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		switch entry {
+		case "development", "staging", "production":
+		default:
+			return c, errors.New("AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS must contain only development, staging or production")
+		}
+		if !slices.Contains(c.ApprovalEnvironments, entry) {
+			c.ApprovalEnvironments = append(c.ApprovalEnvironments, entry)
+		}
+	}
+	c.ApprovalTTL, err = duration("AEGIS_APPROVAL_TTL", "24h")
+	if err != nil {
+		return c, err
+	}
+	if c.ApprovalTTL < time.Hour || c.ApprovalTTL > 168*time.Hour {
+		return c, errors.New("AEGIS_APPROVAL_TTL must be between 1h and 168h")
 	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {
 		origin = strings.TrimSpace(origin)

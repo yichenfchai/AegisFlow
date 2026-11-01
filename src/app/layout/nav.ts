@@ -3,6 +3,8 @@ export interface NavItem {
   to: string
   icon: string
   badge?: number
+  /** Admin-only pages are hidden from member/viewer sidebars; the route guard and the API still enforce the role. */
+  adminOnly?: boolean
 }
 
 export interface NavGroup {
@@ -20,7 +22,7 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { label: '项目列表', to: '/', icon: 'folder_open' },
       { label: '构建流水线', to: '/builds', icon: 'alt_route' },
-      { label: '部署记录', to: '/deploys', icon: 'rocket_launch' },
+      { label: '部署记录', to: '/deploys', icon: 'rocket_launch', adminOnly: true },
     ],
   },
   {
@@ -28,14 +30,14 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { label: '审查中心', to: '/reviews', icon: 'fact_check' },
       { label: '安全扫描', to: '/scans', icon: 'shield' },
-      { label: '审批中心', to: '/approvals', icon: 'how_to_reg' },
+      { label: '审批中心', to: '/approvals', icon: 'how_to_reg', adminOnly: true },
       { label: '知识库', to: '/knowledge', icon: 'menu_book' },
     ],
   },
   {
     title: '运行与治理',
     items: [
-      { label: '部署目标', to: '/deploy-targets', icon: 'dns' },
+      { label: '部署目标', to: '/deploy-targets', icon: 'dns', adminOnly: true },
       { label: '攻击防御', to: '/defense', icon: 'security' },
       { label: '自动化审计', to: '/audit', icon: 'policy' },
       { label: '自动化策略', to: '/policies', icon: 'rule' },
