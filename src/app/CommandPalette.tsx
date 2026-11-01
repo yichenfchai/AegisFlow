@@ -47,6 +47,9 @@ export function CommandPalette() {
       { group: '页面', label: '构建流水线', to: '/builds' },
       { group: '页面', label: '账号安全 · 修改密码与管理会话', to: '/account' },
       { group: '页面', label: '用户与审计 · 管理员', to: '/settings' },
+      { group: '页面', label: '部署记录 · 管理员', to: '/deploys' },
+      { group: '页面', label: '审批中心 · 管理员', to: '/approvals' },
+      { group: '页面', label: '部署目标 · 管理员', to: '/deploy-targets' },
     ],
     [],
   )

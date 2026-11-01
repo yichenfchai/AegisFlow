@@ -19,6 +19,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/builds"
 	"github.com/yichenfchai/AegisFlow/backend/internal/deployments"
+	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 )
@@ -50,6 +51,7 @@ type Server struct {
 	origins      map[string]bool
 	limiter      ratelimit.Limiter
 	cookieSecure bool
+	metrics      *metrics.Registry
 }
 
 const refreshCookieName = "aegis_refresh"
@@ -69,6 +71,9 @@ type Options struct {
 	// Deployments enables the admin-only deployment-target routes; nil fails
 	// closed with 503 like any other missing shared dependency.
 	Deployments *deployments.Service
+	// Metrics, when set, records request counters and latency histograms keyed
+	// by the matched route template. Nil disables recording.
+	Metrics *metrics.Registry
 }
 
 // New builds an isolated Gin engine; business services depend only on context.Context.
@@ -77,7 +82,7 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	if len(options) > 0 {
 		opts = options[0]
 	}
-	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure}
+	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure, metrics: opts.Metrics}
 	for _, o := range origins {
 		s.origins[o] = true
 	}
@@ -130,6 +135,10 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	projectRoutes.POST("/:id/members", s.requireRole("admin", "member"), s.addProjectMember)
 	projectRoutes.PATCH("/:id/members/:userId", s.requireRole("admin", "member"), s.updateProjectMember)
 	projectRoutes.DELETE("/:id/members/:userId", s.requireRole("admin", "member"), s.removeProjectMember)
+	// Deployment tasks are admin-only (design §7); the project path only scopes
+	// creation/listing, authorization is global.
+	projectRoutes.GET("/:id/deployments", s.requireAdmin(), s.listDeployments)
+	projectRoutes.POST("/:id/deployments", s.requireAdmin(), s.createDeployment)
 	buildRoutes := api.Group("/builds", s.authenticate())
 	buildRoutes.GET("", s.listBuilds)
 	buildRoutes.GET("/:id", s.getBuild)
@@ -137,8 +146,9 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	buildRoutes.GET("/:id/events", s.streamBuildEvents)
 	buildRoutes.POST("/:id/cancel", s.requireRole("admin", "member"), s.cancelBuild)
 	buildRoutes.POST("/:id/retry", s.requireRole("admin", "member"), s.retryBuild)
-	// Deployment targets are global administrative objects: manage and probe
-	// them is admin-only (deploy/rollback/approvals arrive with P4.2/P4.3).
+	// Deployment targets, deploy tasks and approvals are global administrative
+	// objects: manage, probe, execute, roll back and decide approvals is
+	// admin-only.
 	deploymentTargets := api.Group("/deployment-targets", s.authenticate(), s.requireAdmin())
 	deploymentTargets.GET("", s.listDeploymentTargets)
 	deploymentTargets.POST("", s.createDeploymentTarget)
@@ -146,6 +156,18 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	deploymentTargets.PATCH("/:id", s.updateDeploymentTarget)
 	deploymentTargets.DELETE("/:id", s.removeDeploymentTarget)
 	deploymentTargets.POST("/:id/check", s.checkDeploymentTarget)
+	deployRoutes := api.Group("/deployments", s.authenticate(), s.requireAdmin())
+	// The global list mirrors the build list: optional projectId and status
+	// filters, newest first. Deployments themselves stay admin-only.
+	deployRoutes.GET("", s.listDeploymentsGlobal)
+	deployRoutes.GET("/:id", s.getDeployment)
+	deployRoutes.GET("/:id/events", s.getDeploymentEvents)
+	deployRoutes.POST("/:id/cancel", s.cancelDeployment)
+	deployRoutes.POST("/:id/rollback", s.rollbackDeployment)
+	approvalRoutes := api.Group("/approvals", s.authenticate(), s.requireAdmin())
+	approvalRoutes.GET("", s.listApprovals)
+	approvalRoutes.POST("/:id/approve", s.approveApproval)
+	approvalRoutes.POST("/:id/reject", s.rejectApproval)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }
@@ -929,9 +951,9 @@ func (s *Server) retryBuild(c *gin.Context) {
 func (s *Server) deploymentTargetError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, deployments.ErrValidation):
-		s.fail(c, 400, "validation_failed", "name 3-64 bytes on one line; kind http; environment development, staging or production; endpoint an http(s) URL without userinfo, query or fragment; healthPath starting with /; secret at most 4096 bytes without control characters")
+		s.fail(c, 400, "validation_failed", "name 3-64 bytes on one line; kind http; environment development, staging or production; endpoint an http(s) URL without userinfo, query or fragment; healthPath and deployPath starting with /; secret at most 4096 bytes without control characters")
 	case errors.Is(err, deployments.ErrConflict):
-		s.fail(c, 409, "conflict", "deployment target name already exists")
+		s.fail(c, 409, "conflict", "deployment target name already exists, or the target has deployment history and cannot be removed")
 	case errors.Is(err, deployments.ErrNotFound):
 		s.fail(c, 404, "not_found", "resource not found")
 	default:
@@ -968,6 +990,7 @@ func (s *Server) createDeploymentTarget(c *gin.Context) {
 		Environment string `json:"environment"`
 		Endpoint    string `json:"endpoint"`
 		HealthPath  string `json:"healthPath"`
+		DeployPath  string `json:"deployPath"`
 		Secret      string `json:"secret"`
 		Status      string `json:"status"`
 	}
@@ -976,7 +999,7 @@ func (s *Server) createDeploymentTarget(c *gin.Context) {
 	}
 	target, err := s.deployments.Create(c.Request.Context(), actorFrom(c), deployments.Input{
 		Name: input.Name, Kind: input.Kind, Environment: input.Environment, Endpoint: input.Endpoint,
-		HealthPath: input.HealthPath, Secret: input.Secret, Status: input.Status,
+		HealthPath: input.HealthPath, DeployPath: input.DeployPath, Secret: input.Secret, Status: input.Status,
 	})
 	if err != nil {
 		s.deploymentTargetError(c, err)
@@ -1008,19 +1031,20 @@ func (s *Server) updateDeploymentTarget(c *gin.Context) {
 		Environment *string `json:"environment"`
 		Endpoint    *string `json:"endpoint"`
 		HealthPath  *string `json:"healthPath"`
+		DeployPath  *string `json:"deployPath"`
 		Secret      *string `json:"secret"`
 		Status      *string `json:"status"`
 	}
 	if !s.decode(c, &input) {
 		return
 	}
-	if input.Name == nil && input.Environment == nil && input.Endpoint == nil && input.HealthPath == nil && input.Secret == nil && input.Status == nil {
+	if input.Name == nil && input.Environment == nil && input.Endpoint == nil && input.HealthPath == nil && input.DeployPath == nil && input.Secret == nil && input.Status == nil {
 		s.fail(c, 400, "invalid_request", "at least one deployment target field is required")
 		return
 	}
 	target, err := s.deployments.Update(c.Request.Context(), actorFrom(c), c.Param("id"), deployments.Patch{
 		Name: input.Name, Environment: input.Environment, Endpoint: input.Endpoint,
-		HealthPath: input.HealthPath, Secret: input.Secret, Status: input.Status,
+		HealthPath: input.HealthPath, DeployPath: input.DeployPath, Secret: input.Secret, Status: input.Status,
 	})
 	if err != nil {
 		s.deploymentTargetError(c, err)
@@ -1056,6 +1080,209 @@ func (s *Server) checkDeploymentTarget(c *gin.Context) {
 		return
 	}
 	s.respond(c, 200, result)
+}
+
+// deploymentError maps deploy-task errors to the shared error envelope.
+func (s *Server) deploymentError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, deployments.ErrValidation):
+		s.fail(c, 400, "validation_failed", "project, target, version, buildId or approval reason is invalid, the target is disabled, no earlier succeeded version can be rolled back to, or the request is not acceptable")
+	case errors.Is(err, deployments.ErrConflict):
+		s.fail(c, 409, "conflict", "deployment or approval is already terminal, is not in the expected state for this operation, or the deployment is no longer awaiting approval")
+	case errors.Is(err, deployments.ErrNotFound):
+		s.fail(c, 404, "not_found", "resource not found")
+	default:
+		s.logger.ErrorContext(c.Request.Context(), "deployment request failed", "requestId", requestID(c), "error", err)
+		s.fail(c, 500, "internal_error", "internal server error")
+	}
+}
+
+func (s *Server) createDeployment(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	var input struct {
+		TargetID string `json:"targetId"`
+		Version  string `json:"version"`
+		BuildID  string `json:"buildId"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	deployment, err := s.deployments.CreateDeployment(c.Request.Context(), actorFrom(c), c.Param("id"), deployments.DeployInput{
+		TargetID: input.TargetID, Version: input.Version, BuildID: input.BuildID,
+	})
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 201, deployment)
+}
+
+func (s *Server) listDeployments(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	limit, offset, ok := s.page(c)
+	if !ok {
+		return
+	}
+	list, total, err := s.deployments.ListDeployments(c.Request.Context(), actorFrom(c), c.Param("id"), c.Query("status"), limit, offset)
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": list, "total": total, "limit": limit, "offset": offset})
+}
+
+// listDeploymentsGlobal is the admin-wide deployment list. It mirrors the build
+// list shape so the deployments page can paginate server-side; projectId and
+// status are optional filters.
+func (s *Server) listDeploymentsGlobal(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	limit, offset, ok := s.page(c)
+	if !ok {
+		return
+	}
+	list, total, err := s.deployments.ListDeployments(c.Request.Context(), actorFrom(c), c.Query("projectId"), c.Query("status"), limit, offset)
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": list, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *Server) getDeployment(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	deployment, err := s.deployments.GetDeployment(c.Request.Context(), actorFrom(c), c.Param("id"))
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, deployment)
+}
+
+func (s *Server) getDeploymentEvents(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	after := int64(0)
+	if value := c.Query("after"); value != "" {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || parsed < 0 {
+			s.fail(c, 400, "invalid_request", "after must be a non-negative integer")
+			return
+		}
+		after = parsed
+	}
+	limit := 200
+	if value := c.Query("limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > 1000 {
+			s.fail(c, 400, "invalid_request", "limit must be an integer between 1 and 1000")
+			return
+		}
+		limit = parsed
+	}
+	events, err := s.deployments.DeploymentEvents(c.Request.Context(), actorFrom(c), c.Param("id"), after, limit)
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": events})
+}
+
+func (s *Server) cancelDeployment(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	if !s.decode(c, &struct{}{}) {
+		return
+	}
+	deployment, err := s.deployments.CancelDeployment(c.Request.Context(), actorFrom(c), c.Param("id"))
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, deployment)
+}
+
+func (s *Server) rollbackDeployment(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	if !s.decode(c, &struct{}{}) {
+		return
+	}
+	deployment, err := s.deployments.RollbackDeployment(c.Request.Context(), actorFrom(c), c.Param("id"))
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 201, deployment)
+}
+
+func (s *Server) listApprovals(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	limit, offset, ok := s.page(c)
+	if !ok {
+		return
+	}
+	list, total, err := s.deployments.ListApprovals(c.Request.Context(), actorFrom(c), c.Query("status"), limit, offset)
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": list, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *Server) approveApproval(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	if !s.decode(c, &struct{}{}) {
+		return
+	}
+	approval, err := s.deployments.Approve(c.Request.Context(), actorFrom(c), c.Param("id"))
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, approval)
+}
+
+func (s *Server) rejectApproval(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	var input struct {
+		Reason string `json:"reason"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	approval, err := s.deployments.Reject(c.Request.Context(), actorFrom(c), c.Param("id"), input.Reason)
+	if err != nil {
+		s.deploymentError(c, err)
+		return
+	}
+	s.respond(c, 200, approval)
 }
 
 func (s *Server) changePassword(c *gin.Context) {
@@ -1197,6 +1424,13 @@ func (s *Server) middleware() gin.HandlerFunc {
 					s.fail(c, 500, "internal_error", "internal server error")
 				}
 			}
+			// Metrics carry the matched route template, never the raw path, so
+			// ids and free-form segments cannot leak into labels.
+			route := c.FullPath()
+			if route == "" {
+				route = "unmatched"
+			}
+			s.metrics.ObserveHTTP(c.Request.Method, route, c.Writer.Status(), time.Since(start))
 			s.logger.Info("http request", "requestId", id, "method", c.Request.Method, "path", c.Request.URL.Path, "status", c.Writer.Status(), "durationMs", time.Since(start).Milliseconds())
 		}()
 		// Vary also on denied/missing origins so intermediaries cannot reuse CORS decisions.

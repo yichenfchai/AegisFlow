@@ -236,6 +236,31 @@ func (s *Service) wake() {
 	}
 }
 
+// StatusCounts reports how many builds exist per status. Every known status is
+// present even when the count is zero so a metrics scrape always exposes the
+// same series. It is intentionally visibility-free: it is a deployment-wide
+// operational signal, only exposed through the separate metrics listener.
+func (s *Service) StatusCounts(ctx context.Context) (map[string]int, error) {
+	counts := map[string]int{
+		StatusQueued: 0, StatusRunning: 0, StatusSucceeded: 0,
+		StatusFailed: 0, StatusCancelled: 0, StatusInterrupted: 0,
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM builds GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, err
+		}
+		counts[status] = count
+	}
+	return counts, rows.Err()
+}
+
 // getByID is the internal, visibility-free read used by the worker's status
 // watchdog: the worker must observe cancellation and shutdown regardless of who
 // triggered the build. Request paths always go through Get.

@@ -19,6 +19,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/config"
 	"github.com/yichenfchai/AegisFlow/backend/internal/deployments"
 	"github.com/yichenfchai/AegisFlow/backend/internal/httpapi"
+	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 )
@@ -113,10 +114,54 @@ func run(logger *slog.Logger) error {
 		User:   cfg.BuildUser,
 	}).WithSource(cfg.BuildClone, cfg.BuildAllowLocalRepo).WithDiskLimit(cfg.BuildDisk)
 	// Deployment-target secrets are sealed with AEGIS_SECRET_KEY; when it is
-	// unset the registry still serves targets without credentials.
-	targets := deployments.New(db, deployments.Options{SecretKey: cfg.SecretKey, CheckTimeout: cfg.DeployCheckTimeout})
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: targets})
+	// unset the registry still serves targets without credentials. The same
+	// service owns the deploy-task store, the approval queue and the worker.
+	deploymentsService := deployments.New(db, deployments.Options{
+		SecretKey:            cfg.SecretKey,
+		CheckTimeout:         cfg.DeployCheckTimeout,
+		DeployTimeout:        cfg.DeployTimeout,
+		ApprovalEnvironments: cfg.ApprovalEnvironments,
+		ApprovalTTL:          cfg.ApprovalTTL,
+	})
+	// Metrics are opt-in and live on their own listener: the public API origin
+	// must not expose deployment-wide counters, and scraping needs no session.
+	var monitoring *metrics.Registry
+	if cfg.MetricsAddr != "" {
+		monitoring = metrics.New()
+	}
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Metrics: monitoring})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	if monitoring != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", monitoring.Handler(func(ctx context.Context) []metrics.Gauge {
+			counts, err := pipeline.StatusCounts(ctx)
+			if err != nil {
+				logger.Error("metrics build gauges unavailable", "error", err)
+				return nil
+			}
+			gauges := make([]metrics.Gauge, 0, len(counts))
+			for status, count := range counts {
+				gauges = append(gauges, metrics.Gauge{Name: "aegisflow_builds", Help: "Builds by status.", Labels: map[string]string{"status": status}, Value: float64(count)})
+			}
+			return gauges
+		}))
+		metricsServer := &http.Server{Addr: cfg.MetricsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
+		metricsListener, listenErr := net.Listen("tcp", cfg.MetricsAddr)
+		if listenErr != nil {
+			return listenErr
+		}
+		logger.Info("metrics listening", "address", metricsListener.Addr().String())
+		go func() {
+			if serveErr := metricsServer.Serve(metricsListener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				logger.Error("metrics server stopped", "error", serveErr)
+			}
+		}()
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = metricsServer.Shutdown(shutdownCtx)
+		}()
+	}
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	// The worker finalizes its in-flight build as interrupted when this
@@ -125,8 +170,10 @@ func run(logger *slog.Logger) error {
 	defer stopWorker()
 	// Only the replica holding the PostgreSQL worker lease recovers interrupted
 	// builds and executes queued ones; the others stand by and take over when
-	// the holder stops (see builds.RunWorker).
+	// the holder stops (see builds.RunWorker). The deployment worker uses a
+	// separate lease key so both pipelines run on every replica independently.
 	go pipeline.RunWorker(workerCtx, logger)
+	go deploymentsService.RunWorker(workerCtx, logger)
 	// Expired sessions and their refresh history are pruned hourly; replay
 	// detection never needs history beyond the session deadline.
 	cleanupCtx, stopCleanup := context.WithCancel(signalCtx)

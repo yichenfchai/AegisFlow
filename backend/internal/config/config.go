@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -37,11 +38,22 @@ type Config struct {
 	// AuditRetention deletes audit rows older than this window; zero (the
 	// default) keeps them forever.
 	AuditRetention time.Duration
+	// MetricsAddr enables the unauthenticated Prometheus endpoint on a separate
+	// listener; empty (the default) disables it.
+	MetricsAddr string
 	// SecretKey seals deployment-target credentials at rest (AES-256-GCM).
 	// Empty disables secret storage; targets without a secret still work.
 	SecretKey []byte
 	// DeployCheckTimeout bounds one deployment-target connectivity probe.
 	DeployCheckTimeout time.Duration
+	// DeployTimeout bounds one deployment execution (default 10m, max 1h).
+	DeployTimeout time.Duration
+	// ApprovalEnvironments lists target environments that require an approval
+	// before execution. An empty slice disables approvals; when the variable is
+	// unset the default is ["production"].
+	ApprovalEnvironments []string
+	// ApprovalTTL bounds how long a pending approval stays valid (default 24h).
+	ApprovalTTL time.Duration
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
@@ -153,6 +165,20 @@ func Load() (Config, error) {
 			return c, errors.New("AEGIS_AUDIT_RETENTION must be 0 (keep forever) or between 24h and 8760h")
 		}
 	}
+	// Metrics listen on their own address so the public API origin never exposes
+	// deployment-wide counters; the endpoint itself has no user authentication,
+	// so bind loopback or protect it at the proxy.
+	c.MetricsAddr = strings.TrimSpace(os.Getenv("AEGIS_METRICS_ADDR"))
+	if c.MetricsAddr != "" {
+		_, port, splitErr := net.SplitHostPort(c.MetricsAddr)
+		if splitErr != nil {
+			return c, errors.New("AEGIS_METRICS_ADDR must be host:port, for example 127.0.0.1:9090")
+		}
+		numericPort, convErr := strconv.Atoi(port)
+		if convErr != nil || numericPort < 0 || numericPort > 65535 {
+			return c, errors.New("AEGIS_METRICS_ADDR must use a numeric port between 0 and 65535")
+		}
+	}
 	// Deployment-target credential sealing. The key is never echoed in an
 	// error; an unset variable is a valid, secret-storage-disabled start.
 	if rawKey := strings.TrimSpace(os.Getenv("AEGIS_SECRET_KEY")); rawKey != "" {
@@ -168,6 +194,42 @@ func Load() (Config, error) {
 	}
 	if c.DeployCheckTimeout > time.Minute {
 		return c, errors.New("AEGIS_DEPLOY_CHECK_TIMEOUT must be at most 1m")
+	}
+	// Deployment execution bound; the worker aborts the HTTP request past it.
+	c.DeployTimeout, err = duration("AEGIS_DEPLOY_TIMEOUT", "10m")
+	if err != nil {
+		return c, err
+	}
+	if c.DeployTimeout > time.Hour {
+		return c, errors.New("AEGIS_DEPLOY_TIMEOUT must be at most 1h")
+	}
+	// Deployment approvals. Presence of the variable is authoritative: an
+	// explicitly empty value disables approvals, while an unset variable uses
+	// the production default. Only the three documented environments are valid.
+	rawEnvironments, present := os.LookupEnv("AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
+	if !present {
+		rawEnvironments = "production"
+	}
+	for _, entry := range strings.Split(rawEnvironments, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		switch entry {
+		case "development", "staging", "production":
+		default:
+			return c, errors.New("AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS must contain only development, staging or production")
+		}
+		if !slices.Contains(c.ApprovalEnvironments, entry) {
+			c.ApprovalEnvironments = append(c.ApprovalEnvironments, entry)
+		}
+	}
+	c.ApprovalTTL, err = duration("AEGIS_APPROVAL_TTL", "24h")
+	if err != nil {
+		return c, err
+	}
+	if c.ApprovalTTL < time.Hour || c.ApprovalTTL > 168*time.Hour {
+		return c, errors.New("AEGIS_APPROVAL_TTL must be between 1h and 168h")
 	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {
 		origin = strings.TrimSpace(origin)

@@ -65,7 +65,7 @@ func TestOpenAPIContractReferencesAndRoutes(t *testing.T) {
 		t.Fatal("missing paths")
 	}
 	for _, route := range []struct{ path, method string }{
-		{"/healthz", "get"}, {"/readyz", "get"}, {"/api/v1/auth/login", "post"}, {"/api/v1/auth/refresh", "post"},
+		{"/healthz", "get"}, {"/readyz", "get"}, {"/metrics", "get"}, {"/api/v1/auth/login", "post"}, {"/api/v1/auth/refresh", "post"},
 		{"/api/v1/auth/logout", "post"}, {"/api/v1/auth/me", "get"}, {"/api/v1/auth/password", "post"},
 		{"/api/v1/auth/sessions", "get"}, {"/api/v1/auth/sessions", "delete"}, {"/api/v1/auth/sessions/{sessionId}", "delete"},
 		{"/api/v1/users", "get"}, {"/api/v1/users", "post"}, {"/api/v1/users/{userId}", "patch"},
@@ -80,6 +80,12 @@ func TestOpenAPIContractReferencesAndRoutes(t *testing.T) {
 		{"/api/v1/deployment-targets", "get"}, {"/api/v1/deployment-targets", "post"},
 		{"/api/v1/deployment-targets/{targetId}", "get"}, {"/api/v1/deployment-targets/{targetId}", "patch"},
 		{"/api/v1/deployment-targets/{targetId}", "delete"}, {"/api/v1/deployment-targets/{targetId}/check", "post"},
+		{"/api/v1/projects/{projectId}/deployments", "get"}, {"/api/v1/projects/{projectId}/deployments", "post"},
+		{"/api/v1/deployments", "get"},
+		{"/api/v1/deployments/{deploymentId}", "get"}, {"/api/v1/deployments/{deploymentId}/events", "get"},
+		{"/api/v1/deployments/{deploymentId}/cancel", "post"}, {"/api/v1/deployments/{deploymentId}/rollback", "post"},
+		{"/api/v1/approvals", "get"}, {"/api/v1/approvals/{approvalId}/approve", "post"},
+		{"/api/v1/approvals/{approvalId}/reject", "post"},
 	} {
 		item, ok := paths[route.path].(map[string]any)
 		if !ok || item[route.method] == nil {

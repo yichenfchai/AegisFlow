@@ -59,8 +59,10 @@ const (
 )
 
 const (
-	defaultHealthPath   = "/"
-	defaultCheckTimeout = 5 * time.Second
+	defaultHealthPath    = "/"
+	defaultDeployPath    = "/deploy"
+	defaultCheckTimeout  = 5 * time.Second
+	defaultDeployTimeout = 10 * time.Minute
 )
 
 // Options is explicit dependency configuration. An empty SecretKey disables
@@ -69,7 +71,14 @@ const (
 type Options struct {
 	SecretKey    []byte
 	CheckTimeout time.Duration
-	HTTPClient   *http.Client
+	// DeployTimeout bounds one deployment execution; zero means 10m.
+	DeployTimeout time.Duration
+	// ApprovalEnvironments lists target environments that require approval.
+	// Nil means ["production"]; an explicitly empty slice disables approvals.
+	ApprovalEnvironments []string
+	// ApprovalTTL bounds a pending approval; zero means 24h.
+	ApprovalTTL time.Duration
+	HTTPClient  *http.Client
 }
 
 // Target is the public view of a deployment target. Secret material is never
@@ -81,6 +90,7 @@ type Target struct {
 	Environment     string `json:"environment"`
 	Endpoint        string `json:"endpoint"`
 	HealthPath      string `json:"healthPath"`
+	DeployPath      string `json:"deployPath"`
 	HasSecret       bool   `json:"hasSecret"`
 	Status          string `json:"status"`
 	CreatedBy       string `json:"createdBy"`
@@ -98,6 +108,7 @@ type Input struct {
 	Environment string
 	Endpoint    string
 	HealthPath  string
+	DeployPath  string
 	Secret      string
 	Status      string
 }
@@ -110,6 +121,7 @@ type Patch struct {
 	Environment *string
 	Endpoint    *string
 	HealthPath  *string
+	DeployPath  *string
 	Secret      *string
 	Status      *string
 }
@@ -124,28 +136,68 @@ type CheckResult struct {
 }
 
 type Service struct {
-	db           *sql.DB
-	secretKey    []byte
-	checkTimeout time.Duration
-	httpClient   *http.Client
+	db            *sql.DB
+	secretKey     []byte
+	checkTimeout  time.Duration
+	deployTimeout time.Duration
+	httpClient    *http.Client
+	// approvalEnvironments is the set of target environments that need a
+	// pending approval before the worker may claim the deployment.
+	approvalEnvironments map[string]bool
+	approvalTTL          time.Duration
+	// notify wakes the worker after a deployment is enqueued; buffered so the
+	// request path never blocks.
+	notify chan struct{}
+	// leaseRetry overrides the standby lease retry in tests.
+	leaseRetry time.Duration
 }
 
-// New builds the registry. A nil HTTPClient uses a client that refuses
-// cross-host redirects and stops after three hops; a zero timeout means 5s.
+// New builds the registry and deployment service. A nil HTTPClient uses a
+// client that refuses cross-host redirects and stops after three hops; zero
+// timeouts mean 5s for a probe and 10m for a deployment execution.
 func New(db *sql.DB, opts Options) *Service {
 	timeout := opts.CheckTimeout
 	if timeout <= 0 {
 		timeout = defaultCheckTimeout
 	}
+	deployTimeout := opts.DeployTimeout
+	if deployTimeout <= 0 {
+		deployTimeout = defaultDeployTimeout
+	}
 	client := opts.HTTPClient
 	if client == nil {
 		client = defaultHTTPClient()
 	}
+	environments := opts.ApprovalEnvironments
+	if environments == nil {
+		environments = []string{EnvironmentProduction}
+	}
+	approvalSet := make(map[string]bool, len(environments))
+	for _, environment := range environments {
+		approvalSet[environment] = true
+	}
+	approvalTTL := opts.ApprovalTTL
+	if approvalTTL <= 0 {
+		approvalTTL = defaultApprovalTTL
+	}
 	return &Service{
-		db:           db,
-		secretKey:    append([]byte(nil), opts.SecretKey...),
-		checkTimeout: timeout,
-		httpClient:   client,
+		db:                   db,
+		secretKey:            append([]byte(nil), opts.SecretKey...),
+		checkTimeout:         timeout,
+		deployTimeout:        deployTimeout,
+		httpClient:           client,
+		approvalEnvironments: approvalSet,
+		approvalTTL:          approvalTTL,
+		notify:               make(chan struct{}, 1),
+		leaseRetry:           defaultLeaseRetry,
+	}
+}
+
+// wake nudges the worker loop without blocking the request path.
+func (s *Service) wake() {
+	select {
+	case s.notify <- struct{}{}:
+	default:
 	}
 }
 
@@ -175,14 +227,14 @@ func secretNotConfigured() error {
 
 // targetColumns is the select list of every read; has_secret is derived so the
 // ciphertext never leaves the database for a normal read.
-const targetColumns = `id,name,kind,environment,endpoint,health_path,(octet_length(secret_cipher)>0)::int,status,created_by,created_at,updated_at,last_check_at,last_check_ok,last_check_detail`
+const targetColumns = `id,name,kind,environment,endpoint,health_path,deploy_path,(octet_length(secret_cipher)>0)::int,status,created_by,created_at,updated_at,last_check_at,last_check_ok,last_check_detail`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
 func scanTarget(row rowScanner) (Target, error) {
 	var t Target
 	var hasSecret, lastCheckOK int
-	if err := row.Scan(&t.ID, &t.Name, &t.Kind, &t.Environment, &t.Endpoint, &t.HealthPath, &hasSecret, &t.Status, &t.CreatedBy, &t.CreatedAt, &t.UpdatedAt, &t.LastCheckAt, &lastCheckOK, &t.LastCheckDetail); err != nil {
+	if err := row.Scan(&t.ID, &t.Name, &t.Kind, &t.Environment, &t.Endpoint, &t.HealthPath, &t.DeployPath, &hasSecret, &t.Status, &t.CreatedBy, &t.CreatedAt, &t.UpdatedAt, &t.LastCheckAt, &lastCheckOK, &t.LastCheckDetail); err != nil {
 		return Target{}, err
 	}
 	t.HasSecret = hasSecret != 0
@@ -202,12 +254,18 @@ func newID() (string, error) {
 // transaction so the state change and its audit row commit together. detail is
 // a short safe context string; the credential is never passed in.
 func writeAudit(ctx context.Context, tx *sql.Tx, actor auth.Actor, action, objectID, detail string) error {
+	return writeAuditObject(ctx, tx, actor, action, "deployment_target", objectID, detail)
+}
+
+// writeAuditObject is the shared insert for target and deployment rows; the
+// object type distinguishes the two vocabularies in the same audit trail.
+func writeAuditObject(ctx context.Context, tx *sql.Tx, actor auth.Actor, action, objectType, objectID, detail string) error {
 	id, err := newID()
 	if err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO auth_audit(id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
-	 VALUES($1,$2,$3,$4,$5,'deployment_target',$6,'success',$7,$8)`, id, time.Now().Unix(), actor.ID, actor.Username, action, objectID, detail, actor.RequestID)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,'success',$8,$9)`, id, time.Now().Unix(), actor.ID, actor.Username, action, objectType, objectID, detail, actor.RequestID)
 	return err
 }
 
@@ -267,6 +325,22 @@ func normalizeHealthPath(healthPath string) (string, error) {
 		return "", fmt.Errorf("%w: healthPath must not contain whitespace", ErrValidation)
 	}
 	return healthPath, nil
+}
+
+func normalizeDeployPath(deployPath string) (string, error) {
+	if deployPath == "" {
+		return defaultDeployPath, nil
+	}
+	if !utf8.ValidString(deployPath) || len(deployPath) > 256 {
+		return "", fmt.Errorf("%w: deployPath must be valid UTF-8 of at most 256 bytes", ErrValidation)
+	}
+	if !strings.HasPrefix(deployPath, "/") {
+		return "", fmt.Errorf("%w: deployPath must start with /", ErrValidation)
+	}
+	if strings.ContainsFunc(deployPath, unicode.IsSpace) || strings.ContainsFunc(deployPath, unicode.IsControl) {
+		return "", fmt.Errorf("%w: deployPath must not contain whitespace", ErrValidation)
+	}
+	return deployPath, nil
 }
 
 // validateEndpoint accepts an http(s) URL with a host and no userinfo, query or
@@ -344,6 +418,13 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+// isForeignKeyViolation reports a PostgreSQL foreign-key failure: once deploy
+// tasks reference a target, deleting it must be a 409 instead of a 500.
+func isForeignKeyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
+}
+
 func validateTargetFields(name, endpoint string) error {
 	if err := validateName(name); err != nil {
 		return err
@@ -378,6 +459,10 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (Ta
 	if err != nil {
 		return Target{}, err
 	}
+	deployPath, err := normalizeDeployPath(input.DeployPath)
+	if err != nil {
+		return Target{}, err
+	}
 	if err = validateTargetFields(input.Name, input.Endpoint); err != nil {
 		return Target{}, err
 	}
@@ -402,15 +487,15 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (Ta
 	}
 	now := time.Now().Unix()
 	target := Target{ID: id, Name: input.Name, Kind: kind, Environment: environment, Endpoint: input.Endpoint,
-		HealthPath: healthPath, HasSecret: input.Secret != "", Status: status, CreatedBy: actor.ID, CreatedAt: now, UpdatedAt: now}
+		HealthPath: healthPath, DeployPath: deployPath, HasSecret: input.Secret != "", Status: status, CreatedBy: actor.ID, CreatedAt: now, UpdatedAt: now}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return Target{}, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `INSERT INTO deployment_targets(id,name,kind,environment,endpoint,health_path,secret_cipher,status,created_by,created_at,updated_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10) ON CONFLICT (lower(name)) DO NOTHING`,
-		id, target.Name, kind, environment, input.Endpoint, healthPath, cipher, status, actor.ID, now)
+	result, err := tx.ExecContext(ctx, `INSERT INTO deployment_targets(id,name,kind,environment,endpoint,health_path,deploy_path,secret_cipher,status,created_by,created_at,updated_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) ON CONFLICT (lower(name)) DO NOTHING`,
+		id, target.Name, kind, environment, input.Endpoint, healthPath, deployPath, cipher, status, actor.ID, now)
 	if err != nil {
 		return Target{}, err
 	}
@@ -476,7 +561,7 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 	if !auth.ValidID(id) {
 		return Target{}, fmt.Errorf("%w: invalid deployment target id", ErrValidation)
 	}
-	if patch.Name == nil && patch.Environment == nil && patch.Endpoint == nil && patch.HealthPath == nil && patch.Secret == nil && patch.Status == nil {
+	if patch.Name == nil && patch.Environment == nil && patch.Endpoint == nil && patch.HealthPath == nil && patch.DeployPath == nil && patch.Secret == nil && patch.Status == nil {
 		return Target{}, fmt.Errorf("%w: at least one field is required", ErrValidation)
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -513,6 +598,15 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 		}
 		if healthPath != current.HealthPath {
 			updated.HealthPath, changed = healthPath, true
+		}
+	}
+	if patch.DeployPath != nil {
+		deployPath, err := normalizeDeployPath(*patch.DeployPath)
+		if err != nil {
+			return Target{}, err
+		}
+		if deployPath != current.DeployPath {
+			updated.DeployPath, changed = deployPath, true
 		}
 	}
 	if patch.Status != nil && *patch.Status != current.Status {
@@ -577,8 +671,8 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 		updated.HasSecret = *patch.Secret != ""
 	}
 	updated.UpdatedAt = time.Now().Unix()
-	if _, err := tx.ExecContext(ctx, `UPDATE deployment_targets SET name=$2,environment=$3,endpoint=$4,health_path=$5,secret_cipher=$6,status=$7,updated_at=$8 WHERE id=$1`,
-		id, updated.Name, updated.Environment, updated.Endpoint, updated.HealthPath, cipher, updated.Status, updated.UpdatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE deployment_targets SET name=$2,environment=$3,endpoint=$4,health_path=$5,deploy_path=$6,secret_cipher=$7,status=$8,updated_at=$9 WHERE id=$1`,
+		id, updated.Name, updated.Environment, updated.Endpoint, updated.HealthPath, updated.DeployPath, cipher, updated.Status, updated.UpdatedAt); err != nil {
 		if isUniqueViolation(err) {
 			return Target{}, fmt.Errorf("%w: deployment target name already exists", ErrConflict)
 		}
@@ -593,8 +687,9 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 	return updated, nil
 }
 
-// Remove deletes a target. This slice has no deploy tasks yet, so a hard delete
-// cannot orphan history; P4.2 must revisit this when tasks reference targets.
+// Remove deletes a target. Since P4.2 deploy tasks reference targets, a target
+// with deployment history cannot be deleted: the foreign key turns that into
+// ErrConflict (409) rather than a 500, preserving the deployment snapshots.
 func (s *Service) Remove(ctx context.Context, actor auth.Actor, id string) error {
 	if !auth.ValidID(id) {
 		return fmt.Errorf("%w: invalid deployment target id", ErrValidation)
@@ -610,6 +705,9 @@ func (s *Service) Remove(ctx context.Context, actor auth.Actor, id string) error
 		return ErrNotFound
 	}
 	if err != nil {
+		if isForeignKeyViolation(err) {
+			return fmt.Errorf("%w: deployment target has deployment history and cannot be removed", ErrConflict)
+		}
 		return err
 	}
 	if err = writeAudit(ctx, tx, actor, ActionRemove, id, "name="+name); err != nil {
