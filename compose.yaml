@@ -1,4 +1,5 @@
 # Local multi-instance acceptance stack; external production TLS/HA services are separate.
+# Production TLS termination example: deploy/nginx-tls.example.conf (see deploy/README.md).
 x-api: &api
   build: ./backend
   environment: &api-env
