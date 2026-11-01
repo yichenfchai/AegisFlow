@@ -29,7 +29,7 @@ go run ./cmd/server
 
 默认监听 http://127.0.0.1:8080。PostgreSQL 数据库须预先创建，服务自动执行版本化表迁移；advisory 事务锁保证多实例并发启动安全。首次空库原子创建一位管理员；已有用户时不覆盖。初始化后移除 bootstrap 环境变量。JWT 密钥至少 32 字节，所有实例必须使用同一密钥、issuer/audience、Cookie 与来源配置；通过部署密钥管理保存并保持一致，重启无需粘性会话。
 
-环境配置见 [.env.example](.env.example)。AEGIS_DATABASE_URL 和 AEGIS_REDIS_URL 均必填，无 SQLite/进程内限流自动回退；旧 AEGIS_DATABASE_PATH 会使启动失败。每个实例默认最多 20 个数据库连接、空闲 5 个，可通过 AEGIS_DB_MAX_OPEN/IDLE 调整，连接总数需按副本数控制。AEGIS_BUILD_TIMEOUT 是单次构建的执行上限（默认 10m，最大 24h）；AEGIS_LOGIN_RATE_LIMIT 是每 IP 每分钟的登录配额（默认 10，取值 1-1000，仅供测试环境在单地址多账号时放宽）；AEGIS_AUDIT_RETENTION 是审计保留窗口（默认 `0` 永久保留；取值 24h–8760h 时每小时清理更早的审计行）。**AEGIS_SECRET_KEY** 是部署目标凭据的 AES-256-GCM 密钥（base64 恰好 32 字节；留空表示禁用凭据存储，无凭据目标仍可用，写入凭据返回 400）；**AEGIS_DEPLOY_CHECK_TIMEOUT** 是单次部署目标连通性探测的上限（默认 5s，最大 1m）。**AEGIS_BUILD_SANDBOX** 选择构建执行方式：`none`（默认，开发用）以服务账号执行并在启动时打印警告；`container` 为每个构建启动一次性容器，配合 `AEGIS_BUILD_IMAGE`（默认 `alpine:3.20`）、`AEGIS_BUILD_CPU`（默认 2）、`AEGIS_BUILD_MEMORY`（默认 2g）、`AEGIS_BUILD_PIDS`（默认 512）使用，启动时探测容器运行时，不可用即拒绝启动；`user` 在 Linux 上通过 `setpriv` 降权到 `AEGIS_BUILD_USER` 指定的专用账号，服务必须以 root 启动，否则启动失败（Windows 不支持该模式）。**AEGIS_BUILD_DISK**（默认 2g，范围 16MiB–1TiB）限制单次构建的工作区大小；**AEGIS_BUILD_CLONE**（默认 false）开启仓库 clone，**AEGIS_BUILD_ALLOW_LOCAL_REPO**（默认 false）额外允许 `file:///` 与绝对本地路径。数据库和 Redis 应使用隔离网络、访问控制、TLS 与备份保护。
+环境配置见 [.env.example](.env.example)。AEGIS_DATABASE_URL 和 AEGIS_REDIS_URL 均必填，无 SQLite/进程内限流自动回退；旧 AEGIS_DATABASE_PATH 会使启动失败。每个实例默认最多 20 个数据库连接、空闲 5 个，可通过 AEGIS_DB_MAX_OPEN/IDLE 调整，连接总数需按副本数控制。AEGIS_BUILD_TIMEOUT 是单次构建的执行上限（默认 10m，最大 24h）；AEGIS_LOGIN_RATE_LIMIT 是每 IP 每分钟的登录配额（默认 10，取值 1-1000，仅供测试环境在单地址多账号时放宽）；AEGIS_AUDIT_RETENTION 是审计保留窗口（默认 `0` 永久保留；取值 24h–8760h 时每小时清理更早的审计行）。**AEGIS_SECRET_KEY** 是部署目标凭据的 AES-256-GCM 密钥（base64 恰好 32 字节；留空表示禁用凭据存储，无凭据目标仍可用，写入凭据返回 400）；**AEGIS_DEPLOY_CHECK_TIMEOUT** 是单次部署目标连通性探测的上限（默认 5s，最大 1m）；**AEGIS_DEPLOY_TIMEOUT** 是单次部署执行的上限（默认 10m，最大 1h）。**AEGIS_BUILD_SANDBOX** 选择构建执行方式：`none`（默认，开发用）以服务账号执行并在启动时打印警告；`container` 为每个构建启动一次性容器，配合 `AEGIS_BUILD_IMAGE`（默认 `alpine:3.20`）、`AEGIS_BUILD_CPU`（默认 2）、`AEGIS_BUILD_MEMORY`（默认 2g）、`AEGIS_BUILD_PIDS`（默认 512）使用，启动时探测容器运行时，不可用即拒绝启动；`user` 在 Linux 上通过 `setpriv` 降权到 `AEGIS_BUILD_USER` 指定的专用账号，服务必须以 root 启动，否则启动失败（Windows 不支持该模式）。**AEGIS_BUILD_DISK**（默认 2g，范围 16MiB–1TiB）限制单次构建的工作区大小；**AEGIS_BUILD_CLONE**（默认 false）开启仓库 clone，**AEGIS_BUILD_ALLOW_LOCAL_REPO**（默认 false）额外允许 `file:///` 与绝对本地路径。数据库和 Redis 应使用隔离网络、访问控制、TLS 与备份保护。
 
 ## 推荐部署：同源代理
 
@@ -115,11 +115,21 @@ server: {
 ### 部署目标（P4 第一批）
 
 - `deployment_targets` 是全局管理对象，`/api/v1/deployment-targets` 全部路由仅 admin 可用；member/viewer 返回 403。支持 HTTP(S) 目标的新增、查询、分页、修改、删除与连通性探测，`kind` 目前只有 `http`。
-- 目标字段：`name`（3–64 字节、单行、大小写不敏感唯一）、`environment`（`development`/`staging`/`production`，默认 development）、`endpoint`（http/https，禁止 userinfo、query、fragment）、`healthPath`（默认 `/`，必须以 `/` 开头）、`status`（`active`/`disabled`）。
+- 目标字段：`name`（3–64 字节、单行、大小写不敏感唯一）、`environment`（`development`/`staging`/`production`，默认 development）、`endpoint`（http/https，禁止 userinfo、query、fragment）、`healthPath`（默认 `/`，必须以 `/` 开头）、`deployPath`（默认 `/deploy`，必须以 `/` 开头，≤256 字节）、`status`（`active`/`disabled`）。
 - 凭据加密存储：`AEGIS_SECRET_KEY`（base64 32 字节）启用 AES-256-GCM；密文布局为 `[12 字节随机 nonce][ciphertext+tag]`，AAD 绑定目标 id（`deployment_target:<id>`），因此密文不能跨行复用。接口只返回 `hasSecret`，从不返回明文或密文；未配置密钥时仍可创建无凭据目标，但写入凭据返回 400。带凭据的目标必须使用 `https` 端点（仅回环地址允许 `http`），否则创建/更新直接 400，避免把 Bearer 凭据以明文发到网络上。
 - 探测：`POST /api/v1/deployment-targets/{id}/check` 对 `endpoint + healthPath` 发 GET，超时由 `AEGIS_DEPLOY_CHECK_TIMEOUT`（默认 5s，最大 1m）控制；有凭据时发送 `Authorization: Bearer <secret>`（仅在本次探测的内存中解密）。2xx 记为健康，其余记录 `http <code>`、`timeout` 或脱敏后的网络错误；结果写入 `last_check_at/last_check_ok/last_check_detail`。默认客户端最多 3 跳、不跨主机，并拒绝 `https`→`http` 降级。
 - 审计：创建、修改、删除、探测分别写 `deployment_target.create|update|remove|check`（objectType `deployment_target`），与状态变更同事务；detail 只含名称或探测结果，绝不含凭据。
-- 本批边界（仍不做）：部署任务、回滚、审批流（P4.2/P4.3）、独立密钥管理页面、部署策略与业务审计保留策略；删除为硬删除（尚无任务引用目标）。
+- 本批边界（P4.1 范围）：审批流（P4.3）、独立密钥管理页面、部署策略与业务审计保留策略；删除为硬删除，但被部署历史引用的目标返回 409（保留历史快照）。
+
+### 部署任务（P4.2）
+
+- 协议：`POST <endpoint 去尾斜杠><deployPath>`（`deployPath` 默认 `/deploy`，可随目标配置），JSON 体 `{deploymentId, project, version, environment, rollback, rollbackVersion}`；目标有凭据时携带 `Authorization: Bearer`，只在执行时内存解密，绝不进入事件、审计或错误信息。2xx 为成功；其他状态码记 `http <code>`，超时（`AEGIS_DEPLOY_TIMEOUT`，默认 10m，最大 1h）与网络错误记脱敏 detail；部署请求不重试。
+- 状态：`queued → running → succeeded/failed/cancelled`，重启恢复把遗留 `running` 置 `interrupted`；`awaiting_approval`/`rejected` 已入库但由 P4.3 使用，本批创建始终直接排队，`approval_id` 留空。
+- 单 worker：独立 PostgreSQL advisory 租约 `aegisflow:deployments:worker`，只有持锁副本恢复 `interrupted` 并用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取；300ms 状态看门狗在取消/终态时中止 HTTP 请求；`finish` 用独立 5s 上下文落终态。上游响应按行写入 `deployment_events`（批量 500ms；单行 ≤4096 字节、最多 5000 行 response，system 生命周期行不计入上限）。
+- 目标快照：创建时固化 `target_name/target_endpoint/target_environment`，之后改名或改端点不影响历史；执行使用目标当前配置，目标在执行前被禁用/删除会置 `failed`。
+- 回滚：`POST /api/v1/deployments/{id}/rollback` 仅接受 `succeeded`/`failed` 源，取同项目+目标中比源部署更早的最近一次 `succeeded` 版本，新建一条 `queued` 部署（`rollbackOf` 指向源，payload `rollback=true`、`rollbackVersion` 为该版本）；无更早成功返回 400，源非终态 409；重复回滚会创建多条部署（非幂等，审计可追溯）。
+- 权限与审计：六个部署端点全部 admin-only（member/viewer 403）；`deployment.create`（detail `target=<name> version=<v> approval=none`）、`deployment.cancel`（`from=<status>`）、`deployment.rollback`（`rollback_of=<id> version=<v>`）与状态变更同事务，重复取消失败不重复记账。
+- 本批边界：审批流（P4.3）、前端部署/审批页面、部署产物与构建强制关联（`buildId` 可选，提供时必须是同项目 `succeeded` 构建）、自定义 HTTP 方法与路径、自动重试均未做。
 
 ### Cookie 与前端对齐
 
@@ -175,7 +185,7 @@ User 字段为 `id/username/displayName/role/disabled/createdAt`，无密码或�
 - SQLite 开发库不会自动导入 PostgreSQL。现阶段开发数据可重新初始化；如有需要保留的用户，必须先备份并单独编写审核过的离线迁移，保留 bcrypt 哈希、校验用户名大小写唯一性并撤销旧会话，不能直接复制文件或将 SQLite 挂共享盘。
 - /readyz 同时检查 PostgreSQL 和 Redis；Redis 故障使就绪返回 503，登录也 503。已存在 Bearer 会话在 PostgreSQL 正常时仍可鉴权；负载均衡是否摘除整个实例取决于运维策略。
 - 请求 ID、slog JSON 访问日志、鉴权操作日志、panic 恢复、安全响应头、HTTP 超时、信号触发优雅退出；日志不记录密码、Cookie、令牌、正文。
-- 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）、部署目标增删改查与探测（deployment_target.create / deployment_target.update / deployment_target.remove / deployment_target.check）。构建、成员与部署目标审计都和状态变更在同一事务提交；幂等重复取消不重复记账，detail 只写项目/成员与构建号或角色（重试额外写 `retry_of=<原构建号>`），不写命令或凭据。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），支持 `action`/`objectType`/`result`/`actor`/`from`/`to` 服务端筛选（AND 组合，同时作用于分页与 total；`from`/`to` 接受 RFC3339 或 `YYYY-MM-DD`，只给日期时 `to` 覆盖该 UTC 全天）。
+- 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）、部署目标增删改查与探测（deployment_target.create / deployment_target.update / deployment_target.remove / deployment_target.check）、部署创建/取消/回滚（deployment.create / deployment.cancel / deployment.rollback）。构建、成员、部署目标与部署任务审计都和状态变更在同一事务提交；幂等重复取消不重复记账，detail 只写项目/成员与构建号或角色（重试额外写 `retry_of=<原构建号>`），不写命令或凭据。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），支持 `action`/`objectType`/`result`/`actor`/`from`/`to` 服务端筛选（AND 组合，同时作用于分页与 total；`from`/`to` 接受 RFC3339 或 `YYYY-MM-DD`，只给日期时 `to` 覆盖该 UTC 全天）。
 - 审计保留策略可选：`AEGIS_AUDIT_RETENTION` 未设置或为 `0` 时永久保留（默认）；设置 24h–8760h 后，与过期会话清理共用的小时任务会删除早于该窗口的审计行。删除是运维显式选择，默认不丢证据。
 - 过期会话与 refresh 历史由后台任务每小时清理（启动时先执行一次）：删除超过绝对期限的会话及其全部 refresh 令牌记录。重放检测只需保留到会话有效期，这与文档化的保留边界一致。
 
@@ -196,10 +206,10 @@ $env:AEGIS_OPS_REDIS_URL = 'redis://localhost:6379/2'
 go test ./cmd/server/ -run TestRealProcessLifecycle -count=1
 ```
 
-分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计、可见性读过滤与成员增删改、创建者不可移除与 404 枚举语义）、构建流水线（触发校验与每项目编号、成功与失败退出码、超时、取消与幂等、重启恢复为 interrupted、跨副本 worker 租约互斥与待命接管、SSE 推送与写超时豁免/终态收尾/非法游标、游标日志分页与截断、RBAC 与未接线 503）、部署目标（校验与默认值、大小写唯一与冲突、凭据 AES-256-GCM 加密与 AAD 绑定、更新时保留/替换/清空语义、非配置密钥时拒绝写入、探测成功/非 2xx/超时/网络错误与结果落库、事务内审计、admin-only RBAC 与未接线 503）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目/构建/部署目标端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
+分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计、可见性读过滤与成员增删改、创建者不可移除与 404 枚举语义）、构建流水线（触发校验与每项目编号、成功与失败退出码、超时、取消与幂等、重启恢复为 interrupted、跨副本 worker 租约互斥与待命接管、SSE 推送与写超时豁免/终态收尾/非法游标、游标日志分页与截断、RBAC 与未接线 503）、部署目标（校验与默认值、大小写唯一与冲突、凭据 AES-256-GCM 加密与 AAD 绑定、更新时保留/替换/清空语义、非配置密钥时拒绝写入、探测成功/非 2xx/超时/网络错误与结果落库、事务内审计、admin-only RBAC 与未接线 503）、部署任务（项目/目标/版本/buildId 校验、每项目编号分配与目标快照、worker 成功/失败/超时/取消/重启恢复、事件游标分页、回滚版本选择与 400/409、事务内审计、目标被引用时 409、worker 租约互斥、admin-only RBAC）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目/构建/部署目标端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
 
 ## 架构
 
-cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；worker 通过租约启动并随信号上下文退出；进程生命周期验收测试见 cmd/server/ops_test.go）；internal/config 校验连接 URL、连接数、登录配额、凭据密钥与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、可见性与成员、分页与事务内审计，读写都带可见性谓词，不依赖 Gin）；internal/builds 是构建流水线（触发与编号、单 worker 租约、SKIP LOCKED 领取、临时目录执行、取消看门狗、批量日志与重启恢复，不依赖 Gin）；internal/deployments 是 admin-only 部署目标注册表（HTTP(S) 目标、AES-256-GCM 凭据加密、连通性探测与事务内审计，不依赖 Gin）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.11 与 Go 1.23 兼容。
+cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；worker 通过租约启动并随信号上下文退出；进程生命周期验收测试见 cmd/server/ops_test.go）；internal/config 校验连接 URL、连接数、登录配额、凭据密钥与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、可见性与成员、分页与事务内审计，读写都带可见性谓词，不依赖 Gin）；internal/builds 是构建流水线（触发与编号、单 worker 租约、SKIP LOCKED 领取、临时目录执行、取消看门狗、批量日志与重启恢复，不依赖 Gin）；internal/deployments 是 admin-only 部署目标与部署任务（目标注册表、AES-256-GCM 凭据加密、连通性探测、部署编号/快照/状态机、租约 worker、事件游标、回滚与事务内审计，不依赖 Gin）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.11 与 Go 1.23 兼容。
 
 本地双实例样例见 [compose.yaml](../compose.yaml) 与 [部署说明](../deploy/README.md)。应用副本可横向扩展，但数据库、Redis、入口网关的高可用需另行部署；样例单节点依赖不等于整套服务高可用。数据库集成测试未配置 URL 会明确 Skip，不能将跳过当作生产验证通过。

@@ -42,6 +42,8 @@ type Config struct {
 	SecretKey []byte
 	// DeployCheckTimeout bounds one deployment-target connectivity probe.
 	DeployCheckTimeout time.Duration
+	// DeployTimeout bounds one deployment execution (default 10m, max 1h).
+	DeployTimeout time.Duration
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
@@ -168,6 +170,14 @@ func Load() (Config, error) {
 	}
 	if c.DeployCheckTimeout > time.Minute {
 		return c, errors.New("AEGIS_DEPLOY_CHECK_TIMEOUT must be at most 1m")
+	}
+	// Deployment execution bound; the worker aborts the HTTP request past it.
+	c.DeployTimeout, err = duration("AEGIS_DEPLOY_TIMEOUT", "10m")
+	if err != nil {
+		return c, err
+	}
+	if c.DeployTimeout > time.Hour {
+		return c, errors.New("AEGIS_DEPLOY_TIMEOUT must be at most 1h")
 	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {
 		origin = strings.TrimSpace(origin)

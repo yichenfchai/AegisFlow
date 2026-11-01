@@ -10,7 +10,7 @@ import (
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT"} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("AEGIS_JWT_SECRET", strings.Repeat("s", 32))
@@ -284,6 +284,31 @@ func TestDeployCheckTimeoutConfig(t *testing.T) {
 			c, err := Load()
 			if (err != nil) != tc.invalid || (!tc.invalid && c.DeployCheckTimeout != tc.want) {
 				t.Fatalf("timeout=%v err=%v", c.DeployCheckTimeout, err)
+			}
+		})
+	}
+}
+
+func TestDeployTimeoutConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    time.Duration
+		invalid bool
+	}{
+		{"", 10 * time.Minute, false},
+		{"30s", 30 * time.Second, false},
+		{"1h", time.Hour, false},
+		{"2h", 0, true},
+		{"0s", 0, true},
+		{"500ms", 0, true},
+		{"soon", 0, true},
+	} {
+		t.Run("value="+tc.value, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_DEPLOY_TIMEOUT", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid || (!tc.invalid && c.DeployTimeout != tc.want) {
+				t.Fatalf("timeout=%v err=%v", c.DeployTimeout, err)
 			}
 		})
 	}
