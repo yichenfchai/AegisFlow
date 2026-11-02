@@ -142,7 +142,7 @@ server: {
 - 过期：持租约 worker 每 30s（接管时先跑一次）扫描 `pending AND expires_at <= now`，每批最多 100 条、`FOR UPDATE SKIP LOCKED`；审批置 `expired`（reason `approval expired`），部署置 `rejected`（detail `approval expired`），并为每行写 `approval.expire` 审计（actor 为空）。
 - 取消交互：取消 `awaiting_approval` 部署时，同一事务把审批置 `expired`（reason `deployment cancelled`，decided_at=now）并写 `approval.expire`；重复取消不会重复记账。审批状态机没有 cancelled，因此复用 `expired`。
 - 审计：`approval.request`（detail `deployment=<id>`）、`approval.approve`（`deployment=<id>`）、`approval.reject`（`deployment=<id> reason=<...>` 可选）、`approval.expire`（`deployment=<id> reason=approval expired|deployment cancelled`），objectType `approval`。
-- 本批边界：多级会签、通知渠道、前端审批页面仍未实现（页面保持未实现声明）。
+- 本批边界：多级会签与通知渠道仍未实现；前端审批页面已接入（#42）。
 
 ### 运行指标（P4）
 
