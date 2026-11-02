@@ -59,10 +59,11 @@ const (
 )
 
 const (
-	defaultHealthPath    = "/"
-	defaultDeployPath    = "/deploy"
-	defaultCheckTimeout  = 5 * time.Second
-	defaultDeployTimeout = 10 * time.Minute
+	defaultHealthPath     = "/"
+	defaultDeployPath     = "/deploy"
+	defaultCheckTimeout   = 5 * time.Second
+	defaultDeployTimeout  = 10 * time.Minute
+	defaultWebhookTimeout = 5 * time.Second
 )
 
 // Options is explicit dependency configuration. An empty SecretKey disables
@@ -78,7 +79,12 @@ type Options struct {
 	ApprovalEnvironments []string
 	// ApprovalTTL bounds a pending approval; zero means 24h.
 	ApprovalTTL time.Duration
-	HTTPClient  *http.Client
+	// ApprovalWebhookURL enables approval notifications; empty disables them.
+	ApprovalWebhookURL    string
+	ApprovalWebhookSecret []byte
+	// ApprovalWebhookTimeout bounds one webhook delivery; zero means 5s.
+	ApprovalWebhookTimeout time.Duration
+	HTTPClient             *http.Client
 }
 
 // Target is the public view of a deployment target. Secret material is never
@@ -145,6 +151,11 @@ type Service struct {
 	// pending approval before the worker may claim the deployment.
 	approvalEnvironments map[string]bool
 	approvalTTL          time.Duration
+	// Approval notifications use a transactional outbox stored in
+	// approval_notifications; an empty webhookURL disables enqueueing.
+	webhookURL    string
+	webhookSecret []byte
+	webhookClient *http.Client
 	// notify wakes the worker after a deployment is enqueued; buffered so the
 	// request path never blocks.
 	notify chan struct{}
@@ -180,6 +191,18 @@ func New(db *sql.DB, opts Options) *Service {
 	if approvalTTL <= 0 {
 		approvalTTL = defaultApprovalTTL
 	}
+	webhookTimeout := opts.ApprovalWebhookTimeout
+	if webhookTimeout <= 0 {
+		webhookTimeout = defaultWebhookTimeout
+	}
+	webhookClient := &http.Client{
+		Timeout: webhookTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			// A webhook redirect could send the signed body to an unintended
+			// host; treat it as a delivery failure instead of following it.
+			return http.ErrUseLastResponse
+		},
+	}
 	return &Service{
 		db:                   db,
 		secretKey:            append([]byte(nil), opts.SecretKey...),
@@ -188,6 +211,9 @@ func New(db *sql.DB, opts Options) *Service {
 		httpClient:           client,
 		approvalEnvironments: approvalSet,
 		approvalTTL:          approvalTTL,
+		webhookURL:           opts.ApprovalWebhookURL,
+		webhookSecret:        append([]byte(nil), opts.ApprovalWebhookSecret...),
+		webhookClient:        webhookClient,
 		notify:               make(chan struct{}, 1),
 		leaseRetry:           defaultLeaseRetry,
 	}

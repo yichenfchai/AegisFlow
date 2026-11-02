@@ -117,11 +117,14 @@ func run(logger *slog.Logger) error {
 	// unset the registry still serves targets without credentials. The same
 	// service owns the deploy-task store, the approval queue and the worker.
 	deploymentsService := deployments.New(db, deployments.Options{
-		SecretKey:            cfg.SecretKey,
-		CheckTimeout:         cfg.DeployCheckTimeout,
-		DeployTimeout:        cfg.DeployTimeout,
-		ApprovalEnvironments: cfg.ApprovalEnvironments,
-		ApprovalTTL:          cfg.ApprovalTTL,
+		SecretKey:              cfg.SecretKey,
+		CheckTimeout:           cfg.DeployCheckTimeout,
+		DeployTimeout:          cfg.DeployTimeout,
+		ApprovalEnvironments:   cfg.ApprovalEnvironments,
+		ApprovalTTL:            cfg.ApprovalTTL,
+		ApprovalWebhookURL:     cfg.ApprovalWebhookURL,
+		ApprovalWebhookSecret:  cfg.ApprovalWebhookSecret,
+		ApprovalWebhookTimeout: cfg.ApprovalWebhookTimeout,
 	})
 	// Metrics are opt-in and live on their own listener: the public API origin
 	// must not expose deployment-wide counters, and scraping needs no session.
@@ -174,6 +177,9 @@ func run(logger *slog.Logger) error {
 	// separate lease key so both pipelines run on every replica independently.
 	go pipeline.RunWorker(workerCtx, logger)
 	go deploymentsService.RunWorker(workerCtx, logger)
+	// The notifier is independent of the deployment lease: every replica may
+	// claim distinct outbox rows, and a slow webhook must not delay executions.
+	go deploymentsService.RunNotifier(workerCtx, logger)
 	// Expired sessions and their refresh history are pruned hourly; replay
 	// detection never needs history beyond the session deadline.
 	cleanupCtx, stopCleanup := context.WithCancel(signalCtx)
