@@ -9,6 +9,10 @@
 3. AI 代理允许：创建分支、本地提交、推送功能分支、创建 PR；禁止：合并 PR、推送或改写 main、force push、无视或关闭 review 状态。
 4. PR 描述必须写明变更内容与**验证记录**（执行了哪些命令、结果如何）；未经验证的变更不具备合并条件。
 5. PR 标题使用 conventional commits 风格（feat / fix / refactor / test / docs / chore / ci）。
+6. 正文与评论先写入 **UTF-8（无 BOM）** 的 Markdown 文件，用 `--body-file`（`gh pr create/edit --body-file`、`gh pr comment --body-file`）或 GitHub 网页编辑器提交；禁止 `--body "中文…"` 这类内联字符串。
+7. 禁止用 `echo -e`、`printf %b` 或再套一层 JSON 转义拼正文：`\a`、`\b`、`\f`、`\r` 会被解释成控制字符（表现为 `backend` 变 `ackend`、`npm` 变 `pm`）。正文里的路径统一写 `/`，不写反斜杠。
+8. Windows 终端先 `chcp 65001`，并设 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`。
+9. 发送前运行 `pwsh scripts/pr-text.ps1 <正文文件>`：命中 `\?{2,}`（汉字被替换成 `?` 的痕迹）或 C0 控制字符必须修正后重发。CI 的 `pr-text` 任务用同一脚本校验 PR 正文，未通过不得合并。
 
 ## 开发纪律
 

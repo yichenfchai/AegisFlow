@@ -1,0 +1,35 @@
+name: PR text
+
+# The PR description is authored by hand (or by an agent) and is easy to corrupt
+# on the way to GitHub: a lossy code-page conversion turns Chinese into '?', and
+# a shell that interprets \a \b \f \r silently eats the first letter of words.
+# The stored body is the only thing GitHub has, so validate it with the same
+# script contributors run locally (scripts/pr-text.ps1).
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-text-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  encoding:
+    name: pr-text
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # The body travels through the environment, so no shell quoting or
+      # backslash processing touches it; printf '%s' copies the bytes verbatim
+      # (unlike echo -e / printf %b, which is what corrupted PR #43 and #44).
+      - name: Validate the PR description encoding
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -eu
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+          pwsh -NoProfile -File scripts/pr-text.ps1 "$RUNNER_TEMP/pr-body.md"
