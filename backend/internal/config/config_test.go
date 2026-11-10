@@ -29,7 +29,7 @@ func unsetEnv(t *testing.T, key string) {
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_APPROVAL_TTL", "AEGIS_APPROVAL_WEBHOOK_URL", "AEGIS_APPROVAL_WEBHOOK_SECRET", "AEGIS_APPROVAL_WEBHOOK_TIMEOUT"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_DEPLOY_HEALTH_ATTEMPTS", "AEGIS_DEPLOY_HEALTH_INTERVAL", "AEGIS_APPROVAL_TTL", "AEGIS_APPROVAL_WEBHOOK_URL", "AEGIS_APPROVAL_WEBHOOK_SECRET", "AEGIS_APPROVAL_WEBHOOK_TIMEOUT"} {
 		t.Setenv(key, "")
 	}
 	unsetEnv(t, "AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
@@ -355,6 +355,43 @@ func TestDeployTimeoutConfig(t *testing.T) {
 			c, err := Load()
 			if (err != nil) != tc.invalid || (!tc.invalid && c.DeployTimeout != tc.want) {
 				t.Fatalf("timeout=%v err=%v", c.DeployTimeout, err)
+			}
+		})
+	}
+}
+
+func TestDeployHealthConfig(t *testing.T) {
+	for _, tc := range []struct {
+		attempts  string
+		interval  string
+		wantCount int
+		wantEvery time.Duration
+		invalid   bool
+	}{
+		{"", "", 3, 2 * time.Second, false},
+		{"0", "", 0, 2 * time.Second, false},
+		{"1", "5s", 1, 5 * time.Second, false},
+		{"20", "1m", 20, time.Minute, false},
+		{"21", "", 0, 0, true},
+		{"-1", "", 0, 0, true},
+		{"many", "", 0, 0, true},
+		{"3", "500ms", 0, 0, true},
+		{"3", "2m", 0, 0, true},
+		{"3", "soon", 0, 0, true},
+	} {
+		t.Run("attempts="+tc.attempts+"/interval="+tc.interval, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_DEPLOY_HEALTH_ATTEMPTS", tc.attempts)
+			t.Setenv("AEGIS_DEPLOY_HEALTH_INTERVAL", tc.interval)
+			c, err := Load()
+			if (err != nil) != tc.invalid {
+				t.Fatalf("err = %v, want invalid=%v", err, tc.invalid)
+			}
+			if tc.invalid {
+				return
+			}
+			if c.DeployHealthAttempts != tc.wantCount || c.DeployHealthInterval != tc.wantEvery {
+				t.Fatalf("attempts=%d interval=%v, want %d/%v", c.DeployHealthAttempts, c.DeployHealthInterval, tc.wantCount, tc.wantEvery)
 			}
 		})
 	}

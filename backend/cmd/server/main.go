@@ -120,6 +120,8 @@ func run(logger *slog.Logger) error {
 		SecretKey:              cfg.SecretKey,
 		CheckTimeout:           cfg.DeployCheckTimeout,
 		DeployTimeout:          cfg.DeployTimeout,
+		HealthCheckAttempts:    cfg.DeployHealthAttempts,
+		HealthCheckInterval:    cfg.DeployHealthInterval,
 		ApprovalEnvironments:   cfg.ApprovalEnvironments,
 		ApprovalTTL:            cfg.ApprovalTTL,
 		ApprovalWebhookURL:     cfg.ApprovalWebhookURL,

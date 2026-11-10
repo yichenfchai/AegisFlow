@@ -33,6 +33,7 @@ type deployPayload struct {
 type executionTarget struct {
 	Endpoint   string
 	DeployPath string
+	HealthPath string
 	Status     string
 	Sealed     []byte
 }
@@ -226,6 +227,29 @@ func (s *Service) execute(ctx context.Context, deployment Deployment) {
 		return
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// A 2xx only proves the deploy endpoint accepted the request. When the
+		// post-deploy health check is enabled, "succeeded" additionally means
+		// the target answered its health path within the attempts budget.
+		if s.healthAttempts > 0 {
+			result, healthy := s.verifyHealth(execCtx, writer, target.Endpoint, target.HealthPath, secret)
+			if !healthy {
+				switch {
+				case s.deploymentCancelled(deployment.ID):
+					writer.systemf("deployment cancelled")
+				case ctx.Err() != nil:
+					writer.systemf("interrupted by server shutdown")
+					s.finish(deployment, DeployInterrupted, "interrupted by server shutdown")
+				case execCtx.Err() == context.DeadlineExceeded:
+					writer.systemf("deployment timed out after %s", s.deployTimeout)
+					s.finish(deployment, DeployFailed, "timeout")
+				default:
+					detail := "health check failed: " + healthDetail(result)
+					writer.systemf("deployment failed: %s", detail)
+					s.finish(deployment, DeployFailed, detail)
+				}
+				return
+			}
+		}
 		writer.systemf("deployment succeeded (http %d, %dms)", resp.StatusCode, time.Since(start).Milliseconds())
 		s.finish(deployment, DeploySucceeded, "")
 		return
@@ -233,6 +257,47 @@ func (s *Service) execute(ctx context.Context, deployment Deployment) {
 	detail := fmt.Sprintf("http %d", resp.StatusCode)
 	writer.systemf("deployment failed: %s", detail)
 	s.finish(deployment, DeployFailed, detail)
+}
+
+// verifyHealth re-probes the target's health path after the deploy endpoint
+// answered 2xx. It returns the last probe so the caller can record why the
+// deployment was still considered unhealthy. Probes share the execution
+// deadline, so a slow health endpoint can never outlive the deploy bound, and
+// they reuse the same credential handling as the connectivity check (the
+// secret stays out of every event and detail).
+func (s *Service) verifyHealth(ctx context.Context, writer *deploymentEventWriter, endpoint, healthPath, secret string) (CheckResult, bool) {
+	var last CheckResult
+	for attempt := 1; attempt <= s.healthAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return last, false
+		}
+		last = s.probe(ctx, endpoint, healthPath, secret)
+		if last.OK {
+			writer.systemf("health check passed (attempt %d/%d, http %d, %dms)",
+				attempt, s.healthAttempts, last.StatusCode, last.LatencyMS)
+			return last, true
+		}
+		writer.systemf("health check failed (attempt %d/%d): %s", attempt, s.healthAttempts, healthDetail(last))
+		if attempt == s.healthAttempts {
+			break
+		}
+		timer := time.NewTimer(s.healthInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return last, false
+		case <-timer.C:
+		}
+	}
+	return last, false
+}
+
+// healthDetail keeps the failure detail non-empty and single line.
+func healthDetail(result CheckResult) string {
+	if result.Detail == "" {
+		return "no healthy response"
+	}
+	return result.Detail
 }
 
 // watchDeployment cancels the in-flight request once the row leaves running.
@@ -292,8 +357,8 @@ func (s *Service) deploymentCancelled(id string) bool {
 
 func (s *Service) executionTargetFor(ctx context.Context, id string) (executionTarget, error) {
 	var target executionTarget
-	err := s.db.QueryRowContext(ctx, `SELECT endpoint,deploy_path,status,secret_cipher FROM deployment_targets WHERE id=$1`, id).
-		Scan(&target.Endpoint, &target.DeployPath, &target.Status, &target.Sealed)
+	err := s.db.QueryRowContext(ctx, `SELECT endpoint,deploy_path,health_path,status,secret_cipher FROM deployment_targets WHERE id=$1`, id).
+		Scan(&target.Endpoint, &target.DeployPath, &target.HealthPath, &target.Status, &target.Sealed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return executionTarget{}, ErrNotFound
 	}
