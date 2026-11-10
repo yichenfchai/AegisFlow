@@ -40,6 +40,7 @@ Docker 未安装时，可单独启动 PostgreSQL/Redis，按 backend/.env.exampl
 - 迁移和 bootstrap 使用数据库事务 advisory 锁，版本迁移账本检查未知新版本。滚动升级要求 schema 变更遵循先扩展后收缩，见下文「滚动升级」。
 - PostgreSQL/Redis/Nginx 在示例中各只有一个副本；扩容应用不等于消除依赖单点。生产需按可用性目标配置托管服务、主备或集群及告警。
 - 构建 worker 由 PostgreSQL 会话锁保证每个部署只有一个副本执行与恢复（不提供并行吞吐）；停止持锁副本时，其正在运行的构建会被标记为 `interrupted`，由下一个持锁副本接管恢复。
+- 审批 Webhook 通知（可选）使用 PostgreSQL outbox 与独立 notifier；生产必须使用 HTTPS（仅回环测试允许 HTTP），配置 `AEGIS_APPROVAL_WEBHOOK_SECRET` 时接收方应校验 `X-AegisFlow-Signature`，并按 `X-AegisFlow-Delivery` 幂等处理。投递失败不会改变审批状态，失败行保留在 `approval_notifications` 供排查。
 - 多人使用不等于已支持多租户隔离；其余业务对象级权限按 TODO 推进。
 
 ## 备份与恢复

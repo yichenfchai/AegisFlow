@@ -29,7 +29,7 @@ func unsetEnv(t *testing.T, key string) {
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_APPROVAL_TTL"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_APPROVAL_TTL", "AEGIS_APPROVAL_WEBHOOK_URL", "AEGIS_APPROVAL_WEBHOOK_SECRET", "AEGIS_APPROVAL_WEBHOOK_TIMEOUT"} {
 		t.Setenv(key, "")
 	}
 	unsetEnv(t, "AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
@@ -413,6 +413,54 @@ func TestApprovalConfig(t *testing.T) {
 			c, err := Load()
 			if (err != nil) != tc.invalid || (!tc.invalid && c.ApprovalTTL != tc.want) {
 				t.Fatalf("ttl=%v err=%v", c.ApprovalTTL, err)
+			}
+		})
+	}
+}
+
+func TestApprovalWebhookConfig(t *testing.T) {
+	t.Run("https with signing secret", func(t *testing.T) {
+		setup(t)
+		t.Setenv("AEGIS_APPROVAL_WEBHOOK_URL", "https://hooks.example.com/aegis/approvals")
+		t.Setenv("AEGIS_APPROVAL_WEBHOOK_SECRET", "0123456789abcdef")
+		t.Setenv("AEGIS_APPROVAL_WEBHOOK_TIMEOUT", "7s")
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.ApprovalWebhookURL != "https://hooks.example.com/aegis/approvals" ||
+			string(c.ApprovalWebhookSecret) != "0123456789abcdef" || c.ApprovalWebhookTimeout != 7*time.Second {
+			t.Fatalf("webhook config = %+v", c)
+		}
+	})
+	t.Run("loopback http is allowed", func(t *testing.T) {
+		setup(t)
+		t.Setenv("AEGIS_APPROVAL_WEBHOOK_URL", "http://127.0.0.1:9099/hook")
+		c, err := Load()
+		if err != nil || c.ApprovalWebhookURL != "http://127.0.0.1:9099/hook" || c.ApprovalWebhookTimeout != 5*time.Second {
+			t.Fatalf("loopback webhook = %+v err=%v", c, err)
+		}
+	})
+	for _, tc := range []struct {
+		name, url, secret, timeout string
+	}{
+		{"plain http remote", "http://hooks.example.com/aegis", "", ""},
+		{"unsupported scheme", "ftp://hooks.example.com/aegis", "", ""},
+		{"userinfo", "https://user:pass@hooks.example.com/aegis", "", ""},
+		{"empty host", "https:///aegis", "", ""},
+		{"fragment", "https://hooks.example.com/aegis#x", "", ""},
+		{"secret without url", "", "0123456789abcdef", ""},
+		{"short secret", "https://hooks.example.com/aegis", "short", ""},
+		{"timeout too long", "https://hooks.example.com/aegis", "", "31s"},
+		{"invalid timeout", "https://hooks.example.com/aegis", "", "soon"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_APPROVAL_WEBHOOK_URL", tc.url)
+			t.Setenv("AEGIS_APPROVAL_WEBHOOK_SECRET", tc.secret)
+			t.Setenv("AEGIS_APPROVAL_WEBHOOK_TIMEOUT", tc.timeout)
+			if _, err := Load(); err == nil {
+				t.Fatal("expected validation error")
 			}
 		})
 	}

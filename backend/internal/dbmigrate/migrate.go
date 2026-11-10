@@ -193,6 +193,25 @@ var Migrations = [][]string{{
 	 decided_at BIGINT NOT NULL DEFAULT 0)`,
 	`CREATE UNIQUE INDEX approvals_deployment_idx ON approvals(deployment_id)`,
 	`CREATE INDEX approvals_pending_idx ON approvals(status, expires_at)`,
+}, {
+	// Approval webhook notifications (P4.4): a transactional outbox. Approval
+	// state changes and the notification row commit together; delivery is
+	// at-least-once, retried with backoff, and never affects the approval
+	// state. The unique (approval_id,event) key makes repeated idempotent
+	// approve/reject/cancel paths unable to enqueue duplicates.
+	`CREATE TABLE approval_notifications (
+	 id TEXT PRIMARY KEY,
+	 approval_id TEXT NOT NULL REFERENCES approvals(id),
+	 event TEXT NOT NULL CHECK(event IN ('approval.requested','approval.approved','approval.rejected','approval.expired')),
+	 payload JSONB NOT NULL,
+	 status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','delivered','failed')),
+	 attempts INTEGER NOT NULL DEFAULT 0,
+	 next_attempt_at BIGINT NOT NULL,
+	 delivered_at BIGINT NOT NULL DEFAULT 0,
+	 last_error TEXT NOT NULL DEFAULT '',
+	 created_at BIGINT NOT NULL,
+	 UNIQUE (approval_id, event))`,
+	`CREATE INDEX approval_notifications_pending_idx ON approval_notifications(status, next_attempt_at, id)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped

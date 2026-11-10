@@ -83,6 +83,7 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 - 过期：持租约的 worker 每 30s（接管时先跑一次）扫描 `pending AND expires_at<=now`，每批最多 100 条、`FOR UPDATE SKIP LOCKED`；审批 `expired`（reason `approval expired`），部署 `rejected`（detail `approval expired`），每行写 `approval.expire` 审计（actor 为空）。
 - 取消交互：取消 `awaiting_approval` 部署时同一事务把审批置 `expired`（reason `deployment cancelled`，decided_at=now）并写 `approval.expire`；审批状态机没有 cancelled，因此复用 expired，重复取消不重复记账。
 - 审计：`approval.request`（`deployment=<id>`）、`approval.approve`（`deployment=<id>`）、`approval.reject`（`deployment=<id> reason=<...>` 可选）、`approval.expire`（`deployment=<id> reason=approval expired|deployment cancelled`），objectType `approval`，与状态变更同事务。
+- 通知（可选，P4.4）：`AEGIS_APPROVAL_WEBHOOK_URL` 非空时，审批请求与批准/拒绝/过期事件在和状态变更同一事务写入 outbox，并由独立 notifier 以至少一次语义投递。请求体是事件快照，不含凭据；可配置 `AEGIS_APPROVAL_WEBHOOK_SECRET` 做 HMAC-SHA256 签名，接收方按 `X-AegisFlow-Delivery` 幂等去重。投递失败重试后置 `failed`，不影响审批状态，也不写新的业务审计动作。URL 除回环地址外必须 https，超时默认 5s（最大 30s）。
 
 ## 客户端会话生命周期
 

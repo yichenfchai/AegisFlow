@@ -254,12 +254,19 @@ func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.
 	}
 	if approvalRequired {
 		expiresAt := now + int64(s.approvalTTL/time.Second)
+		approval := Approval{
+			ID: approvalID, DeploymentID: deployment.ID, ProjectID: projectID,
+			Status: ApprovalPending, RequestedBy: actor.ID, CreatedAt: now, ExpiresAt: expiresAt,
+		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO approvals(id,deployment_id,project_id,status,requested_by,decided_by,reason,created_at,expires_at,decided_at)
 		 VALUES($1,$2,$3,'pending',$4,'','',$5,$6,0)`,
-			approvalID, deployment.ID, projectID, actor.ID, now, expiresAt); err != nil {
+			approval.ID, approval.DeploymentID, approval.ProjectID, approval.RequestedBy, approval.CreatedAt, approval.ExpiresAt); err != nil {
 			return Deployment{}, err
 		}
 		if err = writeAuditObject(ctx, tx, actor, ActionApprovalRequest, "approval", approvalID, "deployment="+deployment.ID); err != nil {
+			return Deployment{}, err
+		}
+		if err = s.enqueueApprovalNotification(ctx, tx, approval, notificationRequested); err != nil {
 			return Deployment{}, err
 		}
 	}
@@ -367,17 +374,21 @@ func (s *Service) CancelDeployment(ctx context.Context, actor auth.Actor, id str
 			approval.ID, ApprovalExpired, "deployment cancelled", now); err != nil {
 			return err
 		}
-		return writeAuditObject(ctx, tx, actor, ActionApprovalExpire, "approval", approval.ID,
-			"deployment="+current.ID+" reason=deployment cancelled")
+		approval.Status = ApprovalExpired
+		approval.Reason = "deployment cancelled"
+		approval.DecidedAt = now
+		if err := writeAuditObject(ctx, tx, actor, ActionApprovalExpire, "approval", approval.ID,
+			"deployment="+current.ID+" reason=deployment cancelled"); err != nil {
+			return err
+		}
+		return s.enqueueApprovalNotification(ctx, tx, *approval, notificationExpired)
 	}
 	if current.Status == DeployCancelled {
 		if err := closePendingApproval(); err != nil {
 			return Deployment{}, err
 		}
-		if approval != nil && approval.Status == ApprovalPending {
-			if err := tx.Commit(); err != nil {
-				return Deployment{}, err
-			}
+		if err := tx.Commit(); err != nil {
+			return Deployment{}, err
 		}
 		return current, nil
 	}
