@@ -1,6 +1,6 @@
 # AegisFlow Go 后端
 
-Go 1.23+，Gin 1.11 + slog，PostgreSQL（pgx）+ Redis 共享限流，多应用实例部署，bcrypt，HS256 JWT。浏览器鉴权采用短期 Bearer access token + HttpOnly refresh Cookie；推荐前后端通过**同源代理**部署。项目注册表、最小构建闭环（触发、列表、详情、取消、游标日志）、部署目标、部署任务与部署审批已实现；LDAP 等其余业务接口尚未实现。完整接口契约见 [openapi.yaml](openapi.yaml)。
+Go 1.23+，Gin 1.11 + slog，PostgreSQL（pgx）+ Redis 共享限流，多应用实例部署，bcrypt，HS256 JWT。浏览器鉴权采用短期 Bearer access token + HttpOnly refresh Cookie；推荐前后端通过**同源代理**部署。项目注册表、最小构建闭环（触发、列表、详情、取消、游标日志）、部署目标、部署任务、部署审批与审批 Webhook 通知已实现；LDAP 等其余业务接口尚未实现。完整接口契约见 [openapi.yaml](openapi.yaml)。
 
 ## 本地启动（PowerShell）
 
@@ -142,7 +142,15 @@ server: {
 - 过期：持租约 worker 每 30s（接管时先跑一次）扫描 `pending AND expires_at <= now`，每批最多 100 条、`FOR UPDATE SKIP LOCKED`；审批置 `expired`（reason `approval expired`），部署置 `rejected`（detail `approval expired`），并为每行写 `approval.expire` 审计（actor 为空）。
 - 取消交互：取消 `awaiting_approval` 部署时，同一事务把审批置 `expired`（reason `deployment cancelled`，decided_at=now）并写 `approval.expire`；重复取消不会重复记账。审批状态机没有 cancelled，因此复用 `expired`。
 - 审计：`approval.request`（detail `deployment=<id>`）、`approval.approve`（`deployment=<id>`）、`approval.reject`（`deployment=<id> reason=<...>` 可选）、`approval.expire`（`deployment=<id> reason=approval expired|deployment cancelled`），objectType `approval`。
-- 本批边界：多级会签、通知渠道、前端审批页面仍未实现（页面保持未实现声明）。
+- 本批边界：多级会签仍未实现；前端审批页面已接入（#42）；通知渠道见 P4.4。
+
+### 审批通知（P4.4）
+
+- 可选配置：`AEGIS_APPROVAL_WEBHOOK_URL` 非空时启用；为空时完全不写 outbox，启用后只对新事件入队、不回填历史审批。URL 必须是 http(s)，除回环地址外只允许 https，且禁止 userinfo/fragment。`AEGIS_APPROVAL_WEBHOOK_SECRET` 可选（16–256 字节），配置后对**原始 JSON 请求体**计算 HMAC-SHA256，写入 `X-AegisFlow-Signature: sha256=<hex>`；`AEGIS_APPROVAL_WEBHOOK_TIMEOUT` 默认 5s、最大 30s。
+- 事件：`approval.requested`、`approval.approved`、`approval.rejected`、`approval.expired`。请求与三种终态在**审批状态变更的同一事务**写入 `approval_notifications` outbox，payload 记录事件发生时的审批、部署编号、项目名、目标、环境、版本与状态；不包含目标凭据、服务凭据、Cookie 或令牌。
+- 投递：独立 notifier 轮询 outbox（不占部署 worker 租约），每行按 `FOR UPDATE SKIP LOCKED` 领取，多个副本可并行；成功 2xx 置 `delivered`。失败按 10s 起的指数退避重试，最多 8 次，之后置 `failed` 并保留脱敏后的 `last_error`。语义是**至少一次**：接收方应按 `X-AegisFlow-Delivery`（同时是 payload `deliveryId`）幂等去重。
+- 可观测与边界：日志只记录审批 id、事件、尝试次数与 `http <code>`/`network error`，不记录 URL、签名密钥或 payload；通知失败不回滚、不改变审批或部署状态。没有管理 API、手动重放或通知历史页面；失败行保留在表中供运维排查。
+- 审计：通知 outbox 与审批审计同事务；不新增一条独立审计动作，避免把投递重试写进业务审计。OpenAPI 无新增路由。
 
 ### 运行指标（P4）
 

@@ -54,6 +54,12 @@ type Config struct {
 	ApprovalEnvironments []string
 	// ApprovalTTL bounds how long a pending approval stays valid (default 24h).
 	ApprovalTTL time.Duration
+	// ApprovalWebhookURL enables approval notifications; empty disables them.
+	// ApprovalWebhookSecret signs the JSON body with HMAC-SHA256 when set.
+	ApprovalWebhookURL    string
+	ApprovalWebhookSecret []byte
+	// ApprovalWebhookTimeout bounds one webhook delivery (default 5s, max 30s).
+	ApprovalWebhookTimeout time.Duration
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
@@ -231,6 +237,39 @@ func Load() (Config, error) {
 	if c.ApprovalTTL < time.Hour || c.ApprovalTTL > 168*time.Hour {
 		return c, errors.New("AEGIS_APPROVAL_TTL must be between 1h and 168h")
 	}
+	// Approval notifications are opt-in. A configured URL must be HTTPS, or
+	// HTTP only for a loopback receiver used by local integrations/tests; the
+	// URL is never logged. The signing secret is optional but, when present,
+	// must be long enough to make HMAC-SHA256 meaningful.
+	c.ApprovalWebhookURL = strings.TrimSpace(os.Getenv("AEGIS_APPROVAL_WEBHOOK_URL"))
+	if c.ApprovalWebhookURL != "" {
+		if len(c.ApprovalWebhookURL) > 2048 {
+			return c, errors.New("AEGIS_APPROVAL_WEBHOOK_URL must be at most 2048 bytes")
+		}
+		webhookURL, parseErr := url.Parse(c.ApprovalWebhookURL)
+		if parseErr != nil || (webhookURL.Scheme != "http" && webhookURL.Scheme != "https") ||
+			webhookURL.Host == "" || webhookURL.User != nil || webhookURL.Fragment != "" {
+			return c, errors.New("AEGIS_APPROVAL_WEBHOOK_URL must be an http(s) URL without userinfo or fragment")
+		}
+		if webhookURL.Scheme == "http" && !isLoopbackHost(webhookURL.Hostname()) {
+			return c, errors.New("AEGIS_APPROVAL_WEBHOOK_URL must use https unless the host is loopback")
+		}
+		if raw := os.Getenv("AEGIS_APPROVAL_WEBHOOK_SECRET"); raw != "" {
+			if len(raw) < 16 || len(raw) > 256 {
+				return c, errors.New("AEGIS_APPROVAL_WEBHOOK_SECRET must contain 16-256 bytes")
+			}
+			c.ApprovalWebhookSecret = []byte(raw)
+		}
+		c.ApprovalWebhookTimeout, err = duration("AEGIS_APPROVAL_WEBHOOK_TIMEOUT", "5s")
+		if err != nil {
+			return c, err
+		}
+		if c.ApprovalWebhookTimeout > 30*time.Second {
+			return c, errors.New("AEGIS_APPROVAL_WEBHOOK_TIMEOUT must be at most 30s")
+		}
+	} else if os.Getenv("AEGIS_APPROVAL_WEBHOOK_SECRET") != "" {
+		return c, errors.New("AEGIS_APPROVAL_WEBHOOK_SECRET requires AEGIS_APPROVAL_WEBHOOK_URL")
+	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {
 		origin = strings.TrimSpace(origin)
 		u, e := url.Parse(origin)
@@ -347,6 +386,18 @@ func duration(key, fallback string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s must be a duration of at least one second", key)
 	}
 	return d, nil
+}
+
+// isLoopbackHost reports whether host is a literal loopback address or the
+// localhost name. It is deliberately conservative: only an explicit loopback
+// receiver may use plain HTTP for webhook delivery.
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // parseBytes accepts the byte-suffix form used across the build settings

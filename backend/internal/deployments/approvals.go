@@ -158,6 +158,9 @@ func (s *Service) Approve(ctx context.Context, actor auth.Actor, approvalID stri
 	if err = writeAuditObject(ctx, tx, actor, ActionApprovalApprove, "approval", approvalID, "deployment="+deployment.ID); err != nil {
 		return Approval{}, err
 	}
+	if err = s.enqueueApprovalNotification(ctx, tx, approval, notificationApproved); err != nil {
+		return Approval{}, err
+	}
 	if err = tx.Commit(); err != nil {
 		return Approval{}, err
 	}
@@ -213,6 +216,9 @@ func (s *Service) Reject(ctx context.Context, actor auth.Actor, approvalID, reas
 		detail += " reason=" + reason
 	}
 	if err = writeAuditObject(ctx, tx, actor, ActionApprovalReject, "approval", approvalID, detail); err != nil {
+		return Approval{}, err
+	}
+	if err = s.enqueueApprovalNotification(ctx, tx, approval, notificationRejected); err != nil {
 		return Approval{}, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -291,8 +297,14 @@ func (s *Service) ExpireApprovals(ctx context.Context, now int64) (int64, error)
 			approval.DeploymentID, DeployRejected, now, "approval expired", DeployAwaitingApproval); err != nil {
 			return 0, err
 		}
+		approval.Status = ApprovalExpired
+		approval.Reason = "approval expired"
+		approval.DecidedAt = now
 		detail := "deployment=" + approval.DeploymentID + " reason=approval expired"
 		if err = writeAuditObject(ctx, tx, auth.Actor{}, ActionApprovalExpire, "approval", approval.ID, detail); err != nil {
+			return 0, err
+		}
+		if err = s.enqueueApprovalNotification(ctx, tx, approval, notificationExpired); err != nil {
 			return 0, err
 		}
 		expired++
