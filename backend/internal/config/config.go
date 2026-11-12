@@ -48,6 +48,11 @@ type Config struct {
 	DeployCheckTimeout time.Duration
 	// DeployTimeout bounds one deployment execution (default 10m, max 1h).
 	DeployTimeout time.Duration
+	// DeployHealthAttempts is how many health probes follow a 2xx deploy
+	// response; 0 disables the post-deploy check (default 3, max 20).
+	DeployHealthAttempts int
+	// DeployHealthInterval spaces those probes (default 2s, 1s–1m).
+	DeployHealthInterval time.Duration
 	// ApprovalEnvironments lists target environments that require an approval
 	// before execution. An empty slice disables approvals; when the variable is
 	// unset the default is ["production"].
@@ -208,6 +213,20 @@ func Load() (Config, error) {
 	}
 	if c.DeployTimeout > time.Hour {
 		return c, errors.New("AEGIS_DEPLOY_TIMEOUT must be at most 1h")
+	}
+	// Post-deploy health verification. A 2xx from the deploy endpoint only
+	// proves the request was accepted, so by default the worker re-probes the
+	// target's health path; 0 disables that second opinion.
+	c.DeployHealthAttempts, err = intInRange("AEGIS_DEPLOY_HEALTH_ATTEMPTS", "3", 0, 20)
+	if err != nil {
+		return c, err
+	}
+	c.DeployHealthInterval, err = duration("AEGIS_DEPLOY_HEALTH_INTERVAL", "2s")
+	if err != nil {
+		return c, err
+	}
+	if c.DeployHealthInterval > time.Minute {
+		return c, errors.New("AEGIS_DEPLOY_HEALTH_INTERVAL must be at most 1m")
 	}
 	// Deployment approvals. Presence of the variable is authoritative: an
 	// explicitly empty value disables approvals, while an unset variable uses

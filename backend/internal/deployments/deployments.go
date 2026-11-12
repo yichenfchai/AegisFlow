@@ -64,6 +64,9 @@ const (
 	defaultCheckTimeout   = 5 * time.Second
 	defaultDeployTimeout  = 10 * time.Minute
 	defaultWebhookTimeout = 5 * time.Second
+	// defaultHealthInterval spaces the post-deploy health probes; the caller
+	// configures both the count and the spacing.
+	defaultHealthInterval = 2 * time.Second
 )
 
 // Options is explicit dependency configuration. An empty SecretKey disables
@@ -84,7 +87,13 @@ type Options struct {
 	ApprovalWebhookSecret []byte
 	// ApprovalWebhookTimeout bounds one webhook delivery; zero means 5s.
 	ApprovalWebhookTimeout time.Duration
-	HTTPClient             *http.Client
+	// HealthCheckAttempts is how many times the worker probes the target's
+	// health path after a 2xx deploy response; 0 disables the post-deploy
+	// check. cmd/server passes the configured value, whose default is 3.
+	HealthCheckAttempts int
+	// HealthCheckInterval waits between those probes; zero means 2s.
+	HealthCheckInterval time.Duration
+	HTTPClient          *http.Client
 }
 
 // Target is the public view of a deployment target. Secret material is never
@@ -159,6 +168,10 @@ type Service struct {
 	// notify wakes the worker after a deployment is enqueued; buffered so the
 	// request path never blocks.
 	notify chan struct{}
+	// healthAttempts is 0 when the post-deploy health check is disabled;
+	// healthInterval spaces the probes.
+	healthAttempts int
+	healthInterval time.Duration
 	// leaseRetry overrides the standby lease retry in tests.
 	leaseRetry time.Duration
 }
@@ -203,6 +216,14 @@ func New(db *sql.DB, opts Options) *Service {
 			return http.ErrUseLastResponse
 		},
 	}
+	healthInterval := opts.HealthCheckInterval
+	if healthInterval <= 0 {
+		healthInterval = defaultHealthInterval
+	}
+	healthAttempts := opts.HealthCheckAttempts
+	if healthAttempts < 0 {
+		healthAttempts = 0
+	}
 	return &Service{
 		db:                   db,
 		secretKey:            append([]byte(nil), opts.SecretKey...),
@@ -215,6 +236,8 @@ func New(db *sql.DB, opts Options) *Service {
 		webhookSecret:        append([]byte(nil), opts.ApprovalWebhookSecret...),
 		webhookClient:        webhookClient,
 		notify:               make(chan struct{}, 1),
+		healthAttempts:       healthAttempts,
+		healthInterval:       healthInterval,
 		leaseRetry:           defaultLeaseRetry,
 	}
 }
