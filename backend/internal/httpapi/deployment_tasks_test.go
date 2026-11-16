@@ -115,23 +115,25 @@ func TestDeploymentTaskRoutesAndRBAC(t *testing.T) {
 	}
 	targetID := target.Data.ID
 
-	// RBAC: every deployment endpoint is admin-only.
-	if w = request(h, "POST", "/api/v1/projects/"+projectID+"/deployments", `{"targetId":"`+targetID+`","version":"v1"}`, memberToken); w.Code != 403 || errorCode(t, w) != "forbidden" {
-		t.Fatalf("member create: %d %s", w.Code, w.Body.String())
+	// Project-scoped RBAC: the service applies the project write overlay. A
+	// viewer may read a public project's deployments but never write, and an
+	// absent or invisible deployment is a 404 for every role.
+	if w = request(h, "GET", "/api/v1/projects/"+projectID+"/deployments", "", viewerToken); w.Code != 200 {
+		t.Fatalf("viewer list: %d %s", w.Code, w.Body.String())
 	}
-	if w = request(h, "GET", "/api/v1/projects/"+projectID+"/deployments", "", viewerToken); w.Code != 403 {
-		t.Fatalf("viewer list: %d", w.Code)
+	if w = request(h, "POST", "/api/v1/projects/"+projectID+"/deployments", `{"targetId":"`+targetID+`","version":"v1"}`, viewerToken); w.Code != 403 || errorCode(t, w) != "forbidden" {
+		t.Fatalf("viewer create: %d %s", w.Code, w.Body.String())
 	}
-	if w = request(h, "GET", "/api/v1/deployments/missing-0000000000000001", "", memberToken); w.Code != 403 {
+	if w = request(h, "GET", "/api/v1/deployments/missing-0000000000000001", "", memberToken); w.Code != 404 {
 		t.Fatalf("member get: %d", w.Code)
 	}
-	if w = request(h, "GET", "/api/v1/deployments/missing-0000000000000001/events", "", viewerToken); w.Code != 403 {
+	if w = request(h, "GET", "/api/v1/deployments/missing-0000000000000001/events", "", viewerToken); w.Code != 404 {
 		t.Fatalf("viewer events: %d", w.Code)
 	}
-	if w = request(h, "POST", "/api/v1/deployments/missing-0000000000000001/cancel", `{}`, memberToken); w.Code != 403 {
+	if w = request(h, "POST", "/api/v1/deployments/missing-0000000000000001/cancel", `{}`, memberToken); w.Code != 404 {
 		t.Fatalf("member cancel: %d", w.Code)
 	}
-	if w = request(h, "POST", "/api/v1/deployments/missing-0000000000000001/rollback", `{}`, viewerToken); w.Code != 403 {
+	if w = request(h, "POST", "/api/v1/deployments/missing-0000000000000001/rollback", `{}`, viewerToken); w.Code != 404 {
 		t.Fatalf("viewer rollback: %d", w.Code)
 	}
 
@@ -227,11 +229,16 @@ func TestDeploymentTaskRoutesAndRBAC(t *testing.T) {
 	if w = request(h, "GET", "/api/v1/deployments?status=bogus", "", adminToken); w.Code != 400 {
 		t.Fatalf("global invalid status: %d", w.Code)
 	}
-	if w = request(h, "GET", "/api/v1/deployments", "", memberToken); w.Code != 403 {
-		t.Fatalf("member global list: %d", w.Code)
+	// Members and viewers see the public project's deployments: the list is
+	// scoped by project visibility, not by the caller's role.
+	if w = request(h, "GET", "/api/v1/deployments", "", memberToken); w.Code != 200 {
+		t.Fatalf("member global list: %d %s", w.Code, w.Body.String())
 	}
-	if w = request(h, "GET", "/api/v1/deployments", "", viewerToken); w.Code != 403 {
-		t.Fatalf("viewer global list: %d", w.Code)
+	if w = request(h, "GET", "/api/v1/deployments", "", viewerToken); w.Code != 200 {
+		t.Fatalf("viewer global list: %d %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil || page.Data.Total != 3 {
+		t.Fatalf("viewer global payload: %s", w.Body.String())
 	}
 	if w = request(h, "GET", "/api/v1/projects/"+projectID+"/deployments?status=bogus", "", adminToken); w.Code != 400 {
 		t.Fatalf("bad status: %d", w.Code)
@@ -293,5 +300,24 @@ func TestDeploymentTaskRoutesAndRBAC(t *testing.T) {
 	}
 	if w = request(h, "GET", "/api/v1/deployments/"+rollback.ID, "", adminToken); w.Code != 200 {
 		t.Fatalf("get rollback: %d", w.Code)
+	}
+
+	// A member may deploy to a public project it can write; approvals stay
+	// admin-only, so the same member cannot decide a request afterwards. (The
+	// approval gate itself is environment policy, covered by the approval
+	// tests with approvals enabled.)
+	w = request(h, "POST", "/api/v1/projects/"+projectID+"/deployments", `{"targetId":"`+targetID+`","version":"v3.0.0"}`, memberToken)
+	if w.Code != 201 {
+		t.Fatalf("member create: %d %s", w.Code, w.Body.String())
+	}
+	memberDeployment := parseDeployment(t, w)
+	if memberDeployment.Status != "queued" || memberDeployment.TriggeredBy == "" {
+		t.Fatalf("member deployment = %+v", memberDeployment)
+	}
+	if w = request(h, "GET", "/api/v1/approvals", "", memberToken); w.Code != 403 {
+		t.Fatalf("member approvals list: %d %s", w.Code, w.Body.String())
+	}
+	if w = request(h, "POST", "/api/v1/approvals/missing-0000000000000001/approve", `{}`, memberToken); w.Code != 403 {
+		t.Fatalf("member approve: %d %s", w.Code, w.Body.String())
 	}
 }

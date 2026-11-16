@@ -119,6 +119,7 @@ func run(logger *slog.Logger) error {
 	deploymentsService := deployments.New(db, deployments.Options{
 		SecretKey:              cfg.SecretKey,
 		PreviousSecretKey:      cfg.PreviousSecretKey,
+		Projects:               registry,
 		CheckTimeout:           cfg.DeployCheckTimeout,
 		DeployTimeout:          cfg.DeployTimeout,
 		HealthCheckAttempts:    cfg.DeployHealthAttempts,

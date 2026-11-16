@@ -135,10 +135,10 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	projectRoutes.POST("/:id/members", s.requireRole("admin", "member"), s.addProjectMember)
 	projectRoutes.PATCH("/:id/members/:userId", s.requireRole("admin", "member"), s.updateProjectMember)
 	projectRoutes.DELETE("/:id/members/:userId", s.requireRole("admin", "member"), s.removeProjectMember)
-	// Deployment tasks are admin-only (design §7); the project path only scopes
-	// creation/listing, authorization is global.
-	projectRoutes.GET("/:id/deployments", s.requireAdmin(), s.listDeployments)
-	projectRoutes.POST("/:id/deployments", s.requireAdmin(), s.createDeployment)
+	// Deployment tasks live under the project for creation/listing; the
+	// service authorizes every action against the project write overlay.
+	projectRoutes.GET("/:id/deployments", s.listDeployments)
+	projectRoutes.POST("/:id/deployments", s.createDeployment)
 	buildRoutes := api.Group("/builds", s.authenticate())
 	buildRoutes.GET("", s.listBuilds)
 	buildRoutes.GET("/:id", s.getBuild)
@@ -146,9 +146,8 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	buildRoutes.GET("/:id/events", s.streamBuildEvents)
 	buildRoutes.POST("/:id/cancel", s.requireRole("admin", "member"), s.cancelBuild)
 	buildRoutes.POST("/:id/retry", s.requireRole("admin", "member"), s.retryBuild)
-	// Deployment targets, deploy tasks and approvals are global administrative
-	// objects: manage, probe, execute, roll back and decide approvals is
-	// admin-only.
+	// Deployment targets and approvals are global administrative objects; the
+	// deploy tasks below them are authorized per project by the service.
 	deploymentTargets := api.Group("/deployment-targets", s.authenticate(), s.requireAdmin())
 	deploymentTargets.GET("", s.listDeploymentTargets)
 	deploymentTargets.POST("", s.createDeploymentTarget)
@@ -156,9 +155,9 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	deploymentTargets.PATCH("/:id", s.updateDeploymentTarget)
 	deploymentTargets.DELETE("/:id", s.removeDeploymentTarget)
 	deploymentTargets.POST("/:id/check", s.checkDeploymentTarget)
-	deployRoutes := api.Group("/deployments", s.authenticate(), s.requireAdmin())
+	deployRoutes := api.Group("/deployments", s.authenticate())
 	// The global list mirrors the build list: optional projectId and status
-	// filters, newest first. Deployments themselves stay admin-only.
+	// filters, newest first, restricted to the projects the caller can see.
 	deployRoutes.GET("", s.listDeploymentsGlobal)
 	deployRoutes.GET("/:id", s.getDeployment)
 	deployRoutes.GET("/:id/events", s.getDeploymentEvents)
@@ -1091,6 +1090,8 @@ func (s *Server) deploymentError(c *gin.Context, err error) {
 		s.fail(c, 409, "conflict", "deployment or approval is already terminal, is not in the expected state for this operation, or the deployment is no longer awaiting approval")
 	case errors.Is(err, deployments.ErrNotFound):
 		s.fail(c, 404, "not_found", "resource not found")
+	case errors.Is(err, deployments.ErrForbidden):
+		s.fail(c, 403, "forbidden", "the caller may see this project but not deploy to it")
 	default:
 		s.logger.ErrorContext(c.Request.Context(), "deployment request failed", "requestId", requestID(c), "error", err)
 		s.fail(c, 500, "internal_error", "internal server error")

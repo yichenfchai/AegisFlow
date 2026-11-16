@@ -47,7 +47,7 @@ tags:
   - name: DeploymentTargets
     description: Admin-only deployment targets with encrypted credentials and connectivity probes
   - name: Deployments
-    description: Admin-only deployment tasks, lifecycle events, cancellation and rollback
+    description: Deployment tasks, lifecycle events, cancellation and rollback; every route is authorized against the project write overlay and filtered by project visibility
   - name: Approvals
     description: Admin-only deployment approval queue (approve, reject, expiry)
   - name: Audit
@@ -1377,8 +1377,8 @@ paths:
     get:
       tags: [Deployments]
       operationId: listProjectDeployments
-      summary: List a project's deployments (admin only)
-      description: Newest first. Every deployment endpoint is admin-only; the project path only scopes the list.
+      summary: List a project's deployments (visible projects)
+      description: Newest first, restricted to projects the caller can see. A member with write access to the project can enqueue, cancel and roll back here.
       security:
         - bearerAuth: []
       parameters:
@@ -1412,7 +1412,7 @@ paths:
     post:
       tags: [Deployments]
       operationId: createDeployment
-      summary: Enqueue a deployment (admin only)
+      summary: Enqueue a deployment (project write access)
       description: |
         The target must exist and be active; its name, endpoint and environment
         are snapshotted into the new deployment. version is a tag, SHA or
@@ -1462,8 +1462,8 @@ paths:
     get:
       tags: [Deployments]
       operationId: listDeployments
-      summary: List deployments across projects (admin only)
-      description: Newest first. projectId and status are optional filters; every deployment endpoint is admin-only and this list mirrors the global build list.
+      summary: List deployments across projects (visible projects)
+      description: Newest first. projectId and status are optional filters; the list mirrors the global build list and is restricted to projects the caller can see.
       security:
         - bearerAuth: []
       parameters:
@@ -1499,7 +1499,7 @@ paths:
     get:
       tags: [Deployments]
       operationId: getDeployment
-      summary: Get one deployment (admin only)
+      summary: Get one deployment (visible projects)
       security:
         - bearerAuth: []
       parameters:
@@ -1528,7 +1528,7 @@ paths:
     get:
       tags: [Deployments]
       operationId: listDeploymentEvents
-      summary: Read deployment events by cursor (admin only)
+      summary: Read deployment events by cursor (visible projects)
       description: Oldest first. after is the exclusive event id (the same cursor the SSE-style readers use); limit is 1-1000 and defaults to 200.
       security:
         - bearerAuth: []
@@ -1566,7 +1566,7 @@ paths:
     post:
       tags: [Deployments]
       operationId: cancelDeployment
-      summary: Cancel a queued, awaiting-approval or running deployment (admin only)
+      summary: Cancel a queued, awaiting-approval or running deployment (project write access)
       description: |
         Cancelling a running deployment aborts the in-flight HTTP request via a
         300ms status watchdog. Repeating on an already-cancelled deployment is
@@ -1603,7 +1603,7 @@ paths:
     post:
       tags: [Deployments]
       operationId: rollbackDeployment
-      summary: Roll back to the most recent earlier succeeded version (admin only)
+      summary: Roll back to the most recent earlier succeeded version (project write access)
       description: |
         The source must be succeeded or failed (409 otherwise), and an earlier
         succeeded deployment for the same project and target must exist (400

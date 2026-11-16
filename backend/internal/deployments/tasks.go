@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 )
 
 // Deployment statuses (design §3). awaiting_approval and rejected are part of
@@ -162,6 +163,9 @@ func (s *Service) CreateDeployment(ctx context.Context, actor auth.Actor, projec
 		return Deployment{}, err
 	}
 	defer tx.Rollback()
+	if err = s.authorizeProjectWrite(ctx, tx, actor, projectID); err != nil {
+		return Deployment{}, err
+	}
 	target, err := targetSnapshotFor(ctx, tx, input.TargetID)
 	if err != nil {
 		return Deployment{}, err
@@ -273,13 +277,17 @@ func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.
 	return deployment, nil
 }
 
-// GetDeployment returns one deployment. Callers are already authorized by the
-// HTTP layer (admin only).
+// GetDeployment returns one deployment the actor is allowed to see. The
+// visibility join mirrors the build list: an invisible project is a 404, so a
+// deployment id cannot be used to probe project existence.
 func (s *Service) GetDeployment(ctx context.Context, actor auth.Actor, id string) (Deployment, error) {
 	if !auth.ValidID(id) {
 		return Deployment{}, fmt.Errorf("%w: invalid deployment id", ErrValidation)
 	}
-	deployment, err := scanDeployment(s.db.QueryRowContext(ctx, `SELECT `+deploymentColumns+` FROM deployments WHERE id=$1`, id))
+	isAdmin, userID := projects.VisibilityArgs(actor)
+	deployment, err := scanDeployment(s.db.QueryRowContext(ctx,
+		`SELECT `+deploymentColumnsQualified+` FROM deployments d JOIN projects p ON p.id=d.project_id
+		 WHERE d.id=$1 AND `+projects.VisiblePredicate("p", 2, 3), id, isAdmin, userID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, ErrNotFound
 	}
@@ -290,7 +298,8 @@ func (s *Service) GetDeployment(ctx context.Context, actor auth.Actor, id string
 }
 
 // ListDeployments pages deployments, newest first; projectID and status are
-// optional filters.
+// optional filters. Only deployments of projects the actor can see are
+// returned, and the project filter cannot widen that set.
 func (s *Service) ListDeployments(ctx context.Context, actor auth.Actor, projectID, status string, limit, offset int) ([]Deployment, int, error) {
 	if projectID != "" && !auth.ValidID(projectID) {
 		return nil, 0, fmt.Errorf("%w: invalid project id", ErrValidation)
@@ -301,14 +310,16 @@ func (s *Service) ListDeployments(ctx context.Context, actor auth.Actor, project
 	if err := paginate(limit, offset); err != nil {
 		return nil, 0, err
 	}
+	isAdmin, userID := projects.VisibilityArgs(actor)
+	filter := ` FROM deployments d JOIN projects p ON p.id=d.project_id
+		WHERE ($1='' OR d.project_id=$1) AND ($2='' OR d.status=$2) AND ` + projects.VisiblePredicate("p", 3, 4)
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM deployments WHERE ($1='' OR project_id=$1) AND ($2='' OR status=$2)`,
-		projectID, status).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+filter, projectID, status, isAdmin, userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+deploymentColumns+` FROM deployments
-	 WHERE ($1='' OR project_id=$1) AND ($2='' OR status=$2)
-	 ORDER BY created_at DESC,deployment_number DESC,id DESC LIMIT $3 OFFSET $4`, projectID, status, limit, offset)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+deploymentColumnsQualified+filter+`
+		ORDER BY d.created_at DESC,d.deployment_number DESC,d.id DESC LIMIT $5 OFFSET $6`,
+		projectID, status, isAdmin, userID, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -343,12 +354,15 @@ func (s *Service) CancelDeployment(ctx context.Context, actor auth.Actor, id str
 	// approval_id never changes after creation, so it can be read without the
 	// deployment lock; taking the approval lock first keeps the lock order
 	// consistent with approve/reject/expire.
-	var approvalID string
-	err = tx.QueryRowContext(ctx, `SELECT approval_id FROM deployments WHERE id=$1`, id).Scan(&approvalID)
+	var approvalID, projectID string
+	err = tx.QueryRowContext(ctx, `SELECT approval_id, project_id FROM deployments WHERE id=$1`, id).Scan(&approvalID, &projectID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, ErrNotFound
 	}
 	if err != nil {
+		return Deployment{}, err
+	}
+	if err = s.authorizeProjectWrite(ctx, tx, actor, projectID); err != nil {
 		return Deployment{}, err
 	}
 	var approval *Approval
@@ -427,6 +441,18 @@ func (s *Service) RollbackDeployment(ctx context.Context, actor auth.Actor, id s
 		return Deployment{}, err
 	}
 	defer tx.Rollback()
+	// Authorize before taking the deployment lock so a caller without write
+	// access neither sees the row nor blocks it.
+	var projectID string
+	if err = tx.QueryRowContext(ctx, `SELECT project_id FROM deployments WHERE id=$1`, id).Scan(&projectID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Deployment{}, ErrNotFound
+		}
+		return Deployment{}, err
+	}
+	if err = s.authorizeProjectWrite(ctx, tx, actor, projectID); err != nil {
+		return Deployment{}, err
+	}
 	source, err := scanDeployment(tx.QueryRowContext(ctx, `SELECT `+deploymentColumns+` FROM deployments WHERE id=$1 FOR UPDATE`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, ErrNotFound

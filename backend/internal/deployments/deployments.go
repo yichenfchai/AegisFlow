@@ -24,12 +24,16 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 )
 
 var (
 	ErrValidation = errors.New("validation failed")
 	ErrConflict   = errors.New("conflict")
 	ErrNotFound   = errors.New("not found")
+	// ErrForbidden means the caller can see the project but may not act on it
+	// (a viewer, or a member on a private project it does not maintain).
+	ErrForbidden = errors.New("forbidden")
 )
 
 // Audited deployment-target actions, recorded in the shared auth_audit trail.
@@ -74,6 +78,9 @@ const (
 // validation error rather than a silent plaintext fallback.
 type Options struct {
 	SecretKey []byte
+	// Projects authorizes non-admin callers through the project write overlay.
+	// Nil keeps deployment writes admin-only: every other role is refused.
+	Projects *projects.Service
 	// PreviousSecretKey keeps stored credentials readable right after a key
 	// rotation: it is only ever used to decrypt, never to seal, so new writes
 	// always use SecretKey. Empty disables the fallback.
@@ -156,6 +163,7 @@ type CheckResult struct {
 
 type Service struct {
 	db            *sql.DB
+	projects      *projects.Service
 	secretKey     []byte
 	previousKey   []byte
 	checkTimeout  time.Duration
@@ -231,6 +239,7 @@ func New(db *sql.DB, opts Options) *Service {
 	}
 	return &Service{
 		db:                   db,
+		projects:             opts.Projects,
 		secretKey:            append([]byte(nil), opts.SecretKey...),
 		previousKey:          append([]byte(nil), opts.PreviousSecretKey...),
 		checkTimeout:         timeout,

@@ -173,15 +173,19 @@ test('部署与审批闭环：部署、审批、回滚与管理员限制', async
   await member.goto('/deploys')
   await expect(member.getByText('无权访问')).toBeVisible()
 
-  const denied = await member.evaluate(async () => {
+  // The deployment API is project-scoped now: a member can list the
+  // deployments of every project it can see, while the admin UI keeps the
+  // pages hidden until the frontend slice lands.
+  const memberList = await member.evaluate(async () => {
     const { apiRequest } = await import('/src/stores/session.ts')
     try {
-      await apiRequest('/deployments')
-      return 200
+      const page = await apiRequest<{ items: unknown[] }>('/deployments')
+      return { status: 200, items: page.items.length }
     } catch (error) {
-      return (error as { status: number }).status
+      return { status: (error as { status: number }).status, items: 0 }
     }
   })
-  expect(denied).toBe(403)
+  expect(memberList.status).toBe(200)
+  expect(memberList.items).toBeGreaterThan(0)
   await memberCtx.close()
 })
