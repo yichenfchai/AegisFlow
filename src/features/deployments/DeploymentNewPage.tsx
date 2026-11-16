@@ -18,8 +18,8 @@ function createError(cause: unknown): string {
     if (cause.status === 400) {
       return '请求不合法：检查版本格式（1-64 位字母、数字、. _ + -）、目标是否启用、构建 ID 是否为本项目的成功构建'
     }
-    if (cause.status === 403) return '当前角色没有发起部署的权限'
-    if (cause.status === 404) return '项目不存在或已被删除'
+    if (cause.status === 403) return '你在该项目没有部署权限：需要项目维护者或被允许的成员角色'
+    if (cause.status === 404) return '项目不存在、对你不可见，或你在该项目没有写权限'
     if (cause.status === 503) return '服务依赖不可用，请稍后重试'
     if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
@@ -51,7 +51,7 @@ export function DeploymentNewPage() {
     staleTime: 60_000,
   })
   const projects = projectsQuery.data?.items ?? []
-  const targets = (targetsQuery.data?.items ?? []).filter((t) => t.status === 'active')
+  const targets = targetsQuery.data?.items ?? []
 
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault()

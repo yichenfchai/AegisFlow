@@ -148,6 +148,10 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	buildRoutes.POST("/:id/retry", s.requireRole("admin", "member"), s.retryBuild)
 	// Deployment targets and approvals are global administrative objects; the
 	// deploy tasks below them are authorized per project by the service.
+	// Deployment targets are admin-managed, but the active target options are
+	// readable by every authenticated role: the deploy form needs them, and the
+	// same values already appear on deployment snapshots.
+	api.GET("/deployment-targets/options", s.authenticate(), s.listDeploymentTargetOptions)
 	deploymentTargets := api.Group("/deployment-targets", s.authenticate(), s.requireAdmin())
 	deploymentTargets.GET("", s.listDeploymentTargets)
 	deploymentTargets.POST("", s.createDeploymentTarget)
@@ -959,6 +963,22 @@ func (s *Server) deploymentTargetError(c *gin.Context, err error) {
 		s.logger.ErrorContext(c.Request.Context(), "deployment target request failed", "requestId", requestID(c), "error", err)
 		s.fail(c, 500, "internal_error", "internal server error")
 	}
+}
+
+// listDeploymentTargetOptions returns the active targets a deployment can use.
+// It is the only deployment-target read available to non-admin roles; the full
+// list, mutations and probes stay admin-only.
+func (s *Server) listDeploymentTargetOptions(c *gin.Context) {
+	if s.deployments == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	options, err := s.deployments.TargetOptions(c.Request.Context())
+	if err != nil {
+		s.deploymentTargetError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": options})
 }
 
 func (s *Server) listDeploymentTargets(c *gin.Context) {

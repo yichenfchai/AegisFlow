@@ -40,6 +40,11 @@ export const router = createBrowserRouter([
       // 真实账号能力（所有角色）
       { path: '/account', element: <AccountSecurityPage /> },
 
+      // 部署记录：按项目可见性过滤，成员/只读可查看；创建与回滚由服务端按项目写权限再判
+      { path: '/deploys', element: <DeploymentListPage /> },
+      { path: '/deploys/new', element: <DeploymentNewPage /> },
+      { path: '/deploys/:id', element: <DeploymentDetailPage /> },
+
       // 非主线业务：恒定未实现
       { path: '/reviews', element: <UnimplementedPage title="审查中心" /> },
       { path: '/reviews/new', element: <UnimplementedPage title="发起审查" /> },
@@ -47,16 +52,13 @@ export const router = createBrowserRouter([
       { path: '/scans', element: <UnimplementedPage title="安全扫描" /> },
       { path: '/knowledge', element: <UnimplementedPage title="知识库" /> },
 
-      // 管理员入口：真实部署目标、部署记录、审批、用户与审计；其余为未实现占位
+      // 管理员入口：真实部署目标、审批、用户与审计；其余为未实现占位
       {
         element: <SessionGate adminOnly />,
         children: [
           { path: '/deploy-targets', element: <DeploymentTargetsPage /> },
           { path: '/deploy-targets/new', element: <DeploymentTargetWizardPage /> },
           { path: '/deploy-targets/:id', element: <DeploymentTargetDetailPage /> },
-          { path: '/deploys', element: <DeploymentListPage /> },
-          { path: '/deploys/new', element: <DeploymentNewPage /> },
-          { path: '/deploys/:id', element: <DeploymentDetailPage /> },
           { path: '/approvals', element: <ApprovalListPage /> },
           { path: '/defense', element: <UnimplementedPage title="攻击防御" /> },
           { path: '/audit', element: <UnimplementedPage title="自动化审计" /> },
