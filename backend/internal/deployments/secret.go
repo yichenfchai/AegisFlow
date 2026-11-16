@@ -15,18 +15,29 @@ const secretAADPrefix = "deployment_target:"
 
 func secretAAD(targetID string) []byte { return []byte(secretAADPrefix + targetID) }
 
+// newGCM builds the AEAD for one key.
+func newGCM(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+// openSealed opens one ciphertext; callers check the length first.
+func openSealed(aead cipher.AEAD, targetID string, sealed []byte) ([]byte, error) {
+	return aead.Open(nil, sealed[:aead.NonceSize()], sealed[aead.NonceSize():], secretAAD(targetID))
+}
+
 // encryptSecret seals secret with AES-256-GCM; the output layout is
 // [12-byte nonce][ciphertext+tag]. A random nonce per write means two equal
-// secrets never produce equal ciphertext.
+// secrets never produce equal ciphertext. Only the current key ever seals, so
+// a rotation never writes a credential that needs the retiring key.
 func (s *Service) encryptSecret(targetID, secret string) ([]byte, error) {
 	if !s.secretReady() {
 		return nil, secretNotConfigured()
 	}
-	block, err := aes.NewCipher(s.secretKey)
-	if err != nil {
-		return nil, err
-	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := newGCM(s.secretKey)
 	if err != nil {
 		return nil, err
 	}
@@ -38,7 +49,11 @@ func (s *Service) encryptSecret(targetID, secret string) ([]byte, error) {
 }
 
 // decryptSecret opens a stored ciphertext for the target it was sealed for.
-// The plaintext is only ever held in memory for one probe.
+// The plaintext is only ever held in memory for one probe. When a rotation is
+// in progress the previous key is tried after the current one, so a target
+// keeps working without rewriting its credential; the failure is the same
+// whichever key was tried, so the error cannot be used to probe which key
+// sealed a row.
 func (s *Service) decryptSecret(targetID string, sealed []byte) (string, error) {
 	if len(sealed) == 0 {
 		return "", nil
@@ -46,20 +61,22 @@ func (s *Service) decryptSecret(targetID string, sealed []byte) (string, error) 
 	if !s.secretReady() {
 		return "", errors.New("deployment target secret cannot be decrypted: secret storage is not configured")
 	}
-	block, err := aes.NewCipher(s.secretKey)
-	if err != nil {
-		return "", err
-	}
-	aead, err := cipher.NewGCM(block)
+	aead, err := newGCM(s.secretKey)
 	if err != nil {
 		return "", err
 	}
 	if len(sealed) < aead.NonceSize()+aead.Overhead() {
 		return "", fmt.Errorf("deployment target secret is malformed")
 	}
-	plain, err := aead.Open(nil, sealed[:aead.NonceSize()], sealed[aead.NonceSize():], secretAAD(targetID))
-	if err != nil {
-		return "", errors.New("deployment target secret cannot be decrypted")
+	if plain, openErr := openSealed(aead, targetID, sealed); openErr == nil {
+		return string(plain), nil
 	}
-	return string(plain), nil
+	if len(s.previousKey) == 32 {
+		if previousAEAD, previousErr := newGCM(s.previousKey); previousErr == nil {
+			if plain, openErr := openSealed(previousAEAD, targetID, sealed); openErr == nil {
+				return string(plain), nil
+			}
+		}
+	}
+	return "", errors.New("deployment target secret cannot be decrypted")
 }

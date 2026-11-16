@@ -29,7 +29,7 @@ func unsetEnv(t *testing.T, key string) {
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_DEPLOY_HEALTH_ATTEMPTS", "AEGIS_DEPLOY_HEALTH_INTERVAL", "AEGIS_APPROVAL_TTL", "AEGIS_APPROVAL_WEBHOOK_URL", "AEGIS_APPROVAL_WEBHOOK_SECRET", "AEGIS_APPROVAL_WEBHOOK_TIMEOUT"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_SECRET_KEY_PREVIOUS", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_DEPLOY_HEALTH_ATTEMPTS", "AEGIS_DEPLOY_HEALTH_INTERVAL", "AEGIS_APPROVAL_TTL", "AEGIS_APPROVAL_WEBHOOK_URL", "AEGIS_APPROVAL_WEBHOOK_SECRET", "AEGIS_APPROVAL_WEBHOOK_TIMEOUT"} {
 		t.Setenv(key, "")
 	}
 	unsetEnv(t, "AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
@@ -305,6 +305,45 @@ func TestSecretKeyConfig(t *testing.T) {
 			}
 			if len(c.SecretKey) != tc.wantLen {
 				t.Fatalf("key length = %d, want %d", len(c.SecretKey), tc.wantLen)
+			}
+		})
+	}
+}
+
+func TestPreviousSecretKeyConfig(t *testing.T) {
+	encode := func(size int, fill byte) string {
+		return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{fill}, size))
+	}
+	current, previous := encode(32, 1), encode(32, 2)
+	for _, tc := range []struct {
+		name     string
+		current  string
+		previous string
+		wantPrev bool
+		invalid  bool
+	}{
+		{"no keys", "", "", false, false},
+		{"current only", current, "", false, false},
+		{"rotation pair", current, previous, true, false},
+		{"previous without current", "", previous, false, true},
+		{"equal keys", current, current, false, true},
+		{"previous not base64", current, "!!!!", false, true},
+		{"previous of 16 bytes", current, encode(16, 3), false, true},
+		{"previous of 33 bytes", current, encode(33, 3), false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_SECRET_KEY", tc.current)
+			t.Setenv("AEGIS_SECRET_KEY_PREVIOUS", tc.previous)
+			c, err := Load()
+			if (err != nil) != tc.invalid {
+				t.Fatalf("err=%v invalid=%v", err, tc.invalid)
+			}
+			if err != nil {
+				return
+			}
+			if got := len(c.PreviousSecretKey) == 32; got != tc.wantPrev {
+				t.Fatalf("previous key set = %v, want %v", got, tc.wantPrev)
 			}
 		})
 	}
