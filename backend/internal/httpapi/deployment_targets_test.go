@@ -56,6 +56,10 @@ func deploymentTestServerWith(t *testing.T, client *http.Client, opts deployment
 		opts.ApprovalEnvironments = []string{}
 	}
 	opts.HTTPClient = client
+	if opts.Projects == nil {
+		// The write overlay needs the registry, exactly like the server wiring.
+		opts.Projects = projects.New(db)
+	}
 	registry := deployments.New(db, opts)
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	return New(s, logger, db.PingContext, []string{"http://localhost:5173"}, Options{

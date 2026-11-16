@@ -130,7 +130,7 @@ server: {
 - 查询：项目内列表 `GET /api/v1/projects/{projectId}/deployments`，管理员全局列表 `GET /api/v1/deployments?projectId&status&limit&offset`（与构建列表同形）；详情、事件游标（`after&limit`）与取消/回滚都在 `/api/v1/deployments/{id}` 下。
 - 目标快照：创建时固化 `target_name/target_endpoint/target_environment`，之后改名或改端点不影响历史；执行使用目标当前配置，目标在执行前被禁用/删除会置 `failed`。
 - 回滚：`POST /api/v1/deployments/{id}/rollback` 仅接受 `succeeded`/`failed` 源，取同项目+目标中比源部署更早的最近一次 `succeeded` 版本，新建一条 `queued` 部署（`rollbackOf` 指向源，payload `rollback=true`、`rollbackVersion` 为该版本）；无更早成功返回 400，源非终态 409；重复回滚会创建多条部署（非幂等，审计可追溯）。
-- 权限与审计：六个部署端点全部 admin-only（member/viewer 403）；`deployment.create`（detail `target=<name> version=<v> approval=none`）、`deployment.cancel`（`from=<status>`）、`deployment.rollback`（`rollback_of=<id> version=<v>`）与状态变更同事务，重复取消失败不重复记账。
+- 权限与审计：部署端点按项目写权限授权——admin 全量；member 对可写项目（public，或 private 且为 maintainer）可创建、取消与回滚；viewer 只读不可写。列表与详情按项目可见性过滤，不可见一律 404（防枚举）；审批接口仍 admin-only。`deployment.create`（detail `target=<name> version=<v> approval=none`）、`deployment.cancel`（`from=<status>`）、`deployment.rollback`（`rollback_of=<id> version=<v>`）与状态变更同事务，重复取消失败不重复记账。
 - 本批边界：部署产物与构建强制关联（`buildId` 可选，提供时必须是同项目 `succeeded` 构建）、自定义 HTTP 方法与路径、自动重试均未做。
 
 

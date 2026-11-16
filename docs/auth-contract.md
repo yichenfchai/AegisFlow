@@ -67,7 +67,7 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 ### 部署任务（P4.2）
 
-- 接口：`POST|GET /api/v1/projects/{projectId}/deployments`、`GET /api/v1/deployments?projectId&status&limit&offset`（管理员全局列表，与构建列表同形）、`GET /api/v1/deployments/{id}`、`GET /api/v1/deployments/{id}/events?after&limit`、`POST /api/v1/deployments/{id}/cancel`、`POST /api/v1/deployments/{id}/rollback`；全部 admin-only，member/viewer 一律 403。
+- 接口：`POST|GET /api/v1/projects/{projectId}/deployments`、`GET /api/v1/deployments?projectId&status&limit&offset`（全局列表，与构建列表同形，按可见性过滤）、`GET /api/v1/deployments/{id}`、`GET /api/v1/deployments/{id}/events?after&limit`、`POST /api/v1/deployments/{id}/cancel`、`POST /api/v1/deployments/{id}/rollback`；授权按项目写权限叠加：admin 全量，member 对可写项目（public，或 private 且为 maintainer）可创建/取消/回滚，viewer 只读不可写；列表、详情与事件按项目可见性过滤，不可见一律 404。审批接口仍为 admin-only。
 - 协议：对目标执行 `POST <endpoint 去尾斜杠><deployPath>`（`deployPath` 默认 `/deploy`），JSON 体 `{deploymentId, project, version, environment, rollback, rollbackVersion}`；目标有凭据时携带 `Authorization: Bearer`，只在执行内存解密。2xx 之后还会按目标的 `healthPath` 复查（默认 3 次、间隔 2s，`AEGIS_DEPLOY_HEALTH_ATTEMPTS` 设为 0 可关闭）：复查 2xx 才记 `succeeded`，始终不健康则记 `failed`（detail `health check failed: <原因>`，每次复查都写一条 system 事件）；部署端点非 2xx、超时（`AEGIS_DEPLOY_TIMEOUT`，默认 10m，最大 1h）与网络错误同样记失败，detail 脱敏且不含凭据；部署请求本身不重试。
 - 状态：`queued → running → succeeded/failed/cancelled`，重启恢复把遗留 `running` 置 `interrupted`；命中审批环境时创建即 `awaiting_approval`（见「部署审批（P4.3）」）。单 worker 持独立 advisory 租约，`SKIP LOCKED` 领取，300ms 看门狗在取消/终态时中止 HTTP 请求。
 - 回滚：仅对 `succeeded`/`failed` 的源部署可用，取同项目+目标中比源更早的最近一次 `succeeded` 版本，新建一条部署（`rollbackOf` 指向源，payload `rollback=true`、`rollbackVersion` 为该版本；命中审批环境时同样进入 `awaiting_approval`）；无更早成功返回 400，源非终态 409；重复回滚会创建多条部署（部署非幂等）。
@@ -120,9 +120,9 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 | 读取其他 private 项目 | 允许 | 禁止（404） | 禁止（404） | 已实现（404 防枚举） |
 | 创建/修改项目、归档与恢复、修改可见性 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 已实现（可见性 + maintainer 叠加） |
 | 读取项目成员、增删改成员 | 允许 | public 允许；private 需项目 maintainer | 只读列表 | 已实现；创建者不可移除；成员变更写审计 |
-| 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 构建、部署与审批已实现（含可见性过滤 / admin-only）；审查、扫描、知识待业务接口落实 |
+| 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 构建与部署已实现（按项目可见性过滤）；审批仍 admin-only；审查、扫描、知识待业务接口落实 |
 | 发起/取消/重试构建、发起审查 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 构建已实现（重试仅限终态，不可见 404）；发起审查待业务接口落实 |
-| 发起部署、回滚及执行审批 | 允许 | 禁止 | 禁止 | 部署触发、回滚与审批已实现（admin-only，P4.2/P4.3） |
+| 发起部署、回滚及执行审批 | 允许 | 允许（项目可写时） | 禁止 | 部署触发与回滚已实现（项目写权限叠加）；审批仍 admin-only（P4.2/P4.3） |
 | 管理部署目标、密钥、策略、设置、防御及业务审计 | 允许 | 禁止 | 禁止 | 部署目标已实现（admin-only，凭据加密存储，P4.1）；独立密钥管理、策略、设置、防御与业务审计待实现 |
 
 后续对象涉及具体项目时，需在服务端查询对象所属项目并校验访问权限。不要根据客户端提交的 role 或隐藏按钮决定授权。
@@ -170,9 +170,9 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 | 读取其他 private 项目 | 允许 | 禁止（404） | 禁止（404） | 已实现（404 防枚举） |
 | 创建/修改项目、归档与恢复、修改可见性 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 已实现（可见性 + maintainer 叠加） |
 | 读取项目成员、增删改成员 | 允许 | public 允许；private 需项目 maintainer | 只读列表 | 已实现；创建者不可移除；成员变更写审计 |
-| 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 构建、部署与审批已实现（含可见性过滤 / admin-only）；审查、扫描、知识待业务接口落实 |
+| 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 构建与部署已实现（按项目可见性过滤）；审批仍 admin-only；审查、扫描、知识待业务接口落实 |
 | 发起/取消/重试构建、发起审查 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 构建已实现（重试仅限终态，不可见 404）；发起审查待业务接口落实 |
-| 发起部署、回滚及执行审批 | 允许 | 禁止 | 禁止 | 部署触发/回滚与审批均已实现（admin-only，P4.2/P4.3） |
+| 发起部署、回滚及执行审批 | 允许 | 允许（项目可写时） | 禁止 | 部署触发/回滚已实现（项目写权限叠加）；审批仍 admin-only（P4.2/P4.3） |
 | 管理部署目标、密钥、策略、设置、防御及业务审计 | 允许 | 禁止 | 禁止 | 部署目标已实现（admin-only，凭据加密存储，P4.1）；独立密钥管理、策略、设置、防御与业务审计待实现 |
 
 后续对象涉及具体项目时，需在服务端查询对象所属项目并校验访问权限。不要根据客户端提交的 role 或隐藏按钮决定授权。
