@@ -87,6 +87,16 @@ psql "$RESTORE_URL" -c "SELECT max(created_at) FROM auth_audit"
 - 需要秒级 RPO 时使用托管服务的 PITR 或 PostgreSQL WAL 归档；应用本身不实现时间点恢复。
 - 应用层审计保留只影响在线数据；备份中更早的审计记录会随备份保留周期存在，两者策略需要分别说明。
 
+## 部署凭据密钥轮换
+
+目标凭据用 `AEGIS_SECRET_KEY` 密封，轮换分两步：先让新钥接管写入、旧钥保留读取，再用维护命令把存量密文改写为新钥。
+
+1. 生成新钥（`openssl rand -base64 32`），把新钥写入 `AEGIS_SECRET_KEY`，把原来的当前钥移到 `AEGIS_SECRET_KEY_PREVIOUS`，滚动重启所有副本。此阶段读路径先试新钥、失败回退旧钥，写入只用新钥，服务不中断。
+2. dry run 估算：`AEGIS_DATABASE_URL=... AEGIS_SECRET_KEY=<新> AEGIS_SECRET_KEY_PREVIOUS=<旧> go run ./cmd/rekey`，确认 `reencrypted` 与预期一致且 `failed=0`。
+3. 加 `-apply` 重跑，逐行重加密。
+4. 再跑一次 dry run：`reencrypted=0` 且 `already_current` 等于存储凭据的目标数后，删除 `AEGIS_SECRET_KEY_PREVIOUS`，再滚动重启一次。
+
+`failed>0` 表示某些行的密文两把钥都打不开：命令不会改动这些行，先核对配置与历史数据，**不要删除旧钥**。重加密只改 `deployment_targets.secret_cipher`，不改 `updated_at`、不写审计；命令可以在服务运行期间执行（此时服务已同时持有两把钥）。
 ## 滚动升级
 
 应用启动时自动执行版本化迁移，并用 advisory 事务锁保证多副本串行；发现数据库版本高于代码支持范围时**拒绝启动**。因此升级的基本约束是「schema 先扩展、代码后使用、旧列最后删除」。

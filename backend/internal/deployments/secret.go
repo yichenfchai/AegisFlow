@@ -61,22 +61,31 @@ func (s *Service) decryptSecret(targetID string, sealed []byte) (string, error) 
 	if !s.secretReady() {
 		return "", errors.New("deployment target secret cannot be decrypted: secret storage is not configured")
 	}
-	aead, err := newGCM(s.secretKey)
+	if plain, err := s.openWithKey(s.secretKey, targetID, sealed); err == nil {
+		return plain, nil
+	}
+	if len(s.previousKey) == 32 {
+		if plain, err := s.openWithKey(s.previousKey, targetID, sealed); err == nil {
+			return plain, nil
+		}
+	}
+	return "", errors.New("deployment target secret cannot be decrypted")
+}
+
+// openWithKey opens one ciphertext with a specific key. The read path uses it
+// through decryptSecret; the rotation command uses it to tell which key a row
+// still depends on.
+func (s *Service) openWithKey(key []byte, targetID string, sealed []byte) (string, error) {
+	aead, err := newGCM(key)
 	if err != nil {
 		return "", err
 	}
 	if len(sealed) < aead.NonceSize()+aead.Overhead() {
 		return "", fmt.Errorf("deployment target secret is malformed")
 	}
-	if plain, openErr := openSealed(aead, targetID, sealed); openErr == nil {
-		return string(plain), nil
+	plain, err := openSealed(aead, targetID, sealed)
+	if err != nil {
+		return "", errors.New("deployment target secret cannot be decrypted")
 	}
-	if len(s.previousKey) == 32 {
-		if previousAEAD, previousErr := newGCM(s.previousKey); previousErr == nil {
-			if plain, openErr := openSealed(previousAEAD, targetID, sealed); openErr == nil {
-				return string(plain), nil
-			}
-		}
-	}
-	return "", errors.New("deployment target secret cannot be decrypted")
+	return string(plain), nil
 }
