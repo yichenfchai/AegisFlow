@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -44,6 +45,10 @@ type Config struct {
 	// SecretKey seals deployment-target credentials at rest (AES-256-GCM).
 	// Empty disables secret storage; targets without a secret still work.
 	SecretKey []byte
+	// PreviousSecretKey decrypts credentials sealed before a key rotation. It
+	// never seals anything: new writes always use SecretKey. Empty disables
+	// the fallback.
+	PreviousSecretKey []byte
 	// DeployCheckTimeout bounds one deployment-target connectivity probe.
 	DeployCheckTimeout time.Duration
 	// DeployTimeout bounds one deployment execution (default 10m, max 1h).
@@ -198,6 +203,22 @@ func Load() (Config, error) {
 			return c, errors.New("AEGIS_SECRET_KEY must be base64 of exactly 32 bytes")
 		}
 		c.SecretKey = key
+	}
+	// A rotation keeps the retiring key available for decryption only. It must
+	// be a different key: equal values mean the primary was not rotated and
+	// only hide that mistake.
+	if rawPrevious := strings.TrimSpace(os.Getenv("AEGIS_SECRET_KEY_PREVIOUS")); rawPrevious != "" {
+		previous, decodeErr := base64.StdEncoding.DecodeString(rawPrevious)
+		if decodeErr != nil || len(previous) != 32 {
+			return c, errors.New("AEGIS_SECRET_KEY_PREVIOUS must be base64 of exactly 32 bytes")
+		}
+		if len(c.SecretKey) == 0 {
+			return c, errors.New("AEGIS_SECRET_KEY_PREVIOUS requires AEGIS_SECRET_KEY")
+		}
+		if bytes.Equal(previous, c.SecretKey) {
+			return c, errors.New("AEGIS_SECRET_KEY_PREVIOUS must differ from AEGIS_SECRET_KEY")
+		}
+		c.PreviousSecretKey = previous
 	}
 	c.DeployCheckTimeout, err = duration("AEGIS_DEPLOY_CHECK_TIMEOUT", "5s")
 	if err != nil {

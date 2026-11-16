@@ -73,8 +73,12 @@ const (
 // secret storage: targets without a secret keep working, writing one is a
 // validation error rather than a silent plaintext fallback.
 type Options struct {
-	SecretKey    []byte
-	CheckTimeout time.Duration
+	SecretKey []byte
+	// PreviousSecretKey keeps stored credentials readable right after a key
+	// rotation: it is only ever used to decrypt, never to seal, so new writes
+	// always use SecretKey. Empty disables the fallback.
+	PreviousSecretKey []byte
+	CheckTimeout      time.Duration
 	// DeployTimeout bounds one deployment execution; zero means 10m.
 	DeployTimeout time.Duration
 	// ApprovalEnvironments lists target environments that require approval.
@@ -153,6 +157,7 @@ type CheckResult struct {
 type Service struct {
 	db            *sql.DB
 	secretKey     []byte
+	previousKey   []byte
 	checkTimeout  time.Duration
 	deployTimeout time.Duration
 	httpClient    *http.Client
@@ -227,6 +232,7 @@ func New(db *sql.DB, opts Options) *Service {
 	return &Service{
 		db:                   db,
 		secretKey:            append([]byte(nil), opts.SecretKey...),
+		previousKey:          append([]byte(nil), opts.PreviousSecretKey...),
 		checkTimeout:         timeout,
 		deployTimeout:        deployTimeout,
 		httpClient:           client,
