@@ -174,11 +174,19 @@ test('部署与审批闭环：部署、审批、回滚与管理员限制', async
   await expect(member.getByText('无权访问')).toHaveCount(0)
 
   // 成员在公开项目上发起 staging 部署：目标选项对成员开放，部署直接执行。
+  // 先等两个下拉的选项到位再选：列表仍在加载时选择会被随后的重渲染吞掉。
   await member.getByRole('link', { name: '新建部署' }).click()
+  await expect(member).toHaveURL('/deploys/new')
+  await expect(member.getByLabel('项目')).toContainText(projectName, { timeout: 20_000 })
+  await expect(member.getByLabel('目标')).toContainText('deploy-staging', { timeout: 20_000 })
   await member.getByLabel('项目').selectOption(projectId)
+  await expect(member.getByLabel('项目')).toHaveValue(projectId)
   await member.getByLabel('目标').selectOption(stagingTargetId)
+  await expect(member.getByLabel('目标')).toHaveValue(stagingTargetId)
   await member.getByLabel('版本').fill(`v1.2.5-${suffix}`)
-  await member.getByRole('button', { name: '创建部署', exact: true }).click()
+  const memberSubmit = member.getByRole('button', { name: '创建部署', exact: true })
+  await expect(memberSubmit).toBeEnabled({ timeout: 10_000 })
+  await memberSubmit.click()
   await expect(member).toHaveURL(/\/deploys\/[A-Za-z0-9_-]{16,64}$/)
   await expect(member.getByText('成功', { exact: true }).first()).toBeVisible({ timeout: 20_000 })
 
