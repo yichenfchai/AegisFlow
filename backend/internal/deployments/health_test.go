@@ -105,6 +105,9 @@ func TestDeployHealthCheckFailsDeployment(t *testing.T) {
 	if deployment.FinishedAt == 0 {
 		t.Fatalf("finishedAt = 0 on a failed deployment")
 	}
+	// finish() commits the terminal row before the event writer flushes its
+	// last batch, so wait for the final lifecycle line instead of racing it.
+	waitForEventText(t, s, deployment.ID, "system:deployment failed")
 	text := joinEvents(deploymentEvents(t, s, deployment.ID))
 	for _, want := range []string{
 		"health check failed (attempt 1/2): http 500",
@@ -130,6 +133,9 @@ func TestDeployHealthCheckDisabledByZeroAttempts(t *testing.T) {
 
 	deployment := deployToHealthTarget(t, s, registry, "health-off", target)
 	deployment = waitDeploymentStatus(t, s, deployment.ID, DeploySucceeded)
+	// Wait for the flushed lifecycle line before asserting the absence of
+	// health-check events, otherwise an unflushed batch would pass silently.
+	waitForEventText(t, s, deployment.ID, "system:deployment succeeded")
 	time.Sleep(100 * time.Millisecond)
 	if got := atomic.LoadInt32(probes); got != 0 {
 		t.Fatalf("health probes = %d, want 0 when disabled", got)
