@@ -1,4 +1,4 @@
-/** Real deployment-task and approval APIs (P4.2/P4.3); admin only. */
+/** Real deployment-task and approval APIs (P4.2/P4.3); project-scoped reads and writes. */
 import { apiRequest } from '@/stores/session'
 import type { Page } from '@/api/account'
 
@@ -56,16 +56,12 @@ export interface Approval {
   decidedAt: number
 }
 
-/** The subset of a deployment target the create form needs. */
+/** The read-only subset of a deployment target the create form needs. */
 export interface DeploymentTargetOption {
   id: string
   name: string
-  kind: string
   environment: DeploymentEnvironment
   endpoint: string
-  healthPath: string
-  deployPath: string
-  status: 'active' | 'disabled'
 }
 
 export interface DeployInput {
@@ -136,9 +132,12 @@ export const approvalsAPI = {
     }),
 }
 
-/** Active and disabled targets; the create form keeps only the active ones. */
+/**
+ * Active targets the deploy form can use. Every authenticated role may read
+ * this read-only projection; the full target registry stays admin-only.
+ */
 export function listTargets() {
-  return apiRequest<Page<DeploymentTargetOption>>('/deployment-targets?limit=100&offset=0')
+  return apiRequest<{ items: DeploymentTargetOption[] }>('/deployment-targets/options')
 }
 
 export const DEPLOY_ENVIRONMENT_TEXT: Record<DeploymentEnvironment, string> = {

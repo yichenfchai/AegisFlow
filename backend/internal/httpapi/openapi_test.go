@@ -78,6 +78,7 @@ func TestOpenAPIContractReferencesAndRoutes(t *testing.T) {
 		{"/api/v1/builds/{buildId}/events", "get"}, {"/api/v1/builds/{buildId}/cancel", "post"},
 		{"/api/v1/builds/{buildId}/retry", "post"},
 		{"/api/v1/deployment-targets", "get"}, {"/api/v1/deployment-targets", "post"},
+		{"/api/v1/deployment-targets/options", "get"},
 		{"/api/v1/deployment-targets/{targetId}", "get"}, {"/api/v1/deployment-targets/{targetId}", "patch"},
 		{"/api/v1/deployment-targets/{targetId}", "delete"}, {"/api/v1/deployment-targets/{targetId}/check", "post"},
 		{"/api/v1/projects/{projectId}/deployments", "get"}, {"/api/v1/projects/{projectId}/deployments", "post"},

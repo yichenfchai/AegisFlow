@@ -15,6 +15,7 @@ import {
 import { projectsAPI } from '@/api/projects'
 import { ApiError } from '@/api/http'
 import { fmtRel } from '@/api/format'
+import { useSession } from '@/stores/session'
 
 const PAGE_SIZE = 12
 const STATUSES: DeploymentStatus[] = [
@@ -39,9 +40,12 @@ function loadError(cause: unknown): string {
 }
 
 /**
- * 部署记录（真实接口）：管理端全局视图，项目与状态筛选走服务端分页。
+ * 部署记录（真实接口）：按项目可见性过滤的全局视图，项目与状态筛选走服务端分页；
+ * 成员与只读用户可查看，创建/取消/回滚由项目写权限决定。
  */
 export function DeploymentListPage() {
+  const { user } = useSession()
+  const canWrite = user?.role === 'admin' || user?.role === 'member'
   const [page, setPage] = useState(1)
   const [status, setStatus] = useState<DeploymentStatus | ''>('')
   const [projectFilter, setProjectFilter] = useState('')
@@ -113,14 +117,16 @@ export function DeploymentListPage() {
     <>
       <PageHeader
         title="部署记录"
-        subtitle="全部项目的部署历史；部署与审批仅管理员可用"
+        subtitle="你有权查看的项目的部署历史；能否发起或回滚取决于项目写权限"
         actions={
-          <Link
-            to="/deploys/new"
-            className="inline-flex items-center gap-space-sm rounded px-space-xl py-1.5 text-body-md bg-primary text-on-primary hover:brightness-110 font-medium"
-          >
-            新建部署
-          </Link>
+          canWrite ? (
+            <Link
+              to="/deploys/new"
+              className="inline-flex items-center gap-space-sm rounded px-space-xl py-1.5 text-body-md bg-primary text-on-primary hover:brightness-110 font-medium"
+            >
+              新建部署
+            </Link>
+          ) : undefined
         }
       />
       <div className="mb-space-lg flex flex-wrap items-end gap-space-md">

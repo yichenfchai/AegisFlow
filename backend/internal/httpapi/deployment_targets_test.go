@@ -124,6 +124,32 @@ func TestDeploymentTargetRoutesAndRBAC(t *testing.T) {
 		t.Fatalf("create response leaked the secret: %s", w.Body.String())
 	}
 
+	// The deploy form needs the active target options, and every authenticated
+	// role may read them; the full target list stays admin-only.
+	if w = request(h, "GET", "/api/v1/deployment-targets/options", "", ""); w.Code != 401 {
+		t.Fatalf("anonymous options: %d", w.Code)
+	}
+	for name, token := range map[string]string{"member": memberToken, "viewer": viewerToken} {
+		w = request(h, "GET", "/api/v1/deployment-targets/options", "", token)
+		if w.Code != 200 {
+			t.Fatalf("%s options: %d %s", name, w.Code, w.Body.String())
+		}
+		var options struct {
+			Data struct {
+				Items []deployments.TargetOption `json:"items"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &options); err != nil {
+			t.Fatalf("%s options payload: %s", name, w.Body.String())
+		}
+		if len(options.Data.Items) != 1 || options.Data.Items[0].ID != target.ID || options.Data.Items[0].Name != "prod-web" {
+			t.Fatalf("%s options = %+v", name, options.Data.Items)
+		}
+		if strings.Contains(w.Body.String(), "probe-token") {
+			t.Fatalf("%s options leaked the secret: %s", name, w.Body.String())
+		}
+	}
+
 	if w = request(h, "POST", "/api/v1/deployment-targets", createBody, adminToken); w.Code != 409 {
 		t.Fatalf("duplicate: %d %s", w.Code, w.Body.String())
 	}

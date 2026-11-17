@@ -152,13 +152,13 @@ test('部署与审批闭环：部署、审批、回滚与管理员限制', async
   await page.getByLabel('项目', { exact: true }).selectOption(projectId)
   await expect(page.getByRole('row', { name: new RegExp(projectName) }).first()).toBeVisible()
 
-  // 普通成员：侧边栏没有部署/审批入口，直连页面得到无权访问，管理接口 403。
-  const memberName = `deploy-viewer-${suffix}`
+  // 项目成员：部署记录按可见性开放，可对自己可写的项目发起部署；审批仍管理员专属。
+  const memberName = `deploy-member-${suffix}`
   await page.goto('/settings')
   await page.getByRole('button', { name: '创建用户' }).click()
   await page.getByLabel('用户名').fill(memberName)
-  await page.getByLabel('显示名').fill('部署只读')
-  await page.getByLabel('初始密码').fill('Deploy-viewer-password-2026')
+  await page.getByLabel('显示名').fill('部署成员')
+  await page.getByLabel('初始密码').fill('Deploy-member-password-2026')
   await page.getByLabel('角色').selectOption('member')
   await page.getByRole('button', { name: '创建', exact: true }).click()
   await expect(page.getByRole('row', { name: new RegExp(memberName) })).toBeVisible()
@@ -166,16 +166,36 @@ test('部署与审批闭环：部署、审批、回滚与管理员限制', async
   const browser = page.context().browser()!
   const memberCtx = await browser.newContext()
   const member = await memberCtx.newPage()
-  await login(member, memberName, 'Deploy-viewer-password-2026')
-  await expect(member.getByRole('link', { name: '项目列表' })).toBeVisible()
-  await expect(member.getByRole('link', { name: '部署记录' })).toHaveCount(0)
+  await login(member, memberName, 'Deploy-member-password-2026')
+  await expect(member.getByRole('link', { name: '部署记录' })).toBeVisible()
   await expect(member.getByRole('link', { name: '审批中心' })).toHaveCount(0)
   await member.goto('/deploys')
+  await expect(member.getByRole('heading', { name: '部署记录' })).toBeVisible()
+  await expect(member.getByText('无权访问')).toHaveCount(0)
+
+  // 成员在公开项目上发起 staging 部署：目标选项对成员开放，部署直接执行。
+  // 先等两个下拉的选项到位再选：列表仍在加载时选择会被随后的重渲染吞掉。
+  await member.getByRole('link', { name: '新建部署' }).click()
+  await expect(member).toHaveURL('/deploys/new')
+  await expect(member.getByLabel('项目')).toContainText(projectName, { timeout: 20_000 })
+  await expect(member.getByLabel('目标')).toContainText('deploy-staging', { timeout: 20_000 })
+  await member.getByLabel('项目').selectOption(projectId)
+  await expect(member.getByLabel('项目')).toHaveValue(projectId)
+  await member.getByLabel('目标').selectOption(stagingTargetId)
+  await expect(member.getByLabel('目标')).toHaveValue(stagingTargetId)
+  await member.getByLabel('版本').fill(`v1.2.5-${suffix}`)
+  const memberSubmit = member.getByRole('button', { name: '创建部署', exact: true })
+  await expect(memberSubmit).toBeEnabled({ timeout: 10_000 })
+  await memberSubmit.click()
+  await expect(member).toHaveURL(/\/deploys\/[A-Za-z0-9_-]{16,64}$/)
+  await expect(member.getByText('成功', { exact: true }).first()).toBeVisible({ timeout: 20_000 })
+
+  // 审批中心仍是管理员页面。
+  await member.goto('/approvals')
   await expect(member.getByText('无权访问')).toBeVisible()
 
   // The deployment API is project-scoped now: a member can list the
-  // deployments of every project it can see, while the admin UI keeps the
-  // pages hidden until the frontend slice lands.
+  // deployments of every project it can see.
   const memberList = await member.evaluate(async () => {
     const { apiRequest } = await import('/src/stores/session.ts')
     try {
@@ -188,4 +208,23 @@ test('部署与审批闭环：部署、审批、回滚与管理员限制', async
   expect(memberList.status).toBe(200)
   expect(memberList.items).toBeGreaterThan(0)
   await memberCtx.close()
+
+  // 只读用户：可以查看可见项目的部署记录，但没有新建入口。
+  const viewerName = `deploy-viewer-${suffix}`
+  await page.goto('/settings')
+  await page.getByRole('button', { name: '创建用户' }).click()
+  await page.getByLabel('用户名').fill(viewerName)
+  await page.getByLabel('显示名').fill('部署只读')
+  await page.getByLabel('初始密码').fill('Deploy-viewer-password-2026')
+  await page.getByLabel('角色').selectOption('viewer')
+  await page.getByRole('button', { name: '创建', exact: true }).click()
+  await expect(page.getByRole('row', { name: new RegExp(viewerName) })).toBeVisible()
+
+  const viewerCtx = await browser.newContext()
+  const viewer = await viewerCtx.newPage()
+  await login(viewer, viewerName, 'Deploy-viewer-password-2026')
+  await viewer.goto('/deploys')
+  await expect(viewer.getByRole('heading', { name: '部署记录' })).toBeVisible()
+  await expect(viewer.getByRole('link', { name: '新建部署' })).toHaveCount(0)
+  await viewerCtx.close()
 })

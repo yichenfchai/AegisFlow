@@ -22,7 +22,7 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { label: '项目列表', to: '/', icon: 'folder_open' },
       { label: '构建流水线', to: '/builds', icon: 'alt_route' },
-      { label: '部署记录', to: '/deploys', icon: 'rocket_launch', adminOnly: true },
+      { label: '部署记录', to: '/deploys', icon: 'rocket_launch' },
     ],
   },
   {

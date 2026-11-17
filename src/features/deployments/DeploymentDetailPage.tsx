@@ -16,6 +16,7 @@ import {
 import { projectsAPI } from '@/api/projects'
 import { ApiError } from '@/api/http'
 import { fmtRel } from '@/api/format'
+import { useSession } from '@/stores/session'
 
 const CANCELABLE: DeploymentStatus[] = ['queued', 'awaiting_approval', 'running']
 const ROLLBACKABLE: DeploymentStatus[] = ['succeeded', 'failed']
@@ -104,6 +105,9 @@ function useDeploymentEvents(
 
 /** 部署详情（真实接口）：状态、审批、事件与取消/回滚。 */
 export function DeploymentDetailPage() {
+  const { user } = useSession()
+  const isAdmin = user?.role === 'admin'
+  const canWrite = isAdmin || user?.role === 'member'
   const { id = '' } = useParams<{ id: string }>()
   const location = useLocation()
   const nav = useNavigate()
@@ -217,17 +221,17 @@ export function DeploymentDetailPage() {
             <StatusBadge tone={DEPLOYMENT_STATUS_TONE[deployment.status]}>
               {DEPLOYMENT_STATUS_TEXT[deployment.status]}
             </StatusBadge>
-            {deployment.approvalId && (
+            {deployment.approvalId && isAdmin && (
               <Link to="/approvals" className="text-body-md text-primary hover:underline">
                 查看审批
               </Link>
             )}
-            {canCancel && (
+            {canCancel && canWrite && (
               <Button variant="danger" icon="stop_circle" disabled={busy} onClick={() => setConfirmCancel(true)}>
                 取消部署
               </Button>
             )}
-            {canRollback && (
+            {canRollback && canWrite && (
               <Button icon="restart_alt" disabled={busy} onClick={() => setConfirmRollback(true)}>
                 回滚
               </Button>
