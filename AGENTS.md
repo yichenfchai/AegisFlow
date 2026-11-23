@@ -31,7 +31,7 @@
 
 ## 文档同步（与代码同一 PR）
 
-接口或行为变更必须同步：`backend/openapi.yaml`（`openapi_test.go` 强制校验路由已写入契约）、`docs/auth-contract.md`、`backend/README.md` 与根 `README.md`。
+接口或行为变更必须同步：`backend/openapi.yaml`（`openapi_test.go` 双向校验 Gin 实际注册的路由与契约：注册未登记、契约未实现都会失败，并校验 `/api/v1` 操作的 security 声明）、`docs/auth-contract.md`、`backend/README.md` 与根 `README.md`。
 
 开发过程文档（`TODO.md`、`HANDOFF.md`、`docs/*-design.md`）只在本地维护、**不入库**（见 `.gitignore`），避免每次合并都在同一批文档上冲突；进度、阶段验收与验证记录写在 PR 正文里（协作纪律第 4 条）。
 
