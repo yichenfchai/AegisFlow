@@ -8,6 +8,7 @@ import { LoginPage } from '@/features/auth/LoginPage'
 import { SessionGate } from '@/features/auth/SessionGate'
 import { ProjectWizardPage } from '@/features/projects/ProjectWizardPage'
 import { ProjectsPage } from '@/features/projects/ProjectsPage'
+import { ProjectEditPage } from '@/features/projects/ProjectEditPage'
 import { ProjectMembersPage } from '@/features/projects/ProjectMembersPage'
 import { AccountSecurityPage } from '@/features/account/AccountSecurityPage'
 import { DeploymentListPage } from '@/features/deployments/DeploymentListPage'
@@ -19,20 +20,21 @@ import { DeploymentTargetWizardPage } from '@/features/deployments/DeploymentTar
 import { DeploymentTargetDetailPage } from '@/features/deployments/DeploymentTargetDetailPage'
 
 /**
- * 真实页面（项目、构建、账号、用户与审计）不进 Gate；业务演示页已随 P3
- * 构建闭环下线。非主线页面恒定显示 UnimplementedPage。
+ * 真实页面（项目、构建、部署、审批、账号、用户与审计）不进 Gate；非主线页面
+ * 恒定显示 UnimplementedPage，不提供演示数据。
  */
 export const router = createBrowserRouter([
   { path: '/login', element: <LoginPage /> },
   {
     element: <SessionGate><AppShell /></SessionGate>,
     children: [
-      // 真实项目注册表（P2）
+      // 真实项目注册表：列表、创建、编辑与成员
       { path: '/', element: <ProjectsPage /> },
       { path: '/projects/new', element: <ProjectWizardPage /> },
+      { path: '/projects/:id/edit', element: <ProjectEditPage /> },
       { path: '/projects/:id/members', element: <ProjectMembersPage /> },
 
-      // 真实构建闭环（P3）：列表、详情、取消；AI 诊断尚未实现
+      // 真实构建闭环：列表、详情、取消；AI 诊断尚未接入
       { path: '/builds', element: <BuildListPage /> },
       { path: '/builds/:id', element: <BuildDetailPage /> },
       { path: '/builds/:id/diagnosis', element: <UnimplementedPage title="AI 诊断" /> },

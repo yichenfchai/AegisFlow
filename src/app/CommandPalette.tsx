@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { create } from 'zustand'
 import { Icon } from '@/components/ui/Icon'
+import { useSession } from '@/stores/session'
 
 interface PaletteState {
   open: boolean
@@ -13,9 +14,18 @@ export const usePalette = create<PaletteState>((set) => ({
   setOpen: (v) => set({ open: v }),
 }))
 
+interface PaletteResult {
+  group: string
+  label: string
+  to: string
+  /** 与 Sidebar 一致：管理员入口只对 admin 展示；路由守卫与 API 仍会再校验。 */
+  adminOnly?: boolean
+}
+
 /** ⌘K 全局命令面板：跨实体搜索跳转 */
 export function CommandPalette() {
   const { open, setOpen } = usePalette()
+  const { user } = useSession()
   const [query, setQuery] = useState('')
   const [idx, setIdx] = useState(0)
   const nav = useNavigate()
@@ -41,20 +51,22 @@ export function CommandPalette() {
     }
   }, [open])
 
-  const RESULTS = useMemo(
+  const results = useMemo<PaletteResult[]>(
     () => [
       { group: '页面', label: '项目列表', to: '/' },
       { group: '页面', label: '构建流水线', to: '/builds' },
       { group: '页面', label: '账号安全 · 修改密码与管理会话', to: '/account' },
-      { group: '页面', label: '用户与审计 · 管理员', to: '/settings' },
+      { group: '页面', label: '用户与审计 · 管理员', to: '/settings', adminOnly: true },
       { group: '页面', label: '部署记录', to: '/deploys' },
-      { group: '页面', label: '审批中心 · 管理员', to: '/approvals' },
-      { group: '页面', label: '部署目标 · 管理员', to: '/deploy-targets' },
+      { group: '页面', label: '审批中心 · 管理员', to: '/approvals', adminOnly: true },
+      { group: '页面', label: '部署目标 · 管理员', to: '/deploy-targets', adminOnly: true },
     ],
     [],
   )
 
-  const filtered = RESULTS.filter((r) => r.label.toLowerCase().includes(query.toLowerCase()))
+  const filtered = results.filter(
+    (r) => (!r.adminOnly || user?.role === 'admin') && r.label.toLowerCase().includes(query.toLowerCase()),
+  )
 
   if (!open) return null
 
