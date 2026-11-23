@@ -239,6 +239,33 @@ func TestWorkerTimeout(t *testing.T) {
 	waitForLog(t, s, build.ID, "timed out")
 }
 
+// TestWithTimeoutWiresConfiguredDeadline is the P1-01 regression: the public
+// setter used by cmd/server to pass AEGIS_BUILD_TIMEOUT must replace the
+// ten-minute default, and a non-positive value must not erase a configured one.
+func TestWithTimeoutWiresConfiguredDeadline(t *testing.T) {
+	s, registry := testService(t)
+	if s.timeout != 10*time.Minute {
+		t.Fatalf("default timeout = %s, want 10m", s.timeout)
+	}
+	s.WithTimeout(0)
+	s.WithTimeout(-time.Second)
+	if s.timeout != 10*time.Minute {
+		t.Fatalf("non-positive WithTimeout changed the default to %s", s.timeout)
+	}
+	s.WithTimeout(700 * time.Millisecond)
+	if s.timeout != 700*time.Millisecond {
+		t.Fatalf("configured timeout = %s, want 700ms", s.timeout)
+	}
+	startWorker(t, s)
+	project := createProject(t, registry, "setter-timeout", sleepCommand(10))
+	build, err := s.Trigger(context.Background(), testActor, project.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, s, build.ID, StatusFailed)
+	waitForLog(t, s, build.ID, "timed out")
+}
+
 func TestCancelRunningBuild(t *testing.T) {
 	s, registry := testService(t)
 	startWorker(t, s)
