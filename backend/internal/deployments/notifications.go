@@ -39,9 +39,12 @@ const (
 	// holder, so a slow webhook never delays deployments.
 	defaultNotificationScanInterval = time.Second
 	maxNotificationAttempts         = 8
-	notificationClaimLease          = 15 * time.Second
-	notificationResponseLimit       = 4 << 10
-	notificationErrorLimit          = 200
+	// minNotificationClaimLease floors the claim lease. New derives the real
+	// lease from the configured webhook timeout (timeout+30s) so a delivery
+	// that is still running can never be re-claimed by another replica.
+	minNotificationClaimLease = 15 * time.Second
+	notificationResponseLimit = 4 << 10
+	notificationErrorLimit    = 200
 )
 
 // ApprovalNotification is the webhook JSON body. It deliberately contains no
@@ -125,7 +128,10 @@ func (s *Service) deliverNotifications(ctx context.Context, logger *slog.Logger)
 
 // claimNotification reserves one due outbox row. The lease prevents a crash
 // between claiming and recording an outcome from spinning on the same row
-// immediately; the row remains retryable after the lease expires.
+// immediately, and it is derived from the webhook timeout (New) so it outlives
+// even the slowest allowed delivery: another replica cannot re-claim a row
+// while its first delivery is still running. The row remains retryable after
+// the lease expires.
 func (s *Service) claimNotification(ctx context.Context) (pendingNotification, error) {
 	now := time.Now().Unix()
 	var notification pendingNotification
@@ -139,7 +145,7 @@ func (s *Service) claimNotification(ctx context.Context) (pendingNotification, e
 		SET next_attempt_at=$4
 		FROM next WHERE n.id=next.id
 		RETURNING n.id,n.approval_id,n.event,n.payload,n.attempts`,
-		notificationPending, now, maxNotificationAttempts, now+int64(notificationClaimLease/time.Second)).
+		notificationPending, now, maxNotificationAttempts, now+int64(s.notificationClaimLease/time.Second)).
 		Scan(&notification.ID, &notification.ApprovalID, &notification.Event, &notification.Payload, &notification.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return pendingNotification{}, sql.ErrNoRows
