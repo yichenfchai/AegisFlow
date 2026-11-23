@@ -112,7 +112,7 @@ func run(logger *slog.Logger) error {
 		Memory: cfg.BuildMemory,
 		Pids:   cfg.BuildPids,
 		User:   cfg.BuildUser,
-	}).WithSource(cfg.BuildClone, cfg.BuildAllowLocalRepo).WithDiskLimit(cfg.BuildDisk)
+	}).WithSource(cfg.BuildClone, cfg.BuildAllowLocalRepo).WithDiskLimit(cfg.BuildDisk).WithTimeout(cfg.BuildTimeout)
 	// Deployment-target secrets are sealed with AEGIS_SECRET_KEY; when it is
 	// unset the registry still serves targets without credentials. The same
 	// service owns the deploy-task store, the approval queue and the worker.

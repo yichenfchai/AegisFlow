@@ -97,6 +97,17 @@ func New(db *sql.DB, projectRegistry *projects.Service) *Service {
 	return newWithLimits(db, projectRegistry, 10*time.Minute, maxLogEvents)
 }
 
+// WithTimeout replaces the per-build execution deadline; a non-positive value
+// keeps the current one. Callers wire it from AEGIS_BUILD_TIMEOUT: the service
+// constructor cannot see configuration, and a silently ignored timeout would
+// leave long builds running for the default ten minutes.
+func (s *Service) WithTimeout(timeout time.Duration) *Service {
+	if timeout > 0 {
+		s.timeout = timeout
+	}
+	return s
+}
+
 func newWithLimits(db *sql.DB, projectRegistry *projects.Service, timeout time.Duration, maxEvents int) *Service {
 	return &Service{db: db, projects: projectRegistry, timeout: timeout, maxEvents: maxEvents, notify: make(chan struct{}, 1), leaseRetry: defaultLeaseRetry}
 }
