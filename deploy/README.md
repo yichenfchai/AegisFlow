@@ -6,7 +6,9 @@
 
 根目录 compose.yaml 提供 PostgreSQL 17、Redis 7.4、两个应用副本和 Nginx 轮询入口，入口只绑定 127.0.0.1:8080。它是联调样例，不是生产高可用模板。
 
-PowerShell 设置 AEGIS_POSTGRES_PASSWORD、AEGIS_JWT_SECRET、AEGIS_BOOTSTRAP_USERNAME、AEGIS_BOOTSTRAP_PASSWORD 后运行：
+官方镜像 [backend/Dockerfile](../backend/Dockerfile) 的运行阶段包含 `git`（仓库 clone）与 `docker-cli`（container 构建沙箱），以非 root 用户 `aegis` 运行，默认监听容器内 `0.0.0.0:8080`（宿主暴露仍由 compose 网络与 gateway 端口决定），并内置 `wget /healthz` 健康检查。compose 给两个 api 副本配置了 healthcheck，gateway 等 `service_healthy` 后才启动。
+
+PowerShell 设置 AEGIS_POSTGRES_PASSWORD、AEGIS_JWT_SECRET、AEGIS_BOOTSTRAP_USERNAME、AEGIS_BOOTSTRAP_PASSWORD 后，在仓库根目录运行：
 
 ```powershell
 docker compose up --build -d
@@ -14,25 +16,63 @@ docker compose up --build -d
 
 变量不要提交仓库。数据库密码在连接 URL 中需要 URL 编码；为简化样例，建议本地使用足够长的字母数字密码。首次初始化后去掉 bootstrap 配置并重建应用容器。前端仍通过 npm run dev 访问 localhost:5173，其 /api 代理到这个 8080 入口。
 
-Nginx 仅信任固定地址 172.30.88.10/32，对传入 X-Forwarded-For 进行覆盖；如网段冲突，需同时调整 compose 网络、gateway 地址与 AEGIS_TRUSTED_PROXIES。网关不自动重试鉴权写请求，避免 refresh 在上游已提交后被再次执行。不能把 0.0.0.0/0 当作可信代理。
+compose 还透传了部署目标凭据密钥（`AEGIS_SECRET_KEY`、`AEGIS_SECRET_KEY_PREVIOUS`，base64 恰好 32 字节，留空表示禁用凭据存储；生成用 `openssl rand -base64 32`）、审批环境（默认 production）、构建相关开关（`AEGIS_BUILD_*`，沙箱默认 none）与独立监听地址 `AEGIS_METRICS_ADDR`（留空关闭）。要在本地验收 P4 的凭据加密与 rekey，至少设置 `AEGIS_SECRET_KEY`；变量含义见 [后端文档](../backend/README.md)。container 构建沙箱需要额外挂载宿主 Docker socket，compose 末尾以注释给出可选覆盖片段，安全边界见下文「构建沙箱部署」，默认不启用。
+
+Nginx 仅信任固定地址 172.30.88.10/32，对传入 X-Forwarded-For 进行覆盖；如网段冲突，需同时调整 compose 网络、gateway 地址与 AEGIS_TRUSTED_PROXIES。网关不自动重试鉴权写请求，避免 refresh 在上游已提交后被再次执行。不能把 0.0.0.0/0 当作可信代理。本地样例的 gateway 配置同样带构建日志 SSE 专用 location（关闭缓冲、11 分钟读超时），与 TLS 样例一致。
 
 Docker 未安装时，可单独启动 PostgreSQL/Redis，按 backend/.env.example 设置共享 URL，再以不同 AEGIS_HTTP_ADDR 启动多个 Go 进程。
 
 ## TLS 终止与反向代理
 
-生产必须让 SPA 与 `/api/v1` 共用同一个 HTTPS 入口（同源），否则 `SameSite=Strict` 的 refresh Cookie、Origin 白名单与 CORS 凭据约定都会失效。TLS 在入口代理终止，应用副本之间保持内网明文；见 [nginx-tls.example.conf](nginx-tls.example.conf)，它在本地样例 [nginx.conf](nginx.conf) 的基础上补了 HTTPS、HSTS 与 SSE 专用 location。
+生产必须让 SPA 与 `/api/v1` 共用同一个 HTTPS 入口（同源），否则 `SameSite=Strict` 的 refresh Cookie、Origin 白名单与 CORS 凭据约定都会失效。TLS 在入口代理终止，应用副本之间保持内网明文；见 [nginx-tls.example.conf](nginx-tls.example.conf)，它在本地样例 [nginx.conf](nginx.conf) 的基础上补了 HTTPS、HSTS、SSE 专用 location、`/healthz`/`/readyz` 代理与 SPA 静态托管。
 
 - **Cookie 与来源**：入口启用 HTTPS 后设置 `AEGIS_COOKIE_SECURE=true`。该值是显式配置，不会从 `X-Forwarded-Proto` 推断，代理也无法用转发头改变它。
 - **可信代理**：`AEGIS_TRUSTED_PROXIES` 只写入口代理的精确地址/CIDR（样例为 `172.30.88.10/32`）。应用只信任来自这些地址的 `X-Forwarded-For`，代理侧必须覆盖而不是追加该头（样例 `proxy_set_header X-Forwarded-For $remote_addr`）。把它写成 `0.0.0.0/0` 等于让任意客户端伪造登录限流来源。
-- **SSE**：`/api/v1/builds/{id}/events` 需要关闭代理缓冲，并把上游读超时设到 15s 心跳之上、10 分钟服务端上限之内（样例用 11m）。普通路径保持 35s 读超时。
+- **SSE**：`/api/v1/builds/{id}/events` 需要关闭代理缓冲，并把上游读超时设到 15s 心跳之上、10 分钟服务端上限之内（样例用 11m）。普通路径保持 35s 读超时。两个样例都使用该专用 location，且必须排在通用 `/` 或 `/api/` 代理规则之前，避免被普通 location 吞掉。
 - **不重试鉴权写**：`proxy_next_upstream off` 必须保留。refresh 在上游已提交后如果被代理重放到另一个副本，会被判定为重放并撤销会话。
 - **请求体**：API 的 JSON 处理器限制 16 KiB，入口 `client_max_body_size 16k` 与之一致，超限在代理层直接拒绝。
 - **证书**：可用 ACME webroot（样例保留了 `/.well-known/acme-challenge/`），续期后 `nginx -s reload`。证书私钥与 `AEGIS_JWT_SECRET` 一样属于需要备份的机密。
 - **数据库与 Redis**：样例 compose 中 `sslmode=disable` 且 Redis 无密码，仅适用于隔离本地网络。生产必须启用 PostgreSQL TLS、Redis 认证/TLS 与网络隔离；应用侧只改连接 URL，不改代码。
 
+## 前端静态资源
+
+前端是 Vite 构建的 SPA，生产由 TLS 入口同源托管（[nginx-tls.example.conf](nginx-tls.example.conf) 的 `root /usr/share/nginx/html` 与 `try_files ... /index.html`）；本地开发继续用 `npm run dev`（Vite 代理 `/api` 到 8080 入口），开发服务器不要对外提供服务。
+
+在仓库根目录构建并把产物同步到入口机的静态目录：
+
+```bash
+npm ci
+npm run build
+# dist/ 是唯一需要发布的目录；按入口机实际路径调整目标目录：
+rsync -a --delete dist/ /srv/aegisflow/www/
+# 若 nginx 以容器运行，把该目录挂到 /usr/share/nginx/html，然后：
+nginx -t && nginx -s reload
+```
+
+- 发布顺序：先发布后端再发布前端，或先同步静态文件再 reload；API 与前端各自可独立回滚。回滚前端只需把上一版 `dist/` 同步回去并 reload，不需要重启 API。
+- 部署后把浏览器看到的入口源（如 `https://aegis.example.com`）加入 `AEGIS_ALLOWED_ORIGINS`，并设置 `AEGIS_COOKIE_SECURE=true`；入口源必须与 SPA/API 实际访问地址一致。
+- 缓存策略：`index.html` 不缓存（样例 `expires -1`），`assets/` 下带内容 hash 的文件缓存一年（样例 `expires 1y`）；不要给 `/api/` 响应加缓存，refresh Cookie 与鉴权响应必须 `no-store`（应用自身已设置）。
+- `nginx-tls.example.conf` 中 `/api/` 代理、SSE location 与 `/healthz`、`/readyz` 代理都排在 SPA fallback 之前；如果改动顺序，注意不要让 `try_files` 把 API 与健康检查请求返回成 `index.html`（监控会把 200 的 HTML 当成健康）。
+- 入口静态根目录只放构建产物，不要把仓库源码、`.env` 或 source map 同步过去；确需保留 source map 时单独存放，不对外公开。
+- 若静态资源改由 CDN/独立静态站点提供，仍必须与 API 同源或处于同一站点（见上文同源要求），否则 refresh Cookie 与 Origin 校验会失效。
+
+## 构建沙箱部署
+
+生产推荐 `AEGIS_BUILD_SANDBOX=container` + 宿主 Docker socket（单机或受控内网自托管）。官方镜像已包含 `git` 与 `docker-cli`，镜像内仍以非 root 用户 `aegis` 运行；compose 末尾的注释片段给出启用方式（挂载 `/var/run/docker.sock`、设置 `AEGIS_BUILD_SANDBOX=container` 和 `group_add`），默认不启用。
+
+- **socket 的安全边界**：把 `/var/run/docker.sock` 挂进应用容器等价于把宿主 Docker daemon 的控制权交给应用容器——可以启动特权容器、挂载宿主目录，实际上接近宿主 root。只允许受信任管理员部署，不要用于多租户或不可信构建来源；构建命令来自项目配置，本身即可执行任意代码。可选的加固：用只读 Docker socket 代理限制可调用的 API、把构建镜像固定为内部仓库、对宿主 daemon 做审计。
+- **socket 组权限**：socket 属主组在宿主上通常是 `docker`（Debian/Ubuntu）或 `root`，GID 因主机而异，不能写死在镜像里。用 `stat -c '%g' /var/run/docker.sock` 取得数字 GID，在 compose 里设置 `group_add: ['<GID>']`，或 `docker run --group-add "$(stat -c '%g' /var/run/docker.sock)"`。GID 变化（重装 Docker、换宿主）后要同步更新。
+- **fail-closed**：配置 `AEGIS_BUILD_SANDBOX=container` 后，启动时会探测 docker CLI 与 daemon；缺失 CLI、socket 未挂载/权限不足或 daemon 不可达都会拒绝启动，不会静默回落到 `none`。构建镜像默认 `alpine:3.20`（`AEGIS_BUILD_IMAGE`），首次使用由宿主 daemon 拉取，离线环境要提前 `docker pull`。
+- **镜像与资源上限**：每次构建是一个一次性容器：`--network none`、`--read-only`、`--cap-drop ALL`、`no-new-privileges`，只挂载构建目录，CPU/内存/进程数由 `AEGIS_BUILD_CPU`、`AEGIS_BUILD_MEMORY`、`AEGIS_BUILD_PIDS` 限制；超时或取消会显式 kill 容器。
+- **clone**：`AEGIS_BUILD_CLONE=true` 时由 API 进程（运行在应用容器内）用 `git clone --depth 1` 浅克隆，构建命令在 clone 出的仓库目录执行；构建容器本身无网络。只支持无凭据的 https 地址，含内联凭据的 URL 直接失败。`git@` SSH 地址还需要 ssh 客户端与密钥/known_hosts，官方镜像未附带 SSH 客户端，也不提供私有仓库凭据；本批边界见 [后端文档](../backend/README.md)。
+- **user 模式**：仅 Linux 裸机且服务以 root 启动时可用，通过 `setpriv` 把 clone 与构建命令降权到 `AEGIS_BUILD_USER` 指定的专用账号；官方镜像是非 root 运行，不满足该模式。需要时单独构建以 root 启动的镜像，并保证该账号存在、`setpriv` 可用。
+- **none 仅开发**：以服务账号执行构建命令，启动时打印警告，不代表任何隔离。仅用于本地联调；生产不要使用默认值。
+- **后续选项（未实现）**：DinD（在独立容器内运行 dockerd，把构建流量与宿主 daemon 隔离）与专用 runner（把构建执行拆到独立服务/主机，通过队列或 API 通信）作为后续演进方向，当前版本只提供上述宿主 socket 方案，不包含这两种形态的实现或部署样例。
+
 ## 生产约束
 
 - 前端和 /api 使用同一 HTTPS 入口；生产显式 AEGIS_COOKIE_SECURE=true，保留 Cookie/Origin/Set-Cookie，禁止缓存鉴权响应。
+- 官方镜像以非 root 用户 `aegis` 运行，容器内监听 `0.0.0.0:8080` 以便网关访问；只通过受控内部网络和入口代理暴露 API 端口，不要把 8080 直接发布到公网，也不要因为容器内监听通配地址就放宽 `AEGIS_TRUSTED_PROXIES`。
 - 所有应用实例使用一致的 JWT 密钥、来源白名单、Cookie 与令牌期限配置、Redis namespace。JWT 密钥轮换需另行设计，不混用旧新密钥副本；密钥丢失会使全部会话失效（用户重新登录即可），因此必须与数据库备份分开保存。
 - PostgreSQL 与 Redis 均使用网络隔离、认证和 TLS。Compose 的 sslmode=disable、无 Redis 密码仅适用于隔离本地联调。
 - PostgreSQL 是用户、密码哈希、会话的权威来源；需要独立备份、恢复演练与高可用方案，见下文「备份与恢复」。Redis 中断会阻止新登录并使 readyz 返回503，不退回各副本自己的限流。
@@ -49,10 +89,14 @@ Docker 未安装时，可单独启动 PostgreSQL/Redis，按 backend/.env.exampl
 
 | 对象 | 说明 | 丢失的后果 |
 | --- | --- | --- |
-| PostgreSQL 数据 | 用户、密码哈希、会话/refresh 哈希、项目、构建与日志、审计 | 无法恢复账号与历史 |
+| PostgreSQL 数据 | 用户、密码哈希、会话/refresh 哈希、项目、构建与构建日志、部署目标（含密文 `secret_cipher`）、部署任务与部署事件、审批、审批通知 outbox、审计 | 无法恢复账号、历史与待处理审批；未投递的通知事件丢失（审批状态本身在审批表） |
+| `AEGIS_SECRET_KEY` | 部署目标凭据的 AES-256-GCM 当前密钥（base64 恰好 32 字节） | `deployment_targets.secret_cipher` 永久不可解密；受影响目标无法鉴权调用，只能重新录入凭据 |
+| `AEGIS_SECRET_KEY_PREVIOUS` | 密钥轮换期间只用于解密旧密文的退役密钥 | 轮换未完成时旧密文同样不可解密，`rekey` 无法迁移；轮换完成并移除后可不备份 |
 | `AEGIS_JWT_SECRET` | 签发 access/refresh 的密钥 | 全部会话失效，用户需重新登录（数据不丢） |
 | 入口 TLS 私钥 | 证书私钥 | 需重新签发证书 |
-| 部署配置 | 环境变量清单（不含明文密码）、编排文件 | 灾难恢复时需要重建 |
+| 部署配置 | 环境变量清单（只写密钥存放位置，不含明文）、编排文件、外部依赖连接信息 | 灾难恢复时需要重建 |
+
+`AEGIS_SECRET_KEY`（及轮换期的 `AEGIS_SECRET_KEY_PREVIOUS`）必须与数据库备份**分开**保存：只有数据库备份而没有密钥，部署目标凭据永久不可解密；两者同时泄漏则等价于凭据泄漏。备份里同时包含 `deployment_targets`、`deployments`、`deployment_events`、`approvals`、`approval_notifications` 等部署治理数据，恢复时整库恢复，不要单独重建这些表。
 
 Redis **不需要备份**：它只保存登录限流计数与 namespace，丢失只会重置配额；重启后 readyz 短暂返回 503、新登录被拒，连接恢复即恢复。不要把 Redis 当作会话或业务存储。
 
@@ -79,7 +123,21 @@ psql "$RESTORE_URL" -c "SELECT max(version) FROM schema_migrations"
 # 2) 关键表行数与最近审计时间。
 psql "$RESTORE_URL" -c "SELECT count(*) FROM auth_users"
 psql "$RESTORE_URL" -c "SELECT max(created_at) FROM auth_audit"
+# 3) 部署治理数据恢复完整性。
+psql "$RESTORE_URL" -c "SELECT count(*) FROM deployment_targets WHERE secret_cipher IS NOT NULL"
+psql "$RESTORE_URL" -c "SELECT count(*) FROM approvals WHERE status = 'pending'"
+psql "$RESTORE_URL" -c "SELECT count(*) FROM approval_notifications WHERE status <> 'delivered'"
+
+# 4) 凭据可解密性：rekey 默认只读 dry run，不会改写恢复库。
+#    必须在 backend 模块目录执行（仓库根目录没有 go.mod）。
+cd backend
+AEGIS_DATABASE_URL="$RESTORE_URL" \
+AEGIS_SECRET_KEY=<备份记录中的当前钥> \
+AEGIS_SECRET_KEY_PREVIOUS=<轮换期旧钥> \
+go run ./cmd/rekey
 ```
+
+第 4 步输出 `dry run: scanned=N already_current=... reencrypted=... failed=0` 表示所有 `deployment_targets.secret_cipher` 都能用备份的密钥解开；`failed>0` 说明恢复出的密文与提供的密钥不匹配，先核对备份记录，**不要删除旧钥**。恢复演练不需要 `-apply`（那会改变恢复库的校验基线）。`rekey` 要求同时提供当前钥与退役钥；从未轮换过的环境没有退役钥，此时改为在临时实例登录管理员，对带凭据的部署目标执行一次「检查」——探测会在内存中解密凭据并发请求，成功即证明密文可解。
 
 把恢复出的库指向一个**临时**应用实例（不同端口、独立 Redis namespace），等 `/readyz` 返回 200、能登录并读到项目后，再按变更窗口切换生产连接。不要在副本仍在运行时直接覆盖生产库：`pg_restore --clean` 会与在线连接和迁移锁冲突。
 
@@ -92,11 +150,24 @@ psql "$RESTORE_URL" -c "SELECT max(created_at) FROM auth_audit"
 目标凭据用 `AEGIS_SECRET_KEY` 密封，轮换分两步：先让新钥接管写入、旧钥保留读取，再用维护命令把存量密文改写为新钥。
 
 1. 生成新钥（`openssl rand -base64 32`），把新钥写入 `AEGIS_SECRET_KEY`，把原来的当前钥移到 `AEGIS_SECRET_KEY_PREVIOUS`，滚动重启所有副本。此阶段读路径先试新钥、失败回退旧钥，写入只用新钥，服务不中断。
-2. dry run 估算：`AEGIS_DATABASE_URL=... AEGIS_SECRET_KEY=<新> AEGIS_SECRET_KEY_PREVIOUS=<旧> go run ./cmd/rekey`，确认 `reencrypted` 与预期一致且 `failed=0`。
-3. 加 `-apply` 重跑，逐行重加密。
+2. dry run 估算（默认不写库）。命令必须在 `backend` 模块目录执行，仓库根目录没有 `go.mod`：
+
+   ```bash
+   cd backend
+   AEGIS_DATABASE_URL=<连接 URL> \
+   AEGIS_SECRET_KEY=<新钥> \
+   AEGIS_SECRET_KEY_PREVIOUS=<旧钥> \
+   go run ./cmd/rekey
+   ```
+
+   确认 `reencrypted` 与预期一致且 `failed=0`。
+3. 加 `-apply` 重跑，逐行重加密：`go run ./cmd/rekey -apply`。
 4. 再跑一次 dry run：`reencrypted=0` 且 `already_current` 等于存储凭据的目标数后，删除 `AEGIS_SECRET_KEY_PREVIOUS`，再滚动重启一次。
 
+以上为 bash 语法；PowerShell 依次设置 `$env:AEGIS_DATABASE_URL`、`$env:AEGIS_SECRET_KEY`、`$env:AEGIS_SECRET_KEY_PREVIOUS` 后执行同一 `go run` 命令即可。
+
 `failed>0` 表示某些行的密文两把钥都打不开：命令不会改动这些行，先核对配置与历史数据，**不要删除旧钥**。重加密只改 `deployment_targets.secret_cipher`，不改 `updated_at`、不写审计；命令可以在服务运行期间执行（此时服务已同时持有两把钥）。
+
 ## 滚动升级
 
 应用启动时自动执行版本化迁移，并用 advisory 事务锁保证多副本串行；发现数据库版本高于代码支持范围时**拒绝启动**。因此升级的基本约束是「schema 先扩展、代码后使用、旧列最后删除」。
@@ -104,21 +175,25 @@ psql "$RESTORE_URL" -c "SELECT max(created_at) FROM auth_audit"
 1. **升级前**：完成一次备份并确认可恢复；记录当前 `SELECT max(version) FROM schema_migrations`；确认后端与前端来自同一发布版本。
 2. **逐副本替换**：一次下线一个副本，等新副本 `/readyz` 返回 200 再处理下一个。入口应在此期间把该副本摘除；未持 worker 租约的副本可以安全替换。
 3. **构建 worker**：停止持锁副本会把正在运行的构建标记为 `interrupted`（不是业务失败，可重试）。升级窗口尽量避开构建高峰，或提前清空排队构建。
-4. **前端**：静态资源与 API 在同一入口后，先发布后端再发布前端；前端只调用同源 `/api/v1`。
+4. **前端**：静态资源与 API 在同一入口后，先发布后端再发布前端；前端只调用同源 `/api/v1`。同步 `dist/` 后 `nginx -s reload`，见「前端静态资源」。
 5. **验证**：`/readyz` 200；管理员登录；项目列表与构建详情可读；触发一次构建并看到日志；审计页出现对应 `build.trigger` 记录。
 6. **回滚**：仅当本次迁移是加法（只新增表/列/索引）时，允许把代码回退到上一版本。若迁移删改过列，必须先停掉全部副本，用升级前备份恢复到新库，再把副本指向该库——迁移账本没有 down migration，不要指望回退脚本。
+
+**网关 upstream 与静态地址**：样例 Nginx 的 `upstream` 是写死副本地址的静态列表，启动时只解析一次；副本重建后容器 IP 变化时，旧地址会继续被使用并返回 502/超时。因此每次替换副本后执行 `nginx -t && nginx -s reload`（reload 平滑），或改用 DNS `resolver` + 动态 upstream、服务发现或主动健康检查。compose 的 gateway `depends_on: service_healthy` 只覆盖首次启动，不覆盖运行期重建；滚动发布需要编排系统的健康检查与网关重载配合。健康判断用 `/readyz`（依赖就绪，503 表示不可用），`/healthz` 只表示进程存活。`proxy_next_upstream off` 是有意的安全取舍：login/refresh/logout 等鉴权写请求不会自动重放到另一个副本，上游故障时宁可返回 5xx 让客户端重试，也不冒 refresh 已提交后被再次执行的风险。
 
 **schema 变更约定**：新增列必须带默认值或允许 NULL；新代码兼容旧数据；删除/重命名放在后续版本，并至少跨一个发布周期。
 
 ## 监控与健康检查
 
 - `/healthz` 是进程存活（不查依赖），供编排系统做 liveness；`/readyz` 检查 PostgreSQL 与 Redis（2s 超时），依赖不可用时返回 503，供 readiness 与入口摘流。
+- 官方镜像内置 Docker `HEALTHCHECK`：每 30s 用 wget 请求 `/healthz`，3s 超时，启动宽限 10s；compose 样例给两个 api 副本配置了 10s 间隔的 healthcheck，并让 gateway 等 `service_healthy` 后才启动。容器 healthy 不代表依赖可用，按依赖摘流仍应使用 `/readyz`。
+- `AEGIS_METRICS_ADDR` 在 compose 中已透传，默认空表示关闭；启用后监听在独立地址，提供无鉴权的 Prometheus 文本端点，因此只能绑定回环，或仅经内网/受保护代理抓取，不要与 API 端口共用。在容器内抓取需要显式监听 `0.0.0.0:<port>`，并只把该端口发布到受控主机地址（compose 末尾有注释示例）。
 - 日志为结构化 JSON，带 `requestId`、method、path、status、duration；排查时用 `X-Request-ID` 贯穿代理与应用日志。日志与审计都不含密码、令牌或 Cookie 明文。
 - 告警至少覆盖：`/readyz` 连续非 200、PostgreSQL 连接数接近上限（副本数 × `AEGIS_DB_MAX_OPEN`）、Redis 不可用、构建队列持续堆积。
 
 ## 测试
 
-后端真实集成：设置 AEGIS_TEST_DATABASE_URL 与 AEGIS_TEST_REDIS_URL 后运行 go test ./...，测试使用随机隔离 schema 和 Redis namespace。测试数据库角色需要 CREATE SCHEMA 与 DROP SCHEMA 权限，不使用生产数据库。
+后端真实集成：在 `backend` 目录设置 AEGIS_TEST_DATABASE_URL 与 AEGIS_TEST_REDIS_URL 后运行 `go test ./...`（仓库根目录没有 `go.mod`），测试使用随机隔离 schema 和 Redis namespace。测试数据库角色需要 CREATE SCHEMA 与 DROP SCHEMA 权限，不使用生产数据库。
 
 浏览器 E2E：设置 AEGIS_E2E_DATABASE_URL 指向专用可丢弃数据库、AEGIS_E2E_REDIS_URL 指向测试 Redis，再 npm run test:e2e。E2E 会初始化管理员和创建用户，不要指向生产；8080/5173 须空闲。多实例集成测试额外启动两个真实 httptest HTTP server、独立数据库池及 Redis clients，验证会话互通、刷新/退出撤销及共享限额。
 
