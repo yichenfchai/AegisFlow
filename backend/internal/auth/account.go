@@ -534,6 +534,12 @@ func (s *Service) PurgeAudit(ctx context.Context, before int64) (int64, error) {
 // CleanupExpired removes sessions past their absolute deadline together with
 // their refresh-token history. Replay detection only needs history while the
 // session is still valid, so this is the documented retention boundary.
+//
+// Lock order convention: every path locks the session row before its refresh
+// token rows (see lockRefreshSession, Refresh and Logout). Cleanup follows the
+// same order — sessions first, then their tokens — because deleting tokens first
+// can deadlock against a refresh that already holds the session lock and is
+// waiting for the token lock.
 func (s *Service) CleanupExpired(ctx context.Context) (int64, error) {
 	if err := s.valid(); err != nil {
 		return 0, err
@@ -543,10 +549,34 @@ func (s *Service) CleanupExpired(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `DELETE FROM auth_refresh_tokens WHERE session_id IN (SELECT id FROM auth_sessions WHERE expires_at <= $1)`, time.Now().Unix()); err != nil {
+	now := time.Now().Unix()
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM auth_sessions WHERE expires_at <= $1 FOR UPDATE`, now)
+	if err != nil {
 		return 0, err
 	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM auth_sessions WHERE expires_at <= $1`, time.Now().Unix())
+	var expired []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		expired = append(expired, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, err
+	}
+	if len(expired) == 0 {
+		return 0, tx.Commit()
+	}
+	// History rows must go before their session rows (foreign key), but the
+	// session locks acquired above keep that order deadlock-safe.
+	if _, err = tx.ExecContext(ctx, `DELETE FROM auth_refresh_tokens WHERE session_id = ANY($1)`, expired); err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM auth_sessions WHERE id = ANY($1)`, expired)
 	if err != nil {
 		return 0, err
 	}
