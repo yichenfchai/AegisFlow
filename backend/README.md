@@ -116,6 +116,7 @@ server: {
 
 - `deployment_targets` 是全局管理对象，`/api/v1/deployment-targets` 全部路由仅 admin 可用；member/viewer 返回 403。支持 HTTP(S) 目标的新增、查询、分页、修改、删除与连通性探测，`kind` 目前只有 `http`。
 - 目标字段：`name`（3–64 字节、单行、大小写不敏感唯一）、`environment`（`development`/`staging`/`production`，默认 development）、`endpoint`（http/https，禁止 userinfo、query、fragment）、`healthPath`（默认 `/`，必须以 `/` 开头）、`deployPath`（默认 `/deploy`，必须以 `/` 开头，≤256 字节）、`status`（`active`/`disabled`）。
+- 网络边界：部署目标 endpoint 由 admin 配置，admin 是可信配置者，目标 endpoint 属于受信配置面；允许私网与回环地址（自托管内网场景），但拒绝 link-local 与云元数据地址（`169.254.0.0/16`、`fe80::/10`、`100.100.100.200`、`fd00:ec2::254`）——IP 字面量在创建/更新时返回 400，主机名在运行时连接建立前按解析结果再次校验，覆盖 DNS rebinding。
 - 凭据加密存储：`AEGIS_SECRET_KEY`（base64 32 字节）启用 AES-256-GCM；密文布局为 `[12 字节随机 nonce][ciphertext+tag]`，AAD 绑定目标 id（`deployment_target:<id>`），因此密文不能跨行复用。接口只返回 `hasSecret`，从不返回明文或密文；未配置密钥时仍可创建无凭据目标，但写入凭据返回 400。带凭据的目标必须使用 `https` 端点（仅回环地址允许 `http`），否则创建/更新直接 400，避免把 Bearer 凭据以明文发到网络上。
 - 密钥轮换（第一批）：把新钥设为 `AEGIS_SECRET_KEY`、旧钥设为 `AEGIS_SECRET_KEY_PREVIOUS`，解密先试当前钥、失败再回退旧钥；**加密只用当前钥**，所以轮换后新写入的密文不再依赖旧钥。两键相同、或只配退役钥都会启动失败；解密失败的错误与具体用哪把钥匙无关，不构成探测面。存量密文用维护命令 `go run ./cmd/rekey`（见 `cmd/rekey`）重加密：默认 dry run 只报告不写，确认后加 `-apply`；它只重写能用退役钥打开的行，两把钥都打不开的行计入 `failed` 并保持原样。命令可重复执行（已迁移的行计入 `already_current`），全部完成后才能从配置里移除 `AEGIS_SECRET_KEY_PREVIOUS`。
 - 目标选项：`GET /api/v1/deployment-targets/options` 向任何已登录角色返回启用中目标的只读投影（id/name/environment/endpoint），部署表单据此选择；完整目标列表、探测与凭据仍 admin-only。

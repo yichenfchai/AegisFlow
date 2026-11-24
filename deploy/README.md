@@ -42,6 +42,7 @@ Docker 未安装时，可单独启动 PostgreSQL/Redis，按 backend/.env.exampl
 - 构建 worker 由 PostgreSQL 会话锁保证每个部署只有一个副本执行与恢复（不提供并行吞吐）；停止持锁副本时，其正在运行的构建会被标记为 `interrupted`，由下一个持锁副本接管恢复。
 - 审批 Webhook 通知（可选）使用 PostgreSQL outbox 与独立 notifier；生产必须使用 HTTPS（仅回环测试允许 HTTP），配置 `AEGIS_APPROVAL_WEBHOOK_SECRET` 时接收方应校验 `X-AegisFlow-Signature`，并按 `X-AegisFlow-Delivery` 幂等处理。投递失败不会改变审批状态，失败行保留在 `approval_notifications` 供排查。
 - 多人使用不等于已支持多租户隔离；其余业务对象级权限按 TODO 推进。
+- 部署目标 endpoint 由 admin 配置，admin 是可信配置者，目标 endpoint 属于受信配置面：允许私网/回环（自托管内网场景），拒绝 link-local 与云元数据地址（169.254.0.0/16、fe80::/10、100.100.100.200、fd00:ec2::254）；创建/更新返回 400，运行时在连接建立前按解析后的 IP 再校验一次（防 DNS rebinding）。
 
 ## 备份与恢复
 
