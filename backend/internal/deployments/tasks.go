@@ -141,6 +141,31 @@ func validDeploymentStatus(status string) bool {
 	}
 }
 
+// archivedProjectError is the deployment-side read-only rejection; it reuses the
+// project registry wording so every write path reports the same reason.
+func archivedProjectError() error {
+	return fmt.Errorf("%w: archived project is read-only until restored", ErrConflict)
+}
+
+// requireActiveProjectForDeployment locks the project row and rejects a
+// deployment write on an archived project. FOR SHARE serializes against the
+// archive transition (which updates the project row) without upgrading the lock
+// later, so it cannot deadlock against another deployment write.
+func requireActiveProjectForDeployment(ctx context.Context, tx *sql.Tx, projectID string) error {
+	var status string
+	err := tx.QueryRowContext(ctx, `SELECT status FROM projects WHERE id=$1 FOR SHARE`, projectID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if status != projects.StatusActive {
+		return archivedProjectError()
+	}
+	return nil
+}
+
 // CreateDeployment enqueues one deploy attempt. The project row lock allocates
 // deployment_number from projects.deploy_count (the build_count pattern), the
 // target snapshot is captured inside the same transaction, and the audit row
@@ -196,12 +221,19 @@ func (s *Service) CreateDeployment(ctx context.Context, actor auth.Actor, projec
 func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.Actor, projectID string, target targetSnapshot,
 	version, buildID, rollbackOf, action string) (Deployment, error) {
 	var count int64
-	err := tx.QueryRowContext(ctx, `SELECT deploy_count FROM projects WHERE id=$1 FOR UPDATE`, projectID).Scan(&count)
+	var projectStatus string
+	err := tx.QueryRowContext(ctx, `SELECT deploy_count,status FROM projects WHERE id=$1 FOR UPDATE`, projectID).Scan(&count, &projectStatus)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, ErrNotFound
 	}
 	if err != nil {
 		return Deployment{}, err
+	}
+	// The project row lock is already held for the deployment-number
+	// allocation, so the archived read-only rule is decided in the same
+	// snapshot: an archive cannot slip between this check and the insert.
+	if projectStatus != projects.StatusActive {
+		return Deployment{}, archivedProjectError()
 	}
 	if buildID != "" {
 		var exists int
@@ -363,6 +395,10 @@ func (s *Service) CancelDeployment(ctx context.Context, actor auth.Actor, id str
 		return Deployment{}, err
 	}
 	if err = s.authorizeProjectWrite(ctx, tx, actor, projectID); err != nil {
+		return Deployment{}, err
+	}
+	// Cancelling is a project write too: an archived project stays read-only.
+	if err = requireActiveProjectForDeployment(ctx, tx, projectID); err != nil {
 		return Deployment{}, err
 	}
 	var approval *Approval
