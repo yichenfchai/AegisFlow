@@ -76,6 +76,17 @@ type Service struct {
 	secret     []byte
 	accessTTL  time.Duration
 	refreshTTL time.Duration
+	// testHookAfterPasswordCheck is nil in production. Tests use it to pause a
+	// login after the password comparison and before the session transaction so
+	// the login/revocation race is reproducible deterministically.
+	testHookAfterPasswordCheck func()
+}
+
+// afterPasswordCheck runs the test-only hook; production services keep it nil.
+func (s *Service) afterPasswordCheck() {
+	if s.testHookAfterPasswordCheck != nil {
+		s.testHookAfterPasswordCheck()
+	}
 }
 
 type accessClaims struct {
@@ -225,6 +236,22 @@ func (s *Service) Login(ctx context.Context, username, password string) (*Tokens
 	return s.LoginWithRemember(ctx, username, password, false, "")
 }
 
+// dummyPasswordHash is a valid bcrypt hash of an unrelated password. Comparing
+// against it makes unknown-user failures pay the same cost as a bad password.
+const dummyPasswordHash = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+
+// comparePassword runs the bcrypt comparison for a login attempt. bcrypt refuses
+// inputs longer than 72 bytes without hashing them, so a length check outside
+// this helper would make long-password failures measurably cheaper than normal
+// ones and leak which usernames exist. The truncation below is only used for the
+// comparison: Login still rejects every >72-byte password after it.
+func comparePassword(hash, password string) bool {
+	if len(password) > 72 {
+		password = password[:72]
+	}
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+}
+
 func (s *Service) LoginWithRemember(ctx context.Context, username, password string, remember bool, requestID string) (*Tokens, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
@@ -232,16 +259,29 @@ func (s *Service) LoginWithRemember(ctx context.Context, username, password stri
 	var u User
 	var hash string
 	var disabled int
-	err := s.db.QueryRowContext(ctx, `SELECT id,username,display_name,role,password_hash,disabled FROM auth_users WHERE lower(username)=lower($1)`, username).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &hash, &disabled)
+	err := s.db.QueryRowContext(ctx, `SELECT id,username,display_name,role,password_hash,disabled,created_at FROM auth_users WHERE lower(username)=lower($1)`, username).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &hash, &disabled, &u.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		// A fixed valid bcrypt hash keeps unknown-user failures comparable to bad passwords.
-		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"), []byte(password))
+		comparePassword(dummyPasswordHash, password)
+		s.afterPasswordCheck()
 		return nil, ErrUnauthorized
 	}
 	if err != nil {
 		return nil, err
 	}
-	if len(password) > 72 || bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
+	if len(password) > 72 {
+		// bcrypt refuses inputs over 72 bytes without hashing them. Without this
+		// branch a long password would skip bcrypt entirely and return measurably
+		// faster than an ordinary failed login, leaking which usernames exist.
+		// Compare against the fixed dummy hash so the known and unknown user paths
+		// pay the same work, then reject the oversized credential.
+		comparePassword(dummyPasswordHash, password)
+		s.afterPasswordCheck()
+		return nil, ErrUnauthorized
+	}
+	matched := comparePassword(hash, password)
+	s.afterPasswordCheck()
+	if !matched {
 		return nil, ErrUnauthorized
 	}
 	// Only report the disabled state once the caller proved knowledge of the password.
@@ -267,6 +307,33 @@ func (s *Service) LoginWithRemember(ctx context.Context, username, password stri
 		return nil, err
 	}
 	defer tx.Rollback()
+	// Re-check the user row under a share lock before creating the session.
+	// ChangePassword, ResetPassword and UpdateUser update auth_users before they
+	// revoke sessions, so their row lock conflicts with this one: either the
+	// revocation committed first (and the stale password/disabled state read
+	// above is rejected here) or this login commits first and the revocation
+	// revokes the session it just created. Without the lock a login that started
+	// before the revocation could insert a session after it, leaving a session
+	// alive that the "revoke immediately" contract says must not exist.
+	var lockedHash string
+	var lockedDisabled int
+	err = tx.QueryRowContext(ctx, `SELECT password_hash,disabled FROM auth_users WHERE id=$1 FOR SHARE`, u.ID).Scan(&lockedHash, &lockedDisabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUnauthorized
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lockedHash != hash {
+		// The password changed while bcrypt was running; verify the credential
+		// against the committed hash instead of trusting the stale comparison.
+		if !comparePassword(lockedHash, password) {
+			return nil, ErrUnauthorized
+		}
+	}
+	if lockedDisabled != 0 {
+		return nil, ErrAccountDisabled
+	}
 	rememberInt := 0
 	if remember {
 		rememberInt = 1
@@ -310,9 +377,9 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*Tokens, er
 	}
 	var u User
 	var expires int64
-	var revoked, remember, consumed int
-	if err = tx.QueryRowContext(ctx, `SELECT u.id,u.username,u.display_name,u.role,s.expires_at,s.revoked,s.remember
- FROM auth_sessions s JOIN auth_users u ON u.id=s.user_id WHERE s.id=$1`, sid).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &expires, &revoked, &remember); err != nil {
+	var revoked, remember, consumed, disabled int
+	if err = tx.QueryRowContext(ctx, `SELECT u.id,u.username,u.display_name,u.role,u.created_at,s.expires_at,s.revoked,s.remember,u.disabled
+ FROM auth_sessions s JOIN auth_users u ON u.id=s.user_id WHERE s.id=$1`, sid).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &u.CreatedAt, &expires, &revoked, &remember, &disabled); err != nil {
 		return nil, err
 	}
 	if err = tx.QueryRowContext(ctx, `SELECT consumed FROM auth_refresh_tokens WHERE token_hash=$1 AND session_id=$2 FOR UPDATE`, hash, sid).Scan(&consumed); err != nil {
@@ -328,7 +395,9 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*Tokens, er
 		}
 		return nil, ErrUnauthorized
 	}
-	if revoked != 0 || expires <= time.Now().Unix() {
+	// Disabled accounts must not rotate refresh tokens either: a disable revokes
+	// sessions, but checking here also rejects a session that raced the revoke.
+	if revoked != 0 || disabled != 0 || expires <= time.Now().Unix() {
 		return nil, ErrUnauthorized
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE auth_refresh_tokens SET consumed=1 WHERE token_hash=$1`, hash); err != nil {
@@ -412,8 +481,8 @@ func (s *Service) InspectToken(ctx context.Context, accessToken string) (*User, 
 		return nil, "", ErrUnauthorized
 	}
 	var u User
-	err = s.db.QueryRowContext(ctx, `SELECT u.id,u.username,u.display_name,u.role FROM auth_sessions s
-	 JOIN auth_users u ON u.id=s.user_id WHERE s.id=$1 AND s.user_id=$2 AND s.revoked=0 AND s.expires_at>$3 AND u.disabled=0`, claims.SessionID, claims.Subject, time.Now().Unix()).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role)
+	err = s.db.QueryRowContext(ctx, `SELECT u.id,u.username,u.display_name,u.role,u.created_at FROM auth_sessions s
+	 JOIN auth_users u ON u.id=s.user_id WHERE s.id=$1 AND s.user_id=$2 AND s.revoked=0 AND s.expires_at>$3 AND u.disabled=0`, claims.SessionID, claims.Subject, time.Now().Unix()).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &u.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", ErrUnauthorized
 	}

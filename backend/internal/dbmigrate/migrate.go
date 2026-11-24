@@ -212,6 +212,18 @@ var Migrations = [][]string{{
 	 created_at BIGINT NOT NULL,
 	 UNIQUE (approval_id, event))`,
 	`CREATE INDEX approval_notifications_pending_idx ON approval_notifications(status, next_attempt_at, id)`,
+}, {
+	// Revocation and retention query indexes (review P2-03). Sessions live for
+	// the refresh TTL (30 days) and are scanned by user on every session list,
+	// revoke-all, disable and cleanup; the audit trail is retained for years.
+	// Build history filters by status, so builds(status,created_at,id) serves the
+	// list page the same way builds_created_idx already serves the global one.
+	// IF NOT EXISTS keeps the migration harmless if an operator pre-created a
+	// replacement index with the same purpose under the expected name.
+	`CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id)`,
+	`CREATE INDEX IF NOT EXISTS auth_sessions_expires_idx ON auth_sessions(expires_at)`,
+	`CREATE INDEX IF NOT EXISTS auth_audit_actor_idx ON auth_audit(actor_id)`,
+	`CREATE INDEX IF NOT EXISTS builds_status_created_idx ON builds(status, created_at, id)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped
