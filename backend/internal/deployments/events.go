@@ -49,14 +49,16 @@ func (w *deploymentEventWriter) flushLoop() {
 	}
 }
 
-// stream stores each upstream line as a response event. A line past the
+// stream stores each upstream line as a response event after redacting the
+// deployment secret and credential-shaped values, so untrusted upstream output
+// can never persist a credential in an event viewers can read. A line past the
 // scanner buffer is still bounded by maxDeployEventBytes truncation; the
 // scanner error is returned so the caller can record why reading stopped.
-func (w *deploymentEventWriter) stream(reader io.Reader) error {
+func (w *deploymentEventWriter) stream(reader io.Reader, secret string) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*maxDeployEventBytes)
 	for scanner.Scan() {
-		w.append("response", scanner.Text())
+		w.append("response", redactResponseLine(scanner.Text(), secret))
 	}
 	return scanner.Err()
 }
