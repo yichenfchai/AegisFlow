@@ -135,3 +135,57 @@ func TestStandbyDoesNotRecoverAnotherInstancesBuild(t *testing.T) {
 	waitForStatus(t, first, build.ID, StatusInterrupted)
 	recorder.waitFor(t, "interrupted builds recovered", 5*time.Second)
 }
+
+// TestWorkerLeaseAlive is the P1-06 regression: holding the lease must expose
+// a liveness check that fails once the dedicated connection is gone.
+func TestWorkerLeaseAlive(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	lease, held, err := s.AcquireWorkerLease(ctx)
+	if err != nil || !held {
+		t.Fatalf("acquire: held=%v err=%v", held, err)
+	}
+	defer lease.Release()
+	if err := lease.Alive(ctx); err != nil {
+		t.Fatalf("Alive on a held lease = %v, want nil", err)
+	}
+	if err := lease.conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Alive(ctx); err == nil {
+		t.Fatal("Alive after the lease connection closed = nil, want an error")
+	}
+}
+
+// TestLeaseHolderReturnsToStandbyWhenConnectionDies proves the holder observes
+// the lost lease within one probe interval instead of keeping the worker loop
+// alive while a standby replica may already have taken over.
+func TestLeaseHolderReturnsToStandbyWhenConnectionDies(t *testing.T) {
+	s, _ := testService(t)
+	previous := leaseProbeInterval
+	leaseProbeInterval = 20 * time.Millisecond
+	defer func() { leaseProbeInterval = previous }()
+
+	lease, held, err := s.AcquireWorkerLease(context.Background())
+	if err != nil || !held {
+		t.Fatalf("acquire: held=%v err=%v", held, err)
+	}
+	recorder := &logRecorder{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runAsLeaseHolder(context.Background(), lease, slog.New(recorder))
+	}()
+	// Let the holder finish recovery and enter the worker loop before the
+	// connection is cut; otherwise the recovery error path would mask the probe.
+	time.Sleep(200 * time.Millisecond)
+	if err := lease.conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recorder.waitFor(t, "lease lost", 5*time.Second)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lease holder did not return to stand-by within one probe interval")
+	}
+}

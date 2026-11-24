@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"sync"
 	"testing"
 
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
@@ -106,5 +107,102 @@ func TestRekeySecretsRequiresBothKeys(t *testing.T) {
 	}
 	if _, err := New(testutil.ClonePostgres(t, db), Options{PreviousSecretKey: []byte("0123456789abcdef0123456789abcdef")}).RekeySecrets(ctx, true); err == nil {
 		t.Fatal("rekey without a current key was allowed")
+	}
+}
+
+// TestRekeyRowCompareAndSwapLeavesConcurrentChange regression: the rekey pass
+// used to UPDATE each row unconditionally after taking a full snapshot, so a
+// credential replaced or cleared by the online API between the snapshot and the
+// write was silently overwritten with the stale plaintext (or resurrected). The
+// per-row write is now a compare-and-swap on the snapshot ciphertext.
+func TestRekeyRowCompareAndSwapLeavesConcurrentChange(t *testing.T) {
+	oldKey := []byte("0123456789abcdef0123456789abcdef")
+	newKey := []byte("fedcba9876543210fedcba9876543210")
+	ctx := context.Background()
+
+	_, db := testServiceWith(t, Options{SecretKey: oldKey})
+	replaced := seedRekeyTarget(t, db, oldKey, "rekey-replaced")
+	cleared := seedRekeyTarget(t, db, oldKey, "rekey-cleared")
+	untouched := seedRekeyTarget(t, db, oldKey, "rekey-untouched")
+
+	// During a rotation the API already seals writes with the current key.
+	rotation := New(testutil.ClonePostgres(t, db), Options{SecretKey: newKey, PreviousSecretKey: oldKey})
+	api := New(testutil.ClonePostgres(t, db), Options{SecretKey: newKey, PreviousSecretKey: oldKey})
+
+	// The pass reads its snapshot first; the concurrent API writes then land.
+	replacedSnapshot := readCipher(t, db, replaced.ID)
+	clearedSnapshot := readCipher(t, db, cleared.ID)
+	untouchedSnapshot := readCipher(t, db, untouched.ID)
+	if _, err := api.Update(ctx, testActor, replaced.ID, Patch{Secret: str("concurrent-replacement")}); err != nil {
+		t.Fatal(err)
+	}
+	replacedCipher := readCipher(t, db, replaced.ID)
+	if _, err := api.Update(ctx, testActor, cleared.ID, Patch{Secret: str("")}); err != nil {
+		t.Fatal(err)
+	}
+
+	if reencrypted, err := rotation.reencryptTargetRow(ctx, replaced.ID, replacedSnapshot, false); err != nil {
+		t.Fatal(err)
+	} else if reencrypted {
+		t.Fatal("rekey overwrote a ciphertext replaced after the snapshot")
+	}
+	if !bytes.Equal(readCipher(t, db, replaced.ID), replacedCipher) {
+		t.Fatal("concurrent credential replacement was overwritten with the snapshot")
+	}
+	if plain, err := rotation.decryptSecret(replaced.ID, readCipher(t, db, replaced.ID)); err != nil || plain != "concurrent-replacement" {
+		t.Fatalf("stored credential = %q err=%v", plain, err)
+	}
+
+	if reencrypted, err := rotation.reencryptTargetRow(ctx, cleared.ID, clearedSnapshot, false); err != nil {
+		t.Fatal(err)
+	} else if reencrypted {
+		t.Fatal("rekey raced with a credential clear")
+	}
+	if cipher := readCipher(t, db, cleared.ID); len(cipher) != 0 {
+		t.Fatalf("cleared credential was resurrected with %d bytes", len(cipher))
+	}
+
+	// An unchanged row is still re-encrypted, so the compare-and-swap does not
+	// skip the normal rotation work.
+	if reencrypted, err := rotation.reencryptTargetRow(ctx, untouched.ID, untouchedSnapshot, false); err != nil {
+		t.Fatal(err)
+	} else if !reencrypted {
+		t.Fatal("rekey refused an unchanged row")
+	}
+	if plain, err := rotation.decryptSecret(untouched.ID, readCipher(t, db, untouched.ID)); err != nil || plain != "rekey-untouched-secret" {
+		t.Fatalf("re-encrypted credential = %q err=%v", plain, err)
+	}
+}
+
+// TestRekeyReportCountsConcurrentSkip checks the report wiring: a row that
+// changes between the snapshot and the write is counted once as
+// SkippedConcurrent, not as reencrypted and not as failed.
+func TestRekeyReportCountsConcurrentSkip(t *testing.T) {
+	oldKey := []byte("0123456789abcdef0123456789abcdef")
+	newKey := []byte("fedcba9876543210fedcba9876543210")
+	ctx := context.Background()
+
+	_, db := testServiceWith(t, Options{SecretKey: oldKey})
+	raced := seedRekeyTarget(t, db, oldKey, "rekey-raced")
+	rotation := New(testutil.ClonePostgres(t, db), Options{SecretKey: newKey, PreviousSecretKey: oldKey})
+	api := New(testutil.ClonePostgres(t, db), Options{SecretKey: newKey, PreviousSecretKey: oldKey})
+
+	var once sync.Once
+	rotation.rekeyBeforeWrite = func(targetID string) {
+		once.Do(func() {
+			if _, err := api.Update(ctx, testActor, targetID, Patch{Secret: str("api-concurrent")}); err != nil {
+				t.Errorf("concurrent API write: %v", err)
+			}
+		})
+	}
+	report, err := rotation.RekeySecrets(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Scanned != 1 || report.AlreadyCurrent != 0 || report.Reencrypted != 0 || report.SkippedConcurrent != 1 || report.Failed != 0 {
+		t.Fatalf("report = %+v", report)
+	}
+	if plain, err := rotation.decryptSecret(raced.ID, readCipher(t, db, raced.ID)); err != nil || plain != "api-concurrent" {
+		t.Fatalf("stored credential = %q err=%v", plain, err)
 	}
 }

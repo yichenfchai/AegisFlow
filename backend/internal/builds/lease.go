@@ -3,6 +3,7 @@ package builds
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -18,12 +19,27 @@ const workerLeaseQuery = `SELECT pg_try_advisory_lock(hashtextextended(current_d
 // lease. It bounds takeover latency after the holder dies.
 const defaultLeaseRetry = 5 * time.Second
 
+// defaultLeaseProbeInterval is how often the holder verifies that its dedicated
+// connection still lives. The advisory lock disappears with the connection, so
+// a lost connection means a standby replica may already be executing builds;
+// the old holder must stop claiming instead of racing it.
+const defaultLeaseProbeInterval = 5 * time.Second
+
+// leaseProbeInterval is the holder liveness check period. A variable so tests
+// can shrink the interval instead of waiting five seconds per assertion.
+var leaseProbeInterval = defaultLeaseProbeInterval
+
+// leaseProbeTimeout bounds one liveness probe: a blackholed TCP peer can
+// otherwise leave the check blocked past the next interval.
+const leaseProbeTimeout = 3 * time.Second
+
 // WorkerLease is the single-worker lock of one deployment. The advisory lock
 // lives on one dedicated connection, so it disappears with the process or the
 // connection and a standby replica can take over; no lease table or heartbeat
-// is needed. It does not make execution idempotent: a build that survives a
-// connection loss is killed by the holder's status watchdog once the row is
-// recovered by the next holder.
+// is needed. The holder periodically verifies that connection (Alive) and
+// returns to stand-by when it fails. It does not make execution idempotent: a
+// build that survives a connection loss is killed by the holder's status
+// watchdog once the row is recovered by the next holder.
 type WorkerLease struct {
 	conn *sql.Conn
 	once sync.Once
@@ -63,6 +79,17 @@ func (l *WorkerLease) Release() {
 		_, _ = l.conn.ExecContext(ctx, `SELECT pg_advisory_unlock_all()`)
 		_ = l.conn.Close()
 	})
+}
+
+// Alive reports whether the dedicated lease connection is still usable. The
+// advisory lock is bound to that session: when the ping fails, the lock is
+// either already gone or about to be, so the caller must stop acting as the
+// worker and let a standby replica take over.
+func (l *WorkerLease) Alive(ctx context.Context) error {
+	if l == nil || l.conn == nil {
+		return errors.New("build worker lease is not held")
+	}
+	return l.conn.PingContext(ctx)
 }
 
 // RunWorker owns this instance's build worker until ctx is cancelled.
@@ -110,7 +137,7 @@ func (s *Service) RunWorker(ctx context.Context, logger *slog.Logger) {
 }
 
 // runAsLeaseHolder recovers interrupted builds and then runs the worker until
-// ctx is cancelled, always returning the lease.
+// ctx is cancelled or the lease connection dies, always returning the lease.
 func (s *Service) runAsLeaseHolder(ctx context.Context, lease *WorkerLease, logger *slog.Logger) {
 	defer lease.Release()
 	recovered, err := s.RecoverInterrupted(ctx)
@@ -123,5 +150,41 @@ func (s *Service) runAsLeaseHolder(ctx context.Context, lease *WorkerLease, logg
 	if recovered > 0 {
 		logger.Info("interrupted builds recovered", "count", recovered)
 	}
-	s.run(ctx)
+	// A long-running build must not outlive its lease. The advisory lock is
+	// released the moment the dedicated connection dies, so a stale holder that
+	// kept executing would race the standby that just took over. Probe the
+	// connection and cancel the worker loop on the first failure.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	probeDone := make(chan struct{})
+	go func() {
+		defer close(probeDone)
+		interval := leaseProbeInterval
+		if interval <= 0 {
+			interval = defaultLeaseProbeInterval
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				probeCtx, probeCancel := context.WithTimeout(runCtx, leaseProbeTimeout)
+				probeErr := lease.Alive(probeCtx)
+				probeCancel()
+				if probeErr == nil {
+					continue
+				}
+				if runCtx.Err() == nil {
+					logger.Warn("build worker lease lost; returning to stand-by", "error", probeErr)
+					cancel()
+				}
+				return
+			}
+		}
+	}()
+	s.run(runCtx)
+	cancel()
+	<-probeDone
 }
