@@ -1,21 +1,66 @@
 # Local multi-instance acceptance stack; external production TLS/HA services are separate.
-# Production TLS termination example: deploy/nginx-tls.example.conf (see deploy/README.md).
+# Production TLS termination + SPA hosting example: deploy/nginx-tls.example.conf
+# (see deploy/README.md). Production build isolation is documented in
+# deploy/README.md "构建沙箱部署"; the container-sandbox override is commented out
+# at the end of this file and is intentionally NOT enabled by default.
 x-api: &api
   build: ./backend
   environment: &api-env
+    # The image defaults to 0.0.0.0:8080 so the gateway can reach the replica;
+    # host exposure is limited by the compose network and the gateway port.
     AEGIS_HTTP_ADDR: 0.0.0.0:8080
     AEGIS_DATABASE_URL: postgres://aegis:${AEGIS_POSTGRES_PASSWORD:?Set AEGIS_POSTGRES_PASSWORD}@postgres:5432/aegisflow?sslmode=disable
     AEGIS_REDIS_URL: redis://redis:6379/0
     AEGIS_REDIS_NAMESPACE: aegisflow
     AEGIS_JWT_SECRET: ${AEGIS_JWT_SECRET:?Set AEGIS_JWT_SECRET}
+    # Deployment-target credential sealing (base64 of exactly 32 bytes).
+    # Empty disables secret storage; targets without credentials still work.
+    AEGIS_SECRET_KEY: ${AEGIS_SECRET_KEY:-}
+    # Retiring key for a rotation; only decryption, never encryption. Unset it
+    # after the rekey maintenance command reports nothing left to migrate.
+    AEGIS_SECRET_KEY_PREVIOUS: ${AEGIS_SECRET_KEY_PREVIOUS:-}
+    # Prometheus endpoint on a SEPARATE listener (empty = disabled). It has no
+    # user authentication: keep it on loopback, or expose it only through a
+    # protected scrape path. To scrape from the host, publish a host port for
+    # this listener (see the commented metrics snippet at the end).
+    AEGIS_METRICS_ADDR: ${AEGIS_METRICS_ADDR:-}
     AEGIS_BOOTSTRAP_USERNAME: ${AEGIS_BOOTSTRAP_USERNAME:-}
     AEGIS_BOOTSTRAP_PASSWORD: ${AEGIS_BOOTSTRAP_PASSWORD:-}
+    # Environments that require approval before a deployment executes.
+    # Unset defaults to production; an explicitly empty value disables approvals
+    # (that is why this uses the `-` form instead of `:-`).
+    AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS: ${AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS-production}
     AEGIS_APPROVAL_WEBHOOK_URL: ${AEGIS_APPROVAL_WEBHOOK_URL:-}
     AEGIS_APPROVAL_WEBHOOK_SECRET: ${AEGIS_APPROVAL_WEBHOOK_SECRET:-}
     AEGIS_APPROVAL_WEBHOOK_TIMEOUT: ${AEGIS_APPROVAL_WEBHOOK_TIMEOUT:-5s}
+    # Build execution. none is for local acceptance only (runs as the service
+    # account); container needs the host Docker socket, see the override snippet.
+    AEGIS_BUILD_SANDBOX: ${AEGIS_BUILD_SANDBOX:-none}
+    AEGIS_BUILD_IMAGE: ${AEGIS_BUILD_IMAGE:-alpine:3.20}
+    AEGIS_BUILD_CPU: ${AEGIS_BUILD_CPU:-2}
+    AEGIS_BUILD_MEMORY: ${AEGIS_BUILD_MEMORY:-2g}
+    AEGIS_BUILD_PIDS: ${AEGIS_BUILD_PIDS:-512}
+    AEGIS_BUILD_TIMEOUT: ${AEGIS_BUILD_TIMEOUT:-10m}
+    AEGIS_BUILD_DISK: ${AEGIS_BUILD_DISK:-2g}
+    AEGIS_BUILD_CLONE: ${AEGIS_BUILD_CLONE:-false}
+    # Local-path clone is a development escape hatch; never enable it in
+    # production. It also requires AEGIS_BUILD_CLONE=true.
+    AEGIS_BUILD_ALLOW_LOCAL_REPO: ${AEGIS_BUILD_ALLOW_LOCAL_REPO:-false}
+    # Per-address login quota (1-1000). The production default is 10; raise it
+    # only for test environments that drive several accounts from one address.
+    AEGIS_LOGIN_RATE_LIMIT: ${AEGIS_LOGIN_RATE_LIMIT:-10}
     AEGIS_ALLOWED_ORIGINS: ${AEGIS_ALLOWED_ORIGINS:-http://localhost:5173}
     AEGIS_COOKIE_SECURE: ${AEGIS_COOKIE_SECURE:-false}
     AEGIS_TRUSTED_PROXIES: 172.30.88.10/32
+  # BusyBox wget is part of the runtime image; /healthz is process liveness only.
+  # Readiness (PostgreSQL/Redis) is /readyz; the depends_on block below makes the
+  # replica wait for those dependencies before it starts.
+  healthcheck:
+    test: ['CMD', 'wget', '-q', '-O-', 'http://127.0.0.1:8080/healthz']
+    interval: 10s
+    timeout: 3s
+    retries: 10
+    start_period: 20s
   depends_on:
     postgres:
       condition: service_healthy
@@ -56,7 +101,12 @@ services:
     image: nginx:1.28-alpine
     ports: ['127.0.0.1:8080:8080']
     volumes: ['./deploy/nginx.conf:/etc/nginx/nginx.conf:ro']
-    depends_on: [api1, api2]
+    # Wait for both replicas to answer /healthz before accepting traffic.
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
     networks:
       aegis:
         ipv4_address: 172.30.88.10
@@ -68,3 +118,47 @@ networks:
 volumes:
   postgres-data:
   redis-data:
+
+# ---------------------------------------------------------------------------
+# Optional container sandbox (NOT enabled by default)
+# ---------------------------------------------------------------------------
+# Production recommendation: run each build in a one-shot container and mount
+# the host Docker socket. Mounting /var/run/docker.sock lets the API container
+# control the host Docker daemon, which is effectively host root: only do this
+# on a trusted single host or controlled internal network, never for untrusted
+# multi-tenant use. The app image already contains the docker CLI and git.
+#
+# Save the following as an override file (for example
+# deploy/docker-compose.sandbox.override.yaml; the file is not included in this
+# sample). The non-root aegis user needs the socket group as a supplemental
+# group, so pass the numeric GID of the host socket group as
+# AEGIS_DOCKER_SOCK_GID (Linux: stat -c '%g' /var/run/docker.sock; the group is
+# usually named docker or root). Both replicas are candidates for the single
+# build worker lease, so both need the socket.
+#
+# services:
+#   api1:
+#     environment:
+#       AEGIS_BUILD_SANDBOX: container
+#     group_add: ['${AEGIS_DOCKER_SOCK_GID:?Set AEGIS_DOCKER_SOCK_GID to the docker.sock group id}']
+#     volumes: ['/var/run/docker.sock:/var/run/docker.sock']
+#   api2:
+#     environment:
+#       AEGIS_BUILD_SANDBOX: container
+#     group_add: ['${AEGIS_DOCKER_SOCK_GID:?Set AEGIS_DOCKER_SOCK_GID to the docker.sock group id}']
+#     volumes: ['/var/run/docker.sock:/var/run/docker.sock']
+#
+# Then: AEGIS_DOCKER_SOCK_GID=$(stat -c '%g' /var/run/docker.sock) \
+#   docker compose -f compose.yaml -f deploy/docker-compose.sandbox.override.yaml up --build -d
+# See deploy/README.md "构建沙箱部署" for the security boundary and fail-closed
+# behaviour. DinD and a dedicated build runner are later options, not part of
+# this sample.
+#
+# Optional metrics scraping: AEGIS_METRICS_ADDR is passed through empty above.
+# To scrape the replicas from the host, set a listener inside the container
+# (for example AEGIS_METRICS_ADDR=0.0.0.0:9090) and publish a distinct host port
+# per replica, for example on api1:
+#   ports: ['127.0.0.1:9091:9090']
+# and on api2:
+#   ports: ['127.0.0.1:9092:9090']
+# Do not publish the metrics listener on a public interface.
