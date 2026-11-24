@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/user"
@@ -181,14 +182,17 @@ func userCommand(ctx context.Context, name, command, dir string) (*exec.Cmd, err
 
 // stop terminates a container that outlived its docker CLI client. Killing the
 // attached client (timeout, cancel, shutdown) does not stop the container, so
-// the executor calls this after any abnormal exit.
+// the executor calls this after any abnormal exit. A failed cleanup is warned
+// about rather than dropped: the container keeps consuming resources.
 func (s Sandbox) stop(containerName string) {
 	if s.Mode != SandboxContainer || containerName == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = exec.CommandContext(ctx, "docker", "kill", containerName).Run()
+	if err := exec.CommandContext(ctx, "docker", "kill", containerName).Run(); err != nil {
+		slog.Default().Warn("failed to clean up build container", "container", containerName, "error", err)
+	}
 }
 
 // shellCommand is the unisolated path: the system shell running as the service

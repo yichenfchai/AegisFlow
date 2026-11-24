@@ -100,6 +100,35 @@ func lockDeployment(ctx context.Context, tx *sql.Tx, id string) (Deployment, err
 	return deployment, err
 }
 
+// expirePendingApproval closes one overdue pending approval inside the caller's
+// transaction: the approval becomes expired under the system actor, its
+// deployment is rejected when it is still awaiting approval, approval.expire is
+// audited with the same detail the background scan writes, and the expired
+// notification is enqueued. The caller holds the approval row lock and owns the
+// commit, so the decision paths can close a row they find past expires_at
+// exactly like the scan would.
+func (s *Service) expirePendingApproval(ctx context.Context, tx *sql.Tx, approval Approval, now int64) (Approval, error) {
+	if _, err := tx.ExecContext(ctx, `UPDATE approvals SET status=$2,reason=$3,decided_at=$4 WHERE id=$1`,
+		approval.ID, ApprovalExpired, "approval expired", now); err != nil {
+		return Approval{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE deployments SET status=$2,finished_at=$3,detail=$4 WHERE id=$1 AND status=$5`,
+		approval.DeploymentID, DeployRejected, now, "approval expired", DeployAwaitingApproval); err != nil {
+		return Approval{}, err
+	}
+	approval.Status = ApprovalExpired
+	approval.Reason = "approval expired"
+	approval.DecidedAt = now
+	detail := "deployment=" + approval.DeploymentID + " reason=approval expired"
+	if err := writeAuditObject(ctx, tx, auth.Actor{}, ActionApprovalExpire, "approval", approval.ID, detail); err != nil {
+		return Approval{}, err
+	}
+	if err := s.enqueueApprovalNotification(ctx, tx, approval, notificationExpired); err != nil {
+		return Approval{}, err
+	}
+	return approval, nil
+}
+
 // normalizeApprovalReason trims and bounds the optional rejection reason; it
 // becomes an audit detail and a stored field, so control characters (including
 // line breaks) are rejected rather than escaped.
@@ -116,9 +145,11 @@ func normalizeApprovalReason(reason string) (string, error) {
 
 // Approve moves a pending approval to approved and its deployment from
 // awaiting_approval to queued, then wakes the worker. Repeating on an approved
-// approval is idempotent and writes no second audit row. A deployment that is
-// no longer awaiting approval is a conflict; the approval stays pending so the
-// expiry scan can close it.
+// approval is idempotent and writes no second audit row. A pending approval
+// already past expires_at is atomically expired (system actor, exactly like the
+// background scan) and answered with a conflict, so the TTL holds even before
+// the scan runs. A deployment that is no longer awaiting approval is a
+// conflict; the approval stays pending so the expiry scan can close it.
 func (s *Service) Approve(ctx context.Context, actor auth.Actor, approvalID string) (Approval, error) {
 	if !auth.ValidID(approvalID) {
 		return Approval{}, fmt.Errorf("%w: invalid approval id", ErrValidation)
@@ -138,6 +169,16 @@ func (s *Service) Approve(ctx context.Context, actor auth.Actor, approvalID stri
 	if approval.Status != ApprovalPending {
 		return Approval{}, fmt.Errorf("%w: only pending approvals can be approved", ErrConflict)
 	}
+	now := time.Now().Unix()
+	if approval.ExpiresAt <= now {
+		if _, err = s.expirePendingApproval(ctx, tx, approval, now); err != nil {
+			return Approval{}, err
+		}
+		if err = tx.Commit(); err != nil {
+			return Approval{}, err
+		}
+		return Approval{}, fmt.Errorf("%w: approval expired", ErrConflict)
+	}
 	deployment, err := lockDeployment(ctx, tx, approval.DeploymentID)
 	if err != nil {
 		return Approval{}, err
@@ -145,7 +186,6 @@ func (s *Service) Approve(ctx context.Context, actor auth.Actor, approvalID stri
 	if deployment.Status != DeployAwaitingApproval {
 		return Approval{}, fmt.Errorf("%w: deployment is no longer awaiting approval", ErrConflict)
 	}
-	now := time.Now().Unix()
 	approval, err = scanApproval(tx.QueryRowContext(ctx, `UPDATE approvals SET status=$2,decided_by=$3,decided_at=$4 WHERE id=$1 RETURNING `+approvalColumns,
 		approvalID, ApprovalApproved, actor.ID, now))
 	if err != nil {
@@ -170,7 +210,10 @@ func (s *Service) Approve(ctx context.Context, actor auth.Actor, approvalID stri
 
 // Reject moves a pending approval to rejected and its deployment to rejected.
 // Repeating on a rejected approval is idempotent and writes no second audit
-// row; every other non-pending status is a conflict.
+// row; every other non-pending status is a conflict. A pending approval already
+// past expires_at is atomically expired (system actor, the same semantics as the
+// background scan) and answered with a conflict, so the TTL holds even before
+// the scan runs and the operator's reason is not applied.
 func (s *Service) Reject(ctx context.Context, actor auth.Actor, approvalID, reason string) (Approval, error) {
 	if !auth.ValidID(approvalID) {
 		return Approval{}, fmt.Errorf("%w: invalid approval id", ErrValidation)
@@ -194,6 +237,16 @@ func (s *Service) Reject(ctx context.Context, actor auth.Actor, approvalID, reas
 	if approval.Status != ApprovalPending {
 		return Approval{}, fmt.Errorf("%w: only pending approvals can be rejected", ErrConflict)
 	}
+	now := time.Now().Unix()
+	if approval.ExpiresAt <= now {
+		if _, err = s.expirePendingApproval(ctx, tx, approval, now); err != nil {
+			return Approval{}, err
+		}
+		if err = tx.Commit(); err != nil {
+			return Approval{}, err
+		}
+		return Approval{}, fmt.Errorf("%w: approval expired", ErrConflict)
+	}
 	deployment, err := lockDeployment(ctx, tx, approval.DeploymentID)
 	if err != nil {
 		return Approval{}, err
@@ -201,7 +254,6 @@ func (s *Service) Reject(ctx context.Context, actor auth.Actor, approvalID, reas
 	if deployment.Status != DeployAwaitingApproval {
 		return Approval{}, fmt.Errorf("%w: deployment is no longer awaiting approval", ErrConflict)
 	}
-	now := time.Now().Unix()
 	approval, err = scanApproval(tx.QueryRowContext(ctx, `UPDATE approvals SET status=$2,decided_by=$3,reason=$4,decided_at=$5 WHERE id=$1 RETURNING `+approvalColumns,
 		approvalID, ApprovalRejected, actor.ID, reason, now))
 	if err != nil {
@@ -289,22 +341,9 @@ func (s *Service) ExpireApprovals(ctx context.Context, now int64) (int64, error)
 	rows.Close()
 	var expired int64
 	for _, approval := range pending {
-		if _, err = tx.ExecContext(ctx, `UPDATE approvals SET status=$2,reason=$3,decided_at=$4 WHERE id=$1`,
-			approval.ID, ApprovalExpired, "approval expired", now); err != nil {
-			return 0, err
-		}
-		if _, err = tx.ExecContext(ctx, `UPDATE deployments SET status=$2,finished_at=$3,detail=$4 WHERE id=$1 AND status=$5`,
-			approval.DeploymentID, DeployRejected, now, "approval expired", DeployAwaitingApproval); err != nil {
-			return 0, err
-		}
-		approval.Status = ApprovalExpired
-		approval.Reason = "approval expired"
-		approval.DecidedAt = now
-		detail := "deployment=" + approval.DeploymentID + " reason=approval expired"
-		if err = writeAuditObject(ctx, tx, auth.Actor{}, ActionApprovalExpire, "approval", approval.ID, detail); err != nil {
-			return 0, err
-		}
-		if err = s.enqueueApprovalNotification(ctx, tx, approval, notificationExpired); err != nil {
+		// The scan and the decision paths share one expiry helper so the audit
+		// detail, deployment transition and notification stay identical.
+		if _, err = s.expirePendingApproval(ctx, tx, approval, now); err != nil {
 			return 0, err
 		}
 		expired++
