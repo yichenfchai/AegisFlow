@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // run is the in-process worker loop: it waits for a wake signal (or a slow
@@ -70,7 +73,11 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 		s.finish(build, StatusFailed)
 		return
 	}
-	defer os.RemoveAll(workDir)
+	defer func() {
+		if err := os.RemoveAll(workDir); err != nil {
+			slog.Default().Warn("build workspace cleanup failed", "build_id", build.ID, "path", workDir, "error", err)
+		}
+	}()
 
 	writer := newLogWriter(s, build.ID, s.maxEvents)
 	defer writer.close()
@@ -152,6 +159,13 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 		s.finish(build, StatusFailed)
 		return
 	}
+	// The command owns a fresh process group and a cancellation policy that
+	// kills the whole group: a shell can background grandchildren that a plain
+	// Process.Kill would orphan. WaitDelay bounds how long Wait keeps waiting
+	// for output pipes inherited by a process it could not reap.
+	startProcessGroup(cmd)
+	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	cmd.WaitDelay = 10 * time.Second
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		s.finish(build, StatusFailed)
@@ -187,8 +201,10 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 		case <-ctxWatch:
 		}
 	}()
-	// The watchdog terminates the process when the API cancels the build or
-	// the server shuts down.
+	// The watchdog terminates the process tree when the API cancels the build,
+	// the execution deadline expires, the server shuts down or the disk limit
+	// trips. A status read failure is not a cancellation: it is logged and the
+	// next tick retries, so a transient database outage does not kill builds.
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	var watchWG sync.WaitGroup
 	watchWG.Add(1)
@@ -200,16 +216,31 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 			select {
 			case <-watchCtx.Done():
 				return
+			case <-runCtx.Done():
+				// Timeout, server shutdown, disk limit or a stop of the worker:
+				// the command-side context cancellation also calls
+				// cmd.Cancel; kill again so the group is addressed explicitly.
+				_ = killProcessGroup(cmd)
+				return
 			case <-ticker.C:
-				current, err := s.getByID(context.Background(), build.ID)
-				if err != nil || current.Status != StatusRunning {
-					_ = cmd.Process.Kill()
-					// Killing the attached docker client does not stop the
-					// container, so remove it explicitly.
-					s.sandbox.stop(containerName)
-					closeStreams()
-					return
+				// Bound the read: a hung database must not wedge the watchdog
+				// that also carries the cancel/timeout kills.
+				readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				current, err := s.getByID(readCtx, build.ID)
+				readCancel()
+				if err != nil {
+					slog.Default().Error("build status watchdog read failed; retrying", "build_id", build.ID, "error", err)
+					continue
 				}
+				if current.Status == StatusRunning {
+					continue
+				}
+				_ = killProcessGroup(cmd)
+				// Killing the attached docker client does not stop the
+				// container, so remove it explicitly.
+				s.sandbox.stop(containerName)
+				closeStreams()
+				return
 			}
 		}
 	}()
@@ -256,12 +287,16 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 }
 
 // finish writes the terminal state; it uses a fresh context so the final
-// update lands even during shutdown races.
+// update lands even during shutdown races. A failure is reported: an
+// unrecovered running row is exactly what the next lease holder will mark
+// interrupted, and silent loss of the terminal state hides that.
 func (s *Service) finish(build *Build, status string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, _ = s.db.ExecContext(ctx, `UPDATE builds SET status=$2, finished_at=$3 WHERE id=$1 AND status=$4`,
-		build.ID, status, time.Now().Unix(), StatusRunning)
+	if _, err := s.db.ExecContext(ctx, `UPDATE builds SET status=$2, finished_at=$3 WHERE id=$1 AND status=$4`,
+		build.ID, status, time.Now().Unix(), StatusRunning); err != nil {
+		slog.Default().Error("finalize build status failed", "build_id", build.ID, "status", status, "error", err)
+	}
 }
 
 // cancelled reports whether an operator moved the build out of running while a
@@ -306,11 +341,58 @@ func (w *logWriter) flushLoop() {
 	}
 }
 
+// stream reads newline-delimited output from a build pipe. A line longer than
+// maxLineBytes is truncated by append (on a rune boundary) and its remainder
+// discarded, but reading continues to EOF: stopping at the first overlong line
+// used to lose every later line and left the child blocked on a full pipe
+// until the build timed out. ReadSlice keeps the consumed buffer bounded no
+// matter how long a single line grows.
 func (w *logWriter) stream(reader io.Reader, stream string) {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes+1024)
-	for scanner.Scan() {
-		w.append(stream, scanner.Text())
+	buffered := bufio.NewReaderSize(reader, 32*1024)
+	line := make([]byte, 0, 256)
+	overlong := false
+	appendChunk := func(chunk []byte) {
+		if overlong || len(chunk) == 0 {
+			return
+		}
+		// Keep one byte over the limit so append can tell the line was cut;
+		// any further bytes of the same line are drained and dropped.
+		room := maxLineBytes + 1 - len(line)
+		if len(chunk) > room {
+			line = append(line, chunk[:room]...)
+			overlong = true
+			return
+		}
+		line = append(line, chunk...)
+	}
+	emit := func(complete bool) {
+		message := string(line)
+		if complete {
+			message = strings.TrimSuffix(message, "\n")
+		}
+		// bufio.ScanLines also dropped a trailing CR; keep that behaviour for
+		// the final line without a newline too.
+		message = strings.TrimSuffix(message, "\r")
+		w.append(stream, message)
+		line = line[:0]
+		overlong = false
+	}
+	for {
+		chunk, err := buffered.ReadSlice('\n')
+		appendChunk(chunk)
+		switch {
+		case err == nil:
+			emit(true)
+		case errors.Is(err, bufio.ErrBufferFull):
+			// The line is longer than the read buffer; keep draining it.
+		default:
+			// EOF, or the pipe was closed on cancellation: emit the final
+			// partial line, if any, and stop.
+			if len(line) > 0 || overlong {
+				emit(false)
+			}
+			return
+		}
 	}
 }
 
@@ -393,10 +475,19 @@ func (s *Service) appendEvents(events []LogEvent) error {
 	return tx.Commit()
 }
 
-// truncateBytes cuts at the byte limit on a rune boundary.
+// truncateBytes cuts at the byte limit on a rune boundary and marks the cut.
 func truncateBytes(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
 	cut := value[:limit]
-	for len(cut) > 0 && cut[len(cut)-1]&0xC0 == 0x80 {
+	// Drop a trailing incomplete UTF-8 sequence. DecodeLastRuneInString
+	// reports RuneError with size 1 for both an incomplete and an invalid
+	// trailing byte, while a real U+FFFD has size 3.
+	for len(cut) > 0 {
+		if r, size := utf8.DecodeLastRuneInString(cut); r != utf8.RuneError || size > 1 {
+			break
+		}
 		cut = cut[:len(cut)-1]
 	}
 	return cut + " …[truncated]"

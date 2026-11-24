@@ -174,7 +174,11 @@ func (s *Service) execute(ctx context.Context, deployment Deployment) {
 	}
 
 	// The watchdog aborts the HTTP request when an operator cancels or the row
-	// leaves running for any other reason (design §4, 300ms like builds).
+	// leaves running for any other reason (design §4, 300ms like builds). It
+	// must live until execute returns, not just until the response headers
+	// arrive: the body stream and the post-deploy health probes are part of the
+	// same execution and would otherwise keep the serial worker busy until the
+	// deployment timeout after a cancel.
 	watchDone := make(chan struct{})
 	var watchOnce sync.Once
 	stopWatch := func() { watchOnce.Do(func() { close(watchDone) }) }
@@ -183,7 +187,6 @@ func (s *Service) execute(ctx context.Context, deployment Deployment) {
 
 	start := time.Now()
 	resp, err := s.httpClient.Do(req)
-	stopWatch()
 	if err != nil {
 		if s.deploymentCancelled(deployment.ID) {
 			writer.systemf("deployment cancelled")
@@ -204,7 +207,7 @@ func (s *Service) execute(ctx context.Context, deployment Deployment) {
 		return
 	}
 	defer resp.Body.Close()
-	scanErr := writer.stream(resp.Body)
+	scanErr := writer.stream(resp.Body, secret)
 	if scanErr != nil {
 		// A read error after a status line is not a deployment failure by
 		// itself: the upstream already answered. Record the truncation and
@@ -231,7 +234,9 @@ func (s *Service) execute(ctx context.Context, deployment Deployment) {
 		// post-deploy health check is enabled, "succeeded" additionally means
 		// the target answered its health path within the attempts budget.
 		if s.healthAttempts > 0 {
-			result, healthy := s.verifyHealth(execCtx, writer, target.Endpoint, target.HealthPath, secret)
+			// Health probes share the cancellable run context: an operator
+			// cancel must abort a hanging probe together with the body stream.
+			result, healthy := s.verifyHealth(runCtx, writer, target.Endpoint, target.HealthPath, secret)
 			if !healthy {
 				switch {
 				case s.deploymentCancelled(deployment.ID):
@@ -262,8 +267,9 @@ func (s *Service) execute(ctx context.Context, deployment Deployment) {
 // verifyHealth re-probes the target's health path after the deploy endpoint
 // answered 2xx. It returns the last probe so the caller can record why the
 // deployment was still considered unhealthy. Probes share the execution
-// deadline, so a slow health endpoint can never outlive the deploy bound, and
-// they reuse the same credential handling as the connectivity check (the
+// deadline and the cancellation signal, so a slow health endpoint can never
+// outlive the deploy bound and an operator cancel aborts an in-flight probe,
+// and they reuse the same credential handling as the connectivity check (the
 // secret stays out of every event and detail).
 func (s *Service) verifyHealth(ctx context.Context, writer *deploymentEventWriter, endpoint, healthPath, secret string) (CheckResult, bool) {
 	var last CheckResult
