@@ -1,0 +1,22 @@
+# Automated dependency updates. Every Dependabot PR still needs the repository
+# owner's review plus the full CI gate before merge (see AGENTS.md): this file
+# only schedules the update PRs, it does not auto-merge them.
+version: 2
+updates:
+  # Frontend toolchain and runtime dependencies (package.json / package-lock.json).
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # Go module graph of the backend (backend/go.mod / backend/go.sum).
+  - package-ecosystem: gomod
+    directory: "/backend"
+    schedule:
+      interval: weekly
+
+  # Actions used by .github/workflows/*.yml.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
