@@ -1,4 +1,4 @@
-/** Real build pipeline API (P3). Business demo APIs stay in ./index. */
+/** Real build pipeline API. */
 import { apiRequest } from '@/stores/session'
 import type { Page } from '@/api/account'
 

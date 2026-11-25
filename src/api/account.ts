@@ -1,4 +1,4 @@
-/** Real account-management and administration APIs (P1). Business demo APIs stay in ./index. */
+/** Real account-management and administration APIs. */
 import { apiRequest } from '@/stores/session'
 import type { SessionUser } from '@/api/http'
 

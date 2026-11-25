@@ -1,4 +1,4 @@
-/** Real deployment-task and approval APIs (P4.2/P4.3); project-scoped reads and writes. */
+/** Real deployment-task and approval APIs; project-scoped reads and writes. */
 import { apiRequest } from '@/stores/session'
 import type { Page } from '@/api/account'
 

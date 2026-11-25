@@ -1,4 +1,4 @@
-/** Real deployment-target registry API (P4.1). Admin only. */
+/** Real deployment-target registry API; admin only. */
 import { apiRequest } from '@/stores/session'
 import type { Page } from '@/api/account'
 import { fmtRel } from '@/api/format'

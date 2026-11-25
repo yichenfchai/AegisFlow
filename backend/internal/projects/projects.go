@@ -20,6 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 )
 
@@ -32,6 +33,21 @@ var (
 	// caller to be one of its maintainers.
 	ErrForbidden = errors.New("forbidden")
 )
+
+// archivedProjectError is the shared rejection for every mutation of an
+// archived project except restoring it: field edits, membership changes and the
+// deployment write paths all report the same read-only reason.
+func archivedProjectError() error {
+	return fmt.Errorf("%w: archived project is read-only until restored", ErrConflict)
+}
+
+// isUniqueViolation reports a PostgreSQL unique_violation (SQLSTATE 23505). The
+// rename pre-check narrows the race but cannot close it, so the unique index
+// stays the authority and its violation must surface as a conflict.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
 
 // Audited project actions, recorded in the shared auth_audit trail.
 const (
@@ -198,6 +214,27 @@ func memberRole(ctx context.Context, q RowQuerier, userID, projectID string) (ro
 		return "", false, err
 	}
 	return role, true, nil
+}
+
+// requireActiveProject locks the project row and rejects writes to an archived
+// project. Taking the lock inside the write transaction orders a membership
+// change against the archive transition: whichever commits first wins, and a
+// caller that arrives after the archive sees the archived status. FOR SHARE is
+// enough (the archive path takes FOR UPDATE on the same row) and, unlike FOR
+// UPDATE, cannot deadlock two concurrent membership writes.
+func requireActiveProject(ctx context.Context, tx *sql.Tx, projectID string) error {
+	var status string
+	err := tx.QueryRowContext(ctx, `SELECT status FROM projects WHERE id=$1 FOR SHARE`, projectID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if status == StatusArchived {
+		return archivedProjectError()
+	}
+	return nil
 }
 
 // Source locations serve different deployment scenarios: https or SSH git URLs
@@ -498,7 +535,7 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 	// An archived project is read-only; only restoring it (or repeating the
 	// archive no-op) is accepted.
 	if current.Status == StatusArchived && fieldChange {
-		return nil, fmt.Errorf("%w: archived project is read-only until restored", ErrConflict)
+		return nil, archivedProjectError()
 	}
 	if fieldChange {
 		if err = validateInput(Input{Name: updated.Name, Description: updated.Description, RepoURL: updated.RepoURL, DefaultBranch: updated.DefaultBranch, BuildCommand: updated.BuildCommand}); err != nil {
@@ -534,6 +571,11 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 	updated.UpdatedAt = time.Now().Unix()
 	if _, err = tx.ExecContext(ctx, `UPDATE projects SET name=$2,description=$3,repo_url=$4,default_branch=$5,build_command=$6,visibility=$7,status=$8,updated_at=$9 WHERE id=$1`,
 		id, updated.Name, updated.Description, updated.RepoURL, updated.DefaultBranch, updated.BuildCommand, updated.Visibility, updated.Status, updated.UpdatedAt); err != nil {
+		// A concurrent rename can pass the pre-check above before either
+		// transaction commits; the unique index still rejects the loser.
+		if isUniqueViolation(err) {
+			return nil, fmt.Errorf("%w: project name already exists", ErrConflict)
+		}
 		return nil, err
 	}
 	action, detail := ActionUpdate, ""
@@ -615,6 +657,9 @@ func (s *Service) AddMember(ctx context.Context, actor auth.Actor, projectID, us
 	if err = s.AuthorizeWrite(ctx, tx, actor, projectID); err != nil {
 		return nil, err
 	}
+	if err = requireActiveProject(ctx, tx, projectID); err != nil {
+		return nil, err
+	}
 	var username string
 	err = tx.QueryRowContext(ctx, `SELECT username FROM auth_users WHERE id=$1`, userID).Scan(&username)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -655,7 +700,8 @@ func (s *Service) UpdateMemberRole(ctx context.Context, actor auth.Actor, projec
 	if err := validateMemberRole(role); err != nil {
 		return nil, err
 	}
-	if _, err := s.Get(ctx, actor, projectID); err != nil {
+	project, err := s.Get(ctx, actor, projectID)
+	if err != nil {
 		return nil, err
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -665,6 +711,15 @@ func (s *Service) UpdateMemberRole(ctx context.Context, actor auth.Actor, projec
 	defer tx.Rollback()
 	if err = s.AuthorizeWrite(ctx, tx, actor, projectID); err != nil {
 		return nil, err
+	}
+	if err = requireActiveProject(ctx, tx, projectID); err != nil {
+		return nil, err
+	}
+	// The creator keeps owner access for the lifetime of the project; like
+	// removal, a demotion is rejected as a validation error instead of silently
+	// dropping the owner role.
+	if userID == project.CreatedBy && role != RoleMaintainer {
+		return nil, fmt.Errorf("%w: the project creator cannot be demoted", ErrValidation)
 	}
 	member, err := scanMember(tx.QueryRowContext(ctx, `UPDATE project_members pm SET role=$3
 	 WHERE pm.project_id=$1 AND pm.user_id=$2
@@ -704,6 +759,9 @@ func (s *Service) RemoveMember(ctx context.Context, actor auth.Actor, projectID,
 	}
 	defer tx.Rollback()
 	if err = s.AuthorizeWrite(ctx, tx, actor, projectID); err != nil {
+		return err
+	}
+	if err = requireActiveProject(ctx, tx, projectID); err != nil {
 		return err
 	}
 	if userID == project.CreatedBy {
