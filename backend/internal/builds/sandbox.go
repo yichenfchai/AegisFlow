@@ -49,6 +49,28 @@ func (s *Service) WithSandbox(sandbox Sandbox) *Service {
 	return s
 }
 
+// containerUserArgument renders the docker `--user` flag for the service
+// identity. Running the build as the uid/gid that owns the 0700 workspace keeps
+// the bind mount writable and the container process non-root. known is false on
+// Windows, where Docker Desktop maps the client into a Linux VM whose user ids
+// do not match the host, so the flag is omitted there.
+func containerUserArgument(uid, gid int, known bool) []string {
+	if !known {
+		return nil
+	}
+	return []string{"--user", strconv.Itoa(uid) + ":" + strconv.Itoa(gid)}
+}
+
+// containerIdentity reports the service process owner for the container user
+// flag. os.Getuid/os.Getgid return -1 on Windows, where the flag must be
+// omitted instead of being passed as "--user -1:-1".
+func containerIdentity() (uid, gid int, known bool) {
+	if runtime.GOOS == "windows" {
+		return 0, 0, false
+	}
+	return os.Getuid(), os.Getgid(), true
+}
+
 // commandForBuild returns the process to start for one build. workDir is the
 // whole build workspace (mounted into a container) and execDir is where the
 // command runs: the workspace itself, or its repo/ subdirectory after a clone.
@@ -74,7 +96,7 @@ func (s Sandbox) commandForBuild(ctx context.Context, containerName, workDir, ex
 		if rel, err := filepath.Rel(workDir, execDir); err == nil && rel != "." {
 			inside = "/workspace/" + filepath.ToSlash(rel)
 		}
-		cmd := exec.CommandContext(ctx, "docker",
+		args := []string{
 			"run", "--rm", "--name", containerName,
 			"--network", "none",
 			"--cpus", s.CPU,
@@ -84,6 +106,12 @@ func (s Sandbox) commandForBuild(ctx context.Context, containerName, workDir, ex
 			"--security-opt", "no-new-privileges",
 			"--read-only",
 			"--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+		}
+		// Run the build as the service identity: the bind-mounted 0700
+		// workspace stays writable and the container never runs as root.
+		uid, gid, known := containerIdentity()
+		args = append(args, containerUserArgument(uid, gid, known)...)
+		args = append(args,
 			"-v", workDir+":/workspace",
 			"-w", inside,
 			"-e", "HOME=/workspace",
@@ -91,6 +119,7 @@ func (s Sandbox) commandForBuild(ctx context.Context, containerName, workDir, ex
 			s.Image,
 			"sh", "-c", command,
 		)
+		cmd := exec.CommandContext(ctx, "docker", args...)
 		cmd.Dir = workDir
 		cmd.Env = dockerClientEnv()
 		return cmd, nil
@@ -158,6 +187,12 @@ func lookupSandboxUser(name string) (*user.User, error) {
 	account, err := user.Lookup(name)
 	if err != nil {
 		return nil, fmt.Errorf("look up build user %q: %w", name, err)
+	}
+	// The mode exists only to drop privileges; a uid-0 target would silently
+	// undo that, so every path (startup probe, clone and command construction)
+	// rejects it before anything runs.
+	if account.Uid == "0" {
+		return nil, fmt.Errorf("build user %q resolves to uid 0 (root); user sandbox mode requires a dedicated non-root account", name)
 	}
 	return account, nil
 }

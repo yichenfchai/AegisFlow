@@ -58,7 +58,7 @@ server: {
 | 方法 | 路径 | 请求与权限 | 成功 data |
 | --- | --- | --- | --- |
 | GET | /healthz | 无鉴权 | `{status:"ok"}` |
-| GET | /readyz | 无鉴权，PostgreSQL + Redis 检查 | `{status:"ready"}` |
+| GET | /readyz | 无鉴权，PostgreSQL + Redis 检查（结果缓存 1s） | `{status:"ready"}` |
 | POST | /api/v1/auth/login | `{username,password,remember?:boolean}`；Origin 必需 | `{user,accessToken,expiresIn}` |
 | POST | /api/v1/auth/refresh | **`{}`** + Cookie；Origin 必需 | `{user,accessToken,expiresIn}` |
 | POST | /api/v1/auth/logout | **`{}`** + Cookie（可缺省）；Origin 必需 | `{loggedOut:true}` |
@@ -105,7 +105,7 @@ server: {
 | POST | /api/v1/approvals/{id}/approve | Bearer + admin；**`{}`** | Approval；重复批准幂等 200，冲突 409 |
 | POST | /api/v1/approvals/{id}/reject | Bearer + admin；`{reason?}`（可选、trim、单行、≤512 字节） | Approval；重复拒绝幂等 200，冲突 409 |
 
-**所有 auth POST（包括 login）强制恰好一个 Origin，且精确匹配允许列表**；缺失、不匹配、`null` 或跨站请求返回 `403 origin_denied`，在登录、轮换和退出之前拦截。非浏览器 curl/脚本也必须带该 Origin。其他请求如果携带 Origin 也须符合允许列表。全局拒绝 `Sec-Fetch-Site: cross-site`。允许来源响应包含 `Access-Control-Allow-Origin: <原始允许源>`、`Access-Control-Allow-Credentials: true`，`Vary: Origin, Sec-Fetch-Site`；OPTIONS 额外 Vary 请求方法与请求头，允许 GET/POST/OPTIONS 和 Authorization/Content-Type。
+**所有 auth POST（包括 login）强制恰好一个 Origin，且精确匹配允许列表**；缺失、不匹配、`null` 或跨站请求返回 `403 origin_denied`，在登录、轮换和退出之前拦截。非浏览器 curl/脚本也必须带该 Origin。其他请求如果携带 Origin 也须符合允许列表。全局拒绝 `Sec-Fetch-Site: cross-site`。允许来源响应包含 `Access-Control-Allow-Origin: <原始允许源>`、`Access-Control-Allow-Credentials: true`，`Vary: Origin, Sec-Fetch-Site`；OPTIONS 额外 Vary 请求方法与请求头，允许 `GET, POST, PATCH, DELETE, OPTIONS` 和 Authorization/Content-Type（覆盖全部 PATCH/DELETE 端点）。
 
 ### 项目可见性与成员（P1 + P2）
 
@@ -122,11 +122,11 @@ server: {
 - 状态机六态：`queued → running → succeeded/failed/cancelled`，只有持有 worker 租约的实例在启动后把遗留的 `running` 统一转为 `interrupted`。`interrupted` 表示进程被打断而不是业务失败，需要重新触发。租约是 PostgreSQL 会话级 advisory lock（按 database + schema 隔离）：同一部署只有一个副本执行与恢复，其余副本待命并在下一重试周期接管；连接或进程消失时锁自动释放。持有人在执行期间每 5 秒（单次 3 秒超时）用租约专用连接探活，失败即记录告警、取消本次执行上下文并回到待命循环，避免锁已释放却继续领取、与接管副本并行。它保证"同一时刻一个 worker"，不提供多 worker 并行吞吐。
 - 触发时固化命令、分支、仓库地址（`repoUrl`）与触发人快照，构建号在每个项目内自增；之后修改项目不影响已触发的构建。命令在系统临时目录执行（Unix `sh -c`、Windows `cmd /c`），结束后删除目录。目录显式以 0700 创建；构建命令只获得显式白名单环境变量（`PATH`、`HOME`、`TMPDIR`/`TMP`/`TEMP`、`LANG` 等，Windows 另加 `SYSTEMROOT` 等系统变量），**不继承** `AEGIS_*` 服务凭据。
 - 仓库 clone（`AEGIS_BUILD_CLONE=true` 且构建有 `repoUrl`）：开始时用 `git clone --depth 1 --single-branch --branch <构建分支>` 把仓库拉到 `repo/`，命令在该目录执行；clone 在宿主侧完成（容器模式容器无网络），并沿用同一执行身份（`user` 模式下即为构建账号）。只支持无凭据的 https / `git@` 地址；含内联凭据的 URL 直接失败，私有仓库凭据本批不支持；`file:///` 与绝对路径仅在 `AEGIS_BUILD_ALLOW_LOCAL_REPO=true` 时允许。clone 失败写一条脱敏后的 `git clone failed: ...` system 日志并把构建置 `failed`。未开启 clone 时若项目配了 `repoUrl`，会显式记录"cloning is disabled"并在空工作区执行。
-- 每个构建工作区受 `AEGIS_BUILD_DISK` 限制：worker 每 2 秒统计 `repo/` 与生成文件的大小，超限即取消构建（含容器）并写 system 日志置 `failed`。这是尽力而为的看门狗，不是文件系统配额，超限时最多会越过上限一个轮询周期的写入量。
+- 每个构建工作区受 `AEGIS_BUILD_DISK` 限制：worker 每 2 秒统计 `repo/` 与生成文件的大小，超限即取消构建（含容器）并写 system 日志置 `failed`。看门狗 fail-closed：遍历中出现任何错误（目录不可读、`stat`/`Info` 失败、条目在统计途中消失）都视为"无法确认上限"，同样立即取消构建、置 `failed`，并在 system 日志写明原因；不会把"读不到大小"当成"未超限"放行。这是尽力而为的看门狗，不是文件系统配额，正常统计时超限最多会越过上限一个轮询周期的写入量。
 - worker 随服务进程启动、单并发运行；持有租约的副本用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取任务，`AEGIS_BUILD_TIMEOUT`（默认 10m，最大 24h，启动时经 config 接到 worker）到期、收到取消请求、服务退出或磁盘超限时终止整个进程树：Unix 使用独立进程组并对组发 `SIGKILL`，Windows 使用 `taskkill /PID <pid> /T /F`（失败回退 `Process.Kill`），并设置 10 秒 `WaitDelay` 兜底被继承的输出管道。取消通过 300ms 状态看门狗传播到正在运行的命令；看门狗读库失败只记录错误并在下个周期重试，不当作取消，终态写入失败同样记录错误日志。待命副本不领取、不恢复，只定期重试租约。
-- 日志按行写入 `build_log_events`，批量 500ms 落库；单行超过 4096 字节按 rune 边界截断并追加 `…[truncated]`，但读取继续到 EOF——单行超长不再丢失后续输出或让子进程卡在写满的管道上；单构建最多记录 5000 条事件，超限后追加一条 system 截断说明。读取有两条通道：`GET /builds/{id}/events` 的 SSE 推送（`status`/`logs`/`done` 帧，`Last-Event-ID` 或 `after` 续传，15s 心跳，终态后等日志静默 3s 再结束，单连接上限 10 分钟后发 `reconnect`；服务关停时向活跃流发 `{"reason":"shutdown"}` 帧后立即返回，不阻塞优雅退出），以及保留的 `after` 游标轮询作为回退。SSE 由前端用 `fetch` 流式读取并携带 Bearer——`EventSource` 无法设置 Authorization 头，token 不放进 URL。
-- 执行隔离由 `AEGIS_BUILD_SANDBOX` 决定。`container` 模式下每个构建是一个一次性容器：`--network none`、`--read-only` 根文件系统、`--cap-drop ALL`、`no-new-privileges`，只把构建目录挂到 `/workspace`，CPU/内存/进程数由 `--cpus`/`--memory`/`--pids-limit` 限制；超时、取消或服务退出时显式 `docker kill` 容器，避免留下孤儿进程。`user` 模式在 Linux 上把 clone 与命令都经 `setpriv` 降权到 `AEGIS_BUILD_USER`，工作区 chown 给该账号，启动时校验 root、账号存在与 `setpriv` 可用，否则拒绝启动；Windows 不支持该模式。`none` 模式仍以服务账号执行，只用于开发。所有模式都只注入最小环境变量白名单，不继承 `AEGIS_*` 服务凭据。
-- 输出脱敏已实现：stdout/stderr 在落库前按模式替换（`AEGIS_*=...`、`Bearer ...`、带内联凭据的 `postgres://`/`redis://` URL、`ghp_`/`github_pat_`/`glpat-`/`AKIA`/`xox[baprs]-`/`sk-` 前缀、JWT、PEM 私钥头）为 `[redacted]`；构建结束时追加一条 system 统计行（只记数量）。命中但无法确认移除的行整行丢弃并计数（fail closed）。多行私钥正文与自由文本口令不覆盖。
+- 日志按行写入 `build_log_events`，批量 500ms 落库；单行超过 4096 字节按 rune 边界截断并追加 `…[truncated]`，但读取继续到 EOF——单行超长不再丢失后续输出或让子进程卡在写满的管道上；单构建最多记录 5000 条事件，超限后追加一条 system 截断说明。读取有两条通道：`GET /builds/{id}/events` 的 SSE 推送（`status`/`logs`/`done` 帧，`Last-Event-ID` 或 `after` 续传，15s 心跳，终态后等日志静默 3s 再结束，单连接上限 10 分钟后发 `reconnect`，并发连接上限默认 64（超出时新流立即返回 503 `not_ready`），单帧写入有 10s 超时以隔离不读数据的慢客户端；服务关停时向活跃流发 `{"reason":"shutdown"}` 帧后立即返回，不阻塞优雅退出），以及保留的 `after` 游标轮询作为回退。SSE 由前端用 `fetch` 流式读取并携带 Bearer——`EventSource` 无法设置 Authorization 头，token 不放进 URL。
+- 执行隔离由 `AEGIS_BUILD_SANDBOX` 决定。`container` 模式下每个构建是一个一次性容器：`--network none`、`--read-only` 根文件系统、`--cap-drop ALL`、`no-new-privileges`，只把构建目录挂到 `/workspace`，CPU/内存/进程数由 `--cpus`/`--memory`/`--pids-limit` 限制；在非 Windows 平台还以服务进程的 uid/gid 通过 `--user <uid>:<gid>` 运行（绑定挂载的 0700 工作区因此对容器可写，且容器内进程不是 root）；Windows（Docker Desktop）的宿主 uid 不映射进其 Linux VM，因此不添加该参数，隔离依赖 Docker Desktop 自身的文件共享与用户映射。超时、取消或服务退出时显式 `docker kill` 容器，避免留下孤儿进程。`user` 模式在 Linux 上把 clone 与命令都经 `setpriv` 降权到 `AEGIS_BUILD_USER`，工作区 chown 给该账号，启动时校验 root、账号存在、目标账号 uid 不为 0（root 不能作为构建账号）与 `setpriv` 可用，否则拒绝启动；Windows 不支持该模式。`none` 模式仍以服务账号执行，只用于开发。所有模式都只注入最小环境变量白名单，不继承 `AEGIS_*` 服务凭据。
+- 输出脱敏已实现：所有落库行（stdout/stderr 与 system 生命周期行）在写入前经过同一套规则——`AEGIS_*=...`、`Bearer ...`、`Authorization: Basic <base64>`/`Basic <base64>`、任意 scheme 的内联凭据 URL（`postgres://`/`redis://`/`mysql://`、带 userinfo 的 `https://` 等，用户部分可省略）替换为 `[redacted]`；`ghp_`/`github_pat_`/`glpat-`/`AKIA`/`xox[baprs]-`/`sk-` 前缀、JWT、PEM 私钥头替换为对应的 `[redacted-*]` 标记。多行 PEM 私钥由跨行状态机处理：从 `-----BEGIN ... PRIVATE KEY-----`（RSA/EC/OPENSSH/普通）到匹配的 `-----END ... PRIVATE KEY-----` 之间的每一行（含首尾）都以 system 流写成 `[redacted]`，块内任意内容不落库；缺少 END 时该流后续行持续脱敏（fail closed）；stdout/stderr 各自维护块状态，块外正常输出不受影响。构建结束时追加一条 system 统计行（只记数量）。命中但无法确认移除的行整行丢弃并计数（fail closed）。自由文本口令仍不覆盖。
 - 本批边界（仍不做）：私有仓库凭据（部署密钥 / token）、构建阶段与产物、构建缓存、多 worker 并行吞吐。`container` 与 `user` 模式已提供隔离和资源上限；`none` 模式仅用于开发。
 
 ### 部署目标（P4 第一批）
@@ -231,7 +231,7 @@ User 字段为 `id/username/displayName/role/disabled/createdAt`，无密码或�
 - PostgreSQL 版本化 schema_migrations 在 advisory 事务锁下执行，未知更高版本或缺号会拒绝启动。首管理员初始化独立加锁，多个实例同时启动也只创建一位管理员。
 - Refresh/Logout 统一锁定 session 行，再读取 token 状态；同一会话跨多个实例串行化刷新与撤销，重放撤销会提交到共享数据库。数据库事务使用 READ COMMITTED。
 - SQLite 开发库不会自动导入 PostgreSQL。现阶段开发数据可重新初始化；如有需要保留的用户，必须先备份并单独编写审核过的离线迁移，保留 bcrypt 哈希、校验用户名大小写唯一性并撤销旧会话，不能直接复制文件或将 SQLite 挂共享盘。
-- /readyz 同时检查 PostgreSQL 和 Redis；Redis 故障使就绪返回 503，登录也 503。已存在 Bearer 会话在 PostgreSQL 正常时仍可鉴权；负载均衡是否摘除整个实例取决于运维策略。
+- /readyz 同时检查 PostgreSQL 和 Redis；Redis 故障使就绪返回 503，登录也 503。探测结果在进程内缓存 1 秒（成功与失败都缓存，探测超时仍为 2 秒），因此无鉴权的 /readyz 轮询不会按请求数放大对依赖的负载。已存在 Bearer 会话在 PostgreSQL 正常时仍可鉴权；负载均衡是否摘除整个实例取决于运维策略。
 - 请求 ID、slog JSON 访问日志、鉴权操作日志、panic 恢复、安全响应头、HTTP 超时、信号触发优雅退出；日志不记录密码、Cookie、令牌、正文。
 - 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）、部署目标增删改查与探测（deployment_target.create / deployment_target.update / deployment_target.remove / deployment_target.check）、部署创建/取消/回滚（deployment.create / deployment.cancel / deployment.rollback）。构建、成员、部署目标与部署任务审计都和状态变更在同一事务提交；幂等重复取消不重复记账，detail 只写项目/成员与构建号或角色（重试额外写 `retry_of=<原构建号>`），不写命令或凭据。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），支持 `action`/`objectType`/`result`/`actor`/`from`/`to` 服务端筛选（AND 组合，同时作用于分页与 total；`from`/`to` 接受 RFC3339 或 `YYYY-MM-DD`，只给日期时 `to` 覆盖该 UTC 全天）。
 - 审计保留策略可选：`AEGIS_AUDIT_RETENTION` 未设置或为 `0` 时永久保留（默认）；设置 24h–8760h 后，与过期会话清理共用的小时任务会删除早于该窗口的审计行。删除是运维显式选择，默认不丢证据。
@@ -252,7 +252,17 @@ go test -race ./...
 $env:AEGIS_OPS_DATABASE_URL = $env:AEGIS_TEST_DATABASE_URL
 $env:AEGIS_OPS_REDIS_URL = 'redis://localhost:6379/2'
 go test ./cmd/server/ -run TestRealProcessLifecycle -count=1
+# 已知漏洞扫描（CI 的 security 任务执行同一命令；当前 continue-on-error 非阻断）：
+go install golang.org/x/vuln/cmd/govulncheck@latest
+& "$(go env GOPATH)/bin/govulncheck" ./...
+# CI 的 windows 任务在 Windows 上跑不依赖 PostgreSQL/Redis 的部分：
+gofmt -l ./cmd ./internal   # 输出为空
+go vet ./...
+go build ./...
+go test ./internal/config ./internal/metrics -count=1
 ```
+
+CI（[.github/workflows/ci.yml](../.github/workflows/ci.yml)）在 `backend`（Linux、真实 PostgreSQL + Redis、`-race`）、`frontend` 与 `e2e` 之外还运行：`security` 任务的 `govulncheck ./...`（当前非阻断；发现项与升级建议见 PR 风险节）、`windows` 任务（Windows 上执行上面这组 gofmt/vet/build 与不依赖外部服务的单测，命令相同，本机 Windows 上可直接复核）和 `infra` 任务（`docker build -t aegisflow-api:ci ./backend`、占位环境变量下的 `docker compose config -q`、网关 `nginx -t`）。Windows 任务的测试范围只有 `internal/config` 与 `internal/metrics`，完整测试套件仍以 `backend` 任务为准。
 
 分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计、可见性读过滤与成员增删改、创建者不可移除与 404 枚举语义）、构建流水线（触发校验与每项目编号、成功与失败退出码、超时、取消与幂等、重启恢复为 interrupted、跨副本 worker 租约互斥与待命接管、SSE 推送与写超时豁免/终态收尾/非法游标、游标日志分页与截断、RBAC 与未接线 503）、部署目标（校验与默认值、大小写唯一与冲突、凭据 AES-256-GCM 加密与 AAD 绑定、更新时保留/替换/清空语义、非配置密钥时拒绝写入、探测成功/非 2xx/超时/网络错误与结果落库、事务内审计、admin-only RBAC 与未接线 503）、部署任务（项目/目标/版本/buildId 校验、每项目编号分配与目标快照、worker 成功/失败/超时/取消/重启恢复、部署后健康复查（首次通过/重试后通过/始终不健康/关闭）、事件游标分页、回滚版本选择与 400/409、事务内审计、目标被引用时 409、worker 租约互斥、项目写权限叠加与可见性 RBAC）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目/构建/部署目标端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
 

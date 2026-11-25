@@ -4,10 +4,13 @@ name: PR text
 # on the way to GitHub: a lossy code-page conversion turns Chinese into '?', and
 # a shell that interprets \a \b \f \r silently eats the first letter of words.
 # The stored body is the only thing GitHub has, so validate it with the same
-# script contributors run locally (scripts/pr-text.ps1).
+# script contributors run locally (scripts/pr-text.ps1). The title is validated
+# against the conventional-commit prefixes required by AGENTS.md (rule 5).
 on:
   pull_request:
-    types: [opened, edited, reopened]
+    # synchronize re-runs after a push, so the status always reflects the
+    # current head instead of a stale run from an earlier commit.
+    types: [opened, edited, reopened, synchronize]
 
 permissions:
   contents: read
@@ -23,6 +26,17 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      # The title travels through the environment so neither YAML nor the shell
+      # interprets it; only the regex below decides. Same prefixes as AGENTS.md.
+      - name: Validate the PR title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -eu
+          if ! printf '%s' "$PR_TITLE" | grep -Eq '^(feat|fix|refactor|test|docs|chore|ci)(\([a-z0-9._-]+\))?: .+'; then
+            printf 'error: PR title must use a conventional-commit prefix, e.g. "fix(api): correct login retry": %s\n' "$PR_TITLE" >&2
+            exit 1
+          fi
       # The body travels through the environment, so no shell quoting or
       # backslash processing touches it; printf '%s' copies the bytes verbatim
       # (unlike echo -e / printf %b, which is what corrupted PR #43 and #44).
