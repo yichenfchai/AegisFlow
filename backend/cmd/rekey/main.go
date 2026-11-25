@@ -81,8 +81,8 @@ func run(args []string) error {
 	if *apply {
 		mode = "applied"
 	}
-	fmt.Printf("%s: scanned=%d already_current=%d reencrypted=%d failed=%d\n",
-		mode, report.Scanned, report.AlreadyCurrent, report.Reencrypted, report.Failed)
+	fmt.Printf("%s: scanned=%d already_current=%d reencrypted=%d skipped_concurrent=%d failed=%d\n",
+		mode, report.Scanned, report.AlreadyCurrent, report.Reencrypted, report.SkippedConcurrent, report.Failed)
 	if !*apply && report.Reencrypted > 0 {
 		fmt.Println("nothing was written; re-run with -apply to re-encrypt these rows")
 	}

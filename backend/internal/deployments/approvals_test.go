@@ -438,6 +438,93 @@ func TestWorkerExpiryScanClosesApproval(t *testing.T) {
 	}
 }
 
+// TestApproveAndRejectExpiredApprovalAtomic regression: a pending approval past
+// its expires_at may stay pending until the 30s background scan runs.
+// Approve/Reject used to accept it in that window, so the TTL was only
+// eventually consistent. The decision path must detect the overdue row under
+// the same FOR UPDATE lock, atomically expire it with the system actor exactly
+// like the scan, and answer 409.
+func TestApproveAndRejectExpiredApprovalAtomic(t *testing.T) {
+	s, db, registry := approvalService(t)
+	ctx := context.Background()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	project := taskProject(t, registry, "approval-expired-tx")
+	target := approvalTarget(t, s, "expired-approve-target", upstream.URL, EnvironmentProduction)
+
+	deployment, err := s.CreateDeployment(ctx, testActor, project.ID, DeployInput{TargetID: target.ID, Version: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Expire the row without running the background scan: this is exactly the
+	// window in which a decision used to be accepted.
+	if _, err := db.Exec(`UPDATE approvals SET expires_at=$2 WHERE deployment_id=$1`,
+		deployment.ID, time.Now().Add(-time.Minute).Unix()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Approve(ctx, testActor, deployment.ApprovalID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("approve of an expired approval error = %v, want ErrConflict", err)
+	}
+	approval := approvalForDeployment(t, s, deployment.ID)
+	if approval.Status != ApprovalExpired || approval.Reason != "approval expired" || approval.DecidedBy != "" || approval.DecidedAt == 0 {
+		t.Fatalf("approval after expired approve = %+v", approval)
+	}
+	got, err := s.GetDeployment(ctx, testActor, deployment.ID)
+	if err != nil || got.Status != DeployRejected || got.Detail != "approval expired" || got.FinishedAt != approval.DecidedAt {
+		t.Fatalf("deployment after expired approve = %+v err=%v", got, err)
+	}
+	audit := approvalAuditRows(t, db, approval.ID)
+	expireRow, expireCount := approvalAction(audit, ActionApprovalExpire)
+	if expireCount != 1 || expireRow.ActorID != "" || expireRow.Detail != "deployment="+deployment.ID+" reason=approval expired" {
+		t.Fatalf("expired approve audit = %+v", audit)
+	}
+	if _, approveCount := approvalAction(audit, ActionApprovalApprove); approveCount != 0 {
+		t.Fatalf("expired approve wrote an approve audit row: %+v", audit)
+	}
+	if len(audit) != 2 {
+		t.Fatalf("expired approve audit rows = %+v, want request+expire", audit)
+	}
+	// The background scan has nothing left to close, and repeating the decision
+	// remains a conflict.
+	if expired, err := s.ExpireApprovals(ctx, time.Now().Unix()); err != nil || expired != 0 {
+		t.Fatalf("scan after atomic expiry = %d err=%v", expired, err)
+	}
+	if _, err := s.Approve(ctx, testActor, deployment.ApprovalID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("repeated approve error = %v, want ErrConflict", err)
+	}
+
+	// Reject on an overdue pending approval behaves the same: the operator's
+	// reason is not applied, the system expiry reason is.
+	rejectDeployment, err := s.CreateDeployment(ctx, testActor, project.ID, DeployInput{TargetID: target.ID, Version: "v2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE approvals SET expires_at=$2 WHERE deployment_id=$1`,
+		rejectDeployment.ID, time.Now().Add(-time.Minute).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reject(ctx, testActor, rejectDeployment.ApprovalID, "late window"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("reject of an expired approval error = %v, want ErrConflict", err)
+	}
+	rejectedApproval := approvalForDeployment(t, s, rejectDeployment.ID)
+	if rejectedApproval.Status != ApprovalExpired || rejectedApproval.Reason != "approval expired" || rejectedApproval.DecidedBy != "" || rejectedApproval.DecidedAt == 0 {
+		t.Fatalf("approval after expired reject = %+v", rejectedApproval)
+	}
+	rejectedDeployment, err := s.GetDeployment(ctx, testActor, rejectDeployment.ID)
+	if err != nil || rejectedDeployment.Status != DeployRejected || rejectedDeployment.Detail != "approval expired" {
+		t.Fatalf("deployment after expired reject = %+v err=%v", rejectedDeployment, err)
+	}
+	rejectAudit := approvalAuditRows(t, db, rejectedApproval.ID)
+	if _, rejectCount := approvalAction(rejectAudit, ActionApprovalReject); rejectCount != 0 {
+		t.Fatalf("expired reject wrote a reject audit row: %+v", rejectAudit)
+	}
+	if row, count := approvalAction(rejectAudit, ActionApprovalExpire); count != 1 || row.ActorID != "" ||
+		row.Detail != "deployment="+rejectDeployment.ID+" reason=approval expired" {
+		t.Fatalf("expired reject audit = %+v", rejectAudit)
+	}
+}
+
 func TestListApprovals(t *testing.T) {
 	s, _, registry := approvalService(t)
 	ctx := context.Background()

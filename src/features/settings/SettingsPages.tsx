@@ -449,7 +449,7 @@ function AboutTab() {
             <div>© 2026 AegisFlow</div>
           </div>
           <p className="text-body-sm text-outline">
-            业务模块（项目、构建、部署、审批等）按 TODO 里程碑推进；当前版本提供真实账号管理与审计。
+            项目注册表、构建闭环、部署目标、部署任务与部署审批均已接入真实接口；审查、安全扫描与知识库等模块属于后续阶段。
           </p>
         </div>
       </section>

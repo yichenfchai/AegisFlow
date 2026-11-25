@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
@@ -382,5 +383,167 @@ func TestPrivateProjectWritesNeedMaintainer(t *testing.T) {
 		if !seen[want] {
 			t.Fatalf("missing audit action %s in %v", want, seen)
 		}
+	}
+}
+
+// Archived projects are read-only for membership writes as well: adding,
+// changing and removing a member are conflicts, and restoring the project
+// re-opens exactly the same operations (decisions-2026-11-23 §3).
+func TestArchivedProjectRejectsMemberWrites(t *testing.T) {
+	s, db := testService(t)
+	ctx := context.Background()
+	seedUser(t, db, memberActor.ID, memberActor.Username)
+	seedUser(t, db, viewerActor.ID, viewerActor.Username)
+	project, err := s.Create(ctx, adminActor, Input{Name: "archive-member-writes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.AddMember(ctx, adminActor, project.ID, memberActor.ID, RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Update(ctx, adminActor, project.ID, Patch{Archived: boolPtr(true)}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = s.AddMember(ctx, adminActor, project.ID, viewerActor.ID, RoleViewer); !errors.Is(err, ErrConflict) {
+		t.Fatalf("archived add member error = %v, want ErrConflict", err)
+	} else if !strings.Contains(err.Error(), "archived project is read-only until restored") {
+		t.Fatalf("archived add member message = %q", err)
+	}
+	if _, err = s.UpdateMemberRole(ctx, adminActor, project.ID, memberActor.ID, RoleMaintainer); !errors.Is(err, ErrConflict) {
+		t.Fatalf("archived update member role error = %v, want ErrConflict", err)
+	}
+	if err = s.RemoveMember(ctx, adminActor, project.ID, memberActor.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("archived remove member error = %v, want ErrConflict", err)
+	}
+
+	// Unarchive is the one accepted write; afterwards the member writes work.
+	if _, err = s.Update(ctx, adminActor, project.ID, Patch{Archived: boolPtr(false)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.AddMember(ctx, adminActor, project.ID, viewerActor.ID, RoleViewer); err != nil {
+		t.Fatalf("add member after restore = %v", err)
+	}
+	if _, err = s.UpdateMemberRole(ctx, adminActor, project.ID, memberActor.ID, RoleMaintainer); err != nil {
+		t.Fatalf("update member role after restore = %v", err)
+	}
+	if err = s.RemoveMember(ctx, adminActor, project.ID, memberActor.ID); err != nil {
+		t.Fatalf("remove member after restore = %v", err)
+	}
+}
+
+// The creator keeps owner access for the lifetime of the project: a role
+// downgrade is a validation error and leaves the stored role untouched, while
+// other members keep changing roles normally (decisions-2026-11-23 §4).
+func TestProjectCreatorCannotBeDemoted(t *testing.T) {
+	s, db := testService(t)
+	ctx := context.Background()
+	seedUser(t, db, memberActor.ID, memberActor.Username)
+	project, err := s.Create(ctx, adminActor, Input{Name: "creator-protection", Visibility: VisibilityPrivate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.AddMember(ctx, adminActor, project.ID, memberActor.ID, RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = s.UpdateMemberRole(ctx, adminActor, project.ID, adminActor.ID, RoleViewer); !errors.Is(err, ErrValidation) {
+		t.Fatalf("creator demotion error = %v, want ErrValidation", err)
+	} else if !strings.Contains(err.Error(), "creator cannot be demoted") {
+		t.Fatalf("creator demotion message = %q", err)
+	}
+	members, err := s.ListMembers(ctx, adminActor, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	creatorRole := ""
+	for _, member := range members {
+		if member.UserID == adminActor.ID {
+			creatorRole = member.Role
+		}
+	}
+	if creatorRole != RoleMaintainer {
+		t.Fatalf("creator role after rejected demotion = %q, want %q", creatorRole, RoleMaintainer)
+	}
+	// Membership changes for everyone else still work.
+	if _, err = s.UpdateMemberRole(ctx, adminActor, project.ID, memberActor.ID, RoleMaintainer); err != nil {
+		t.Fatalf("promote other member = %v", err)
+	}
+	if _, err = s.UpdateMemberRole(ctx, adminActor, project.ID, memberActor.ID, RoleViewer); err != nil {
+		t.Fatalf("demote other member = %v", err)
+	}
+	// Removing the creator stays a validation error.
+	if err = s.RemoveMember(ctx, adminActor, project.ID, adminActor.ID); !errors.Is(err, ErrValidation) {
+		t.Fatalf("creator removal error = %v, want ErrValidation", err)
+	}
+}
+
+// A rename that passes the pre-check but collides with a concurrent insert must
+// surface as ErrConflict: the unique index is the authority, and its 23505 must
+// not leak to the HTTP layer as a 500. A second connection holds an uncommitted
+// row with the target name, so the pre-check cannot see it and the UPDATE waits
+// on the index entry; committing that row then makes PostgreSQL raise 23505
+// deterministically (no timing loop needed).
+func TestConcurrentRenameMapsUniqueViolationToConflict(t *testing.T) {
+	s, db := testService(t)
+	ctx := context.Background()
+	alpha, err := s.Create(ctx, testActor, Input{Name: "alpha"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pending.Rollback()
+	now := time.Now().Unix()
+	if _, err = pending.ExecContext(ctx, `INSERT INTO projects(id,name,status,created_by,created_at,updated_at)
+	 VALUES($1,'gamma-race','active',$2,$3,$3)`, "pending-00000000000001", testActor.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	// Remember the backend that holds the uncommitted row, so the wait below is
+	// matched against exactly this transaction instead of any unrelated session.
+	var pendingPID int
+	if err = pending.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&pendingPID); err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, renameErr := s.Update(ctx, testActor, alpha.ID, Patch{Name: str("gamma-race")})
+		errCh <- renameErr
+	}()
+
+	// Wait until the rename's UPDATE is blocked by the pending transaction's
+	// unique-index entry. pg_blocking_pids pins the check to that backend, so a
+	// concurrently running test cannot be mistaken for this update.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting int
+		if err = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pg_stat_activity
+		 WHERE datname=current_database() AND wait_event_type='Lock'
+		   AND query LIKE 'UPDATE projects SET name=%'
+		   AND $1 = ANY(pg_blocking_pids(pid))`, pendingPID).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("rename did not block on the pending name; the regression cannot be exercised")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err = pending.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if renameErr := <-errCh; !errors.Is(renameErr, ErrConflict) {
+		t.Fatalf("concurrent rename error = %v, want ErrConflict", renameErr)
+	}
+	// The losing transaction rolls back, so the original name is unchanged.
+	current, err := s.Get(ctx, testActor, alpha.ID)
+	if err != nil || current.Name != "alpha" {
+		t.Fatalf("project after lost rename = %+v err=%v", current, err)
 	}
 }

@@ -1,8 +1,12 @@
 openapi: 3.0.3
 info:
-  title: AegisFlow Browser Authentication API
+  title: AegisFlow API
   version: 1.0.0
   description: |
+    Machine-readable contract for the AegisFlow backend: browser authentication,
+    users and audit, the project registry, builds, deployment targets, deployment
+    tasks, approvals, health and metrics.
+
     Multi-instance PostgreSQL backend with Redis shared rate limiting behind a same-origin reverse proxy (recommended).
     All JSON responses use data/error plus requestId envelopes. All responses include
     X-Request-ID and Cache-Control: no-store. POST bodies must be one JSON object,
@@ -31,6 +35,11 @@ info:
     only, validated against PostgreSQL session state; cookies never authorize me/users.
     Keep access tokens in memory, do not store refresh tokens in JavaScript storage.
     Serialize refresh calls: replay of a consumed token revokes the whole session.
+
+    GET /metrics is only offered on the optional separate metrics listener
+    (AEGIS_METRICS_ADDR, disabled by default), never on this API listener, and it
+    is deliberately unauthenticated so a scraper needs no session; bind it to
+    loopback or protect it at the proxy. See the /metrics path for its payload.
 servers:
   - url: /
     description: Same-origin proxy; use relative /api/v1 URLs in the browser
@@ -1154,7 +1163,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Build is still queued or running, the project is archived, or it has no build command; error.code is conflict or validation_failed
+          description: Build is still queued or running, or the project is archived; error.code is conflict. A project without a build command is a 400 validation_failed instead
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
@@ -1365,6 +1374,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/deployment-targets/{targetId}/check:
     post:
@@ -1450,15 +1460,13 @@ paths:
         semantic version (1-64 chars of A-Z a-z 0-9 . _ + -). buildId is
         optional and must reference a succeeded build of the same project.
         deploymentNumber is allocated per project under the project row lock.
-        The deployment starts queued and a single leased worker executes it;
-        when the target environment is in AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS
-        (default production) it instead starts awaiting_approval, a pending
-        approval is created in the same transaction and approvalId is set.
-        deployment.create (and approval.request when required) is audited in
-        the same transaction.
-        The deployment starts queued; a single leased worker executes it.
-        deployment.create is audited in the same transaction. Approvals arrive
-        with P4.3; this slice always enqueues directly.
+        A single leased worker executes queued deployments. When the target
+        environment is listed in AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS (default
+        production) the new deployment starts in awaiting_approval instead of
+        queued; a pending approval is created in the same transaction, approvalId
+        is set and approving moves it to queued. Every create writes a
+        deployment.create audit row, and approval.request when approval is
+        required, in the same transaction.
       security:
         - bearerAuth: []
       parameters:
@@ -1473,7 +1481,7 @@ paths:
             schema: { $ref: '#/components/schemas/CreateDeploymentInput' }
       responses:
         '201':
-          description: Deployment enqueued in the queued state
+          description: Deployment created; status is queued, or awaiting_approval when the target environment requires approval
           content:
             application/json:
               schema:
@@ -1638,7 +1646,8 @@ paths:
       description: |
         The source must be succeeded or failed (409 otherwise), and an earlier
         succeeded deployment for the same project and target must exist (400
-        otherwise). A new queued deployment is created with rollbackOf set to
+        otherwise). A new deployment is created (queued, or awaiting_approval
+        when the target environment requires approval) with rollbackOf set to
         the source id and version set to the version being restored; the source
         row is unchanged. Repeated rollbacks create multiple rows: deployment is
         not idempotent, and the audit trail records each attempt.
@@ -1656,7 +1665,7 @@ paths:
             schema: { $ref: '#/components/schemas/RollbackDeploymentInput' }
       responses:
         '201':
-          description: Rollback deployment enqueued
+          description: Rollback deployment created; status is queued, or awaiting_approval when the target environment requires approval
           content:
             application/json:
               schema:

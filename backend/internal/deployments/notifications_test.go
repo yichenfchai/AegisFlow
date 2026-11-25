@@ -276,3 +276,36 @@ func TestApprovalWebhookDisabledDoesNotEnqueue(t *testing.T) {
 		t.Fatalf("disabled notifier enqueued %d rows", count)
 	}
 }
+
+// TestNotificationClaimLeaseExceedsWebhookTimeout regression: the claim lease
+// was a fixed 15s while a webhook delivery may legitimately take up to 30s, so
+// another replica could re-claim and re-deliver a row while the first delivery
+// was still running (duplicate events, delivered state overwritten back to
+// pending). The lease is derived from the configured webhook timeout and must
+// outlive the longest allowed delivery.
+func TestNotificationClaimLeaseExceedsWebhookTimeout(t *testing.T) {
+	server, _ := webhookServer(t, http.StatusNoContent)
+	s, _, registry := taskService(t, Options{
+		ApprovalEnvironments:   []string{EnvironmentProduction},
+		ApprovalWebhookURL:     server.URL,
+		ApprovalWebhookTimeout: 30 * time.Second,
+	})
+	ctx := context.Background()
+	project := taskProject(t, registry, "claim-lease")
+	target := approvalTarget(t, s, "claim-lease-target", server.URL, EnvironmentProduction)
+	if _, err := s.CreateDeployment(ctx, testActor, project.ID, DeployInput{TargetID: target.ID, Version: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now().Unix()
+	claimed, err := s.claimNotification(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nextAttempt int64
+	if err := s.db.QueryRow(`SELECT next_attempt_at FROM approval_notifications WHERE id=$1`, claimed.ID).Scan(&nextAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if lease := nextAttempt - before; lease < 60 {
+		t.Fatalf("claim lease = %ds, want >= 60s for a 30s webhook timeout", lease)
+	}
+}

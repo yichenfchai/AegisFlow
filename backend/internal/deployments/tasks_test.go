@@ -622,3 +622,66 @@ func joinEvents(events []DeploymentEvent) string {
 	}
 	return strings.Join(parts, "\n")
 }
+
+// An archived project is read-only for deployment writes: creating, cancelling
+// and rolling back all conflict until restore, while reads keep working
+// (decisions-2026-11-23 §3).
+func TestArchivedProjectRejectsDeploymentWrites(t *testing.T) {
+	s, db, registry := taskService(t, Options{})
+	ctx := context.Background()
+	project := taskProject(t, registry, "deploy-archive")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	target := taskTarget(t, s, "archive-target", upstream.URL)
+
+	// Existing history: a succeeded version to roll back to, a failed source,
+	// and a still-queued deployment (no worker runs in this test).
+	base := time.Now().Unix()
+	first := seedDeployment(t, db, project.ID, target.ID, 1, DeploySucceeded, "v1", base-30)
+	source := seedDeployment(t, db, project.ID, target.ID, 2, DeployFailed, "v2", base-20)
+	queued, err := s.CreateDeployment(ctx, testActor, project.ID, DeployInput{TargetID: target.ID, Version: "v3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	archive := true
+	if _, err = registry.Update(ctx, testActor, project.ID, projects.Patch{Archived: &archive}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = s.CreateDeployment(ctx, testActor, project.ID, DeployInput{TargetID: target.ID, Version: "v4"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("archived create deployment error = %v, want ErrConflict", err)
+	} else if !strings.Contains(err.Error(), "archived project is read-only until restored") {
+		t.Fatalf("archived create deployment message = %q", err)
+	}
+	if _, err = s.RollbackDeployment(ctx, testActor, source); !errors.Is(err, ErrConflict) {
+		t.Fatalf("archived rollback error = %v, want ErrConflict", err)
+	}
+	if _, err = s.CancelDeployment(ctx, testActor, queued.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("archived cancel error = %v, want ErrConflict", err)
+	}
+	// Reads still work while archived.
+	if _, err = s.GetDeployment(ctx, testActor, first); err != nil {
+		t.Fatalf("archived deployment read = %v", err)
+	}
+	// None of the rejected writes added a row.
+	if _, total, err := s.ListDeployments(ctx, testActor, project.ID, "", 10, 0); err != nil || total != 3 {
+		t.Fatalf("deployments after rejected writes: total=%d err=%v", total, err)
+	}
+
+	// Restoring re-opens the same writes.
+	restore := false
+	if _, err = registry.Update(ctx, testActor, project.ID, projects.Patch{Archived: &restore}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := s.CreateDeployment(ctx, testActor, project.ID, DeployInput{TargetID: target.ID, Version: "v6"})
+	if err != nil || created.Status != DeployQueued {
+		t.Fatalf("create deployment after restore = %+v err=%v", created, err)
+	}
+	if _, err = s.CancelDeployment(ctx, testActor, queued.ID); err != nil {
+		t.Fatalf("cancel after restore = %v", err)
+	}
+	if _, err = s.RollbackDeployment(ctx, testActor, source); err != nil {
+		t.Fatalf("rollback after restore = %v", err)
+	}
+}
