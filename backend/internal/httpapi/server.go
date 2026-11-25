@@ -52,6 +52,9 @@ type Server struct {
 	limiter      ratelimit.Limiter
 	cookieSecure bool
 	metrics      *metrics.Registry
+	// shutdownCtx is never nil: New substitutes context.Background() when the
+	// embedder does not pass one, so streaming selects can always wait on it.
+	shutdownCtx context.Context
 }
 
 const refreshCookieName = "aegis_refresh"
@@ -74,6 +77,11 @@ type Options struct {
 	// Metrics, when set, records request counters and latency histograms keyed
 	// by the matched route template. Nil disables recording.
 	Metrics *metrics.Registry
+	// ShutdownContext ends long-lived streams like build-event SSE when the
+	// process starts draining. Nil keeps the previous behavior (streams only
+	// end with the client or the server-side lifetime cap), which is what
+	// tests and embedders without a signal context expect.
+	ShutdownContext context.Context
 }
 
 // New builds an isolated Gin engine; business services depend only on context.Context.
@@ -82,7 +90,11 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	if len(options) > 0 {
 		opts = options[0]
 	}
-	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure, metrics: opts.Metrics}
+	shutdownCtx := opts.ShutdownContext
+	if shutdownCtx == nil {
+		shutdownCtx = context.Background()
+	}
+	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure, metrics: opts.Metrics, shutdownCtx: shutdownCtx}
 	for _, o := range origins {
 		s.origins[o] = true
 	}
@@ -819,6 +831,13 @@ func (s *Server) streamBuildEvents(c *gin.Context) {
 	for {
 		select {
 		case <-c.Request.Context().Done():
+			return
+		case <-s.shutdownCtx.Done():
+			// http.Server.Shutdown does not cancel in-flight request contexts,
+			// so without this branch an open stream would hold the drain until
+			// the shutdown deadline expires and the process exits non-zero.
+			// Tell the client why the stream ended and return immediately.
+			writeSSE(c, "done", "", []byte(`{"reason":"shutdown"}`))
 			return
 		case <-lifetime.C:
 			writeSSE(c, "done", "", []byte(`{"reason":"reconnect"}`))

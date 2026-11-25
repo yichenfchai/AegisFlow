@@ -21,6 +21,13 @@ import (
 
 func testServer(t *testing.T) (http.Handler, *auth.Service) {
 	t.Helper()
+	return testServerWithOptions(t, Options{})
+}
+
+// testServerWithOptions wires the same services as testServer and lets a test
+// pass explicit deployment options (for example ShutdownContext).
+func testServerWithOptions(t *testing.T, options Options) (http.Handler, *auth.Service) {
+	t.Helper()
 	db := testutil.OpenPostgres(t)
 	s := auth.New(db, strings.Repeat("k", 32), time.Minute, time.Hour)
 	if err := s.Migrate(context.Background()); err != nil {
@@ -37,7 +44,16 @@ func testServer(t *testing.T) (http.Handler, *auth.Service) {
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	go pipeline.RunWorker(workerCtx, logger)
 	t.Cleanup(stopWorker)
-	return New(s, logger, db.PingContext, []string{"http://localhost:5173"}, Options{Limiter: newTestLimiter(), Projects: registry, Builds: pipeline}), s
+	if options.Limiter == nil {
+		options.Limiter = newTestLimiter()
+	}
+	if options.Projects == nil {
+		options.Projects = registry
+	}
+	if options.Builds == nil {
+		options.Builds = pipeline
+	}
+	return New(s, logger, db.PingContext, []string{"http://localhost:5173"}, options), s
 }
 func request(h http.Handler, method, path, body, token string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))

@@ -129,7 +129,10 @@ func TestCreateDeploymentRequiresApproval(t *testing.T) {
 		t.Fatalf("staging audit = %v", rows)
 	}
 
-	// An explicitly empty environment list never creates approvals.
+	// An explicitly empty environment list never creates approvals. config.Load
+	// must hand this service a non-nil empty slice for an explicitly empty
+	// AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS; a nil slice would default to
+	// production and silently require approval (P1-02).
 	s2, _, registry2 := taskService(t, Options{ApprovalEnvironments: []string{}})
 	project2 := taskProject(t, registry2, "approval-disabled")
 	prod2 := approvalTarget(t, s2, "prod-target-2", upstream.URL, EnvironmentProduction)
@@ -137,7 +140,7 @@ func TestCreateDeploymentRequiresApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if disabled.Status != DeployQueued || disabled.ApprovalID != "" {
+	if disabled.Status != DeployQueued || disabled.ApprovalID != "" || approvalCountForDeployment(t, s2, disabled.ID) != 0 {
 		t.Fatalf("approval-disabled deployment = %+v", disabled)
 	}
 
@@ -183,6 +186,25 @@ func TestNewDefaultsApprovalToProduction(t *testing.T) {
 	approval := approvalForDeployment(t, s, deployment.ID)
 	if approval.ExpiresAt-approval.CreatedAt != int64(defaultApprovalTTL/time.Second) {
 		t.Fatalf("default TTL = %d seconds", approval.ExpiresAt-approval.CreatedAt)
+	}
+}
+
+// TestNewApprovalEnvironmentsDistinguishesNilFromEmpty pins the Options
+// contract P1-02 depends on: nil means the variable was unset and defaults to
+// production, while a non-nil empty slice means it was explicitly set empty
+// and disables approvals. config.Load must therefore return a non-nil empty
+// slice for an explicitly empty AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS; otherwise
+// a production deployment silently waits for an approval nobody expects.
+func TestNewApprovalEnvironmentsDistinguishesNilFromEmpty(t *testing.T) {
+	unset := New(nil, Options{})
+	if !unset.approvalEnvironments[EnvironmentProduction] {
+		t.Fatalf("nil environments = %v, want the production default", unset.approvalEnvironments)
+	}
+	empty := New(nil, Options{ApprovalEnvironments: []string{}})
+	for _, environment := range []string{EnvironmentDevelopment, EnvironmentStaging, EnvironmentProduction} {
+		if empty.approvalEnvironments[environment] {
+			t.Fatalf("empty environments require approval for %q: %v", environment, empty.approvalEnvironments)
+		}
 	}
 }
 
