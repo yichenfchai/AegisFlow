@@ -74,6 +74,67 @@ jobs:
       - name: User sandbox privilege drop (root)
         run: sudo env PATH="$PATH" GOMODCACHE="$(go env GOMODCACHE)" GOCACHE=/tmp/aegis-go-cache HOME=/tmp go test ./internal/builds -run TestUserSandboxRunsAsTargetAccount -count=1 -v
 
+  # Supply-chain check, not a build gate: the code that ships is built by the
+  # backend job. govulncheck@latest declares a newer Go toolchain than
+  # backend/go.mod's `go` directive, so the scanner is built with the latest
+  # stable toolchain while the module graph it scans is still backend/go.mod.
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: backend/go.sum
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      # Advisory for now: the current module graph reports known vulnerabilities
+      # (see the PR risk section / backend/README.md). TODO: drop
+      # continue-on-error after the Go module baseline is upgraded and this job
+      # has been green on main, so regressions block the merge.
+      - name: Scan for known vulnerabilities
+        continue-on-error: true
+        run: '"$(go env GOPATH)/bin/govulncheck" ./...'
+
+  # The backend job runs on Linux. This job keeps the Windows development path
+  # (cmd /c build commands, taskkill on process trees) compiling and vetted.
+  # Only packages that need no PostgreSQL/Redis run here; the full suite runs in
+  # the backend job.
+  windows:
+    name: windows
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Verify formatting
+        shell: pwsh
+        run: |
+          $unformatted = gofmt -l ./cmd ./internal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($unformatted) {
+            Write-Host 'gofmt reported unformatted files:'
+            $unformatted | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build ./...
+      - name: Test packages without external services
+        run: go test ./internal/config ./internal/metrics -count=1
+
   frontend:
     name: frontend
     runs-on: ubuntu-latest
@@ -91,6 +152,11 @@ jobs:
         run: npm test
       - name: Lint
         run: npm run lint
+      # Blocking: the lockfile currently audits clean (0 vulnerabilities). Only
+      # high/critical findings fail; lower severities are reported but allowed,
+      # matching the project's existing lint-warning policy.
+      - name: Audit dependencies (high and critical)
+        run: npm audit --audit-level=high
 
   e2e:
     name: e2e
@@ -148,3 +214,30 @@ jobs:
           path: test-results/
           if-no-files-found: ignore
           retention-days: 7
+
+  # Packaging and deployment config regression checks. The placeholders below
+  # exist only so compose interpolation (${VAR:?}) resolves; no service is run
+  # against them and no secret is involved.
+  infra:
+    name: infra
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AEGIS_POSTGRES_PASSWORD: ci-placeholder-postgres-password
+      AEGIS_JWT_SECRET: ci-placeholder-jwt-secret
+    steps:
+      - uses: actions/checkout@v4
+      # Builds the production image from backend/Dockerfile so a broken
+      # Dockerfile or Go version drift is caught here instead of at release.
+      - name: Build the backend image
+        run: docker build -t aegisflow-api:ci ./backend
+      # Fails on any unresolved ${VAR:?...} or malformed service definition;
+      # also proves the required variables are the ones documented.
+      - name: Validate compose interpolation
+        run: docker compose config -q
+      # The gateway config is bind-mounted by compose; check it with the same
+      # nginx image the stack uses. nginx resolves upstream hostnames while
+      # loading the config, so the isolated container needs api1/api2 in
+      # /etc/hosts; nothing listens or is served, only the config is validated.
+      - name: Validate the gateway nginx config
+        run: docker run --rm --add-host api1:127.0.0.1 --add-host api2:127.0.0.1 -v "$PWD/deploy/nginx.conf:/etc/nginx/nginx.conf:ro" nginx:1.28-alpine nginx -t

@@ -196,6 +196,8 @@ go run ./cmd/rekey
 
 后端真实集成：在 `backend` 目录设置 AEGIS_TEST_DATABASE_URL 与 AEGIS_TEST_REDIS_URL 后运行 `go test ./...`（仓库根目录没有 `go.mod`），测试使用随机隔离 schema 和 Redis namespace。测试数据库角色需要 CREATE SCHEMA 与 DROP SCHEMA 权限，不使用生产数据库。
 
-浏览器 E2E：设置 AEGIS_E2E_DATABASE_URL 指向专用可丢弃数据库、AEGIS_E2E_REDIS_URL 指向测试 Redis，再 npm run test:e2e。E2E 会初始化管理员和创建用户，不要指向生产；8080/5173 须空闲。多实例集成测试额外启动两个真实 httptest HTTP server、独立数据库池及 Redis clients，验证会话互通、刷新/退出撤销及共享限额。
+浏览器 E2E：设置 AEGIS_E2E_DATABASE_URL 指向专用可丢弃数据库、AEGIS_E2E_REDIS_URL 指向测试 Redis，再 npm run test:e2e。E2E 会初始化管理员和创建用户，不要指向生产；8080/5173 须空闲。本地重复运行需要空库时，先执行 `pwsh scripts/reset-e2e-db.ps1`（默认读取 `AEGIS_E2E_DATABASE_URL`，删除并重建该一次性库；`-WhatIf` 只打印将执行的 SQL）；CI 的 e2e 任务每次使用全新的 PostgreSQL 服务容器，无需重置。多实例集成测试额外启动两个真实 httptest HTTP server、独立数据库池及 Redis clients，验证会话互通、刷新/退出撤销及共享限额。
+
+部署配置的 CI 检查：`infra` 任务执行 `docker build -t aegisflow-api:ci ./backend`，在占位 `AEGIS_POSTGRES_PASSWORD`/`AEGIS_JWT_SECRET`（只用于 compose 插值，不会启动服务）下运行 `docker compose config -q`，并用本样例同款 `nginx:1.28-alpine` 镜像对网关配置运行 `nginx -t`。nginx 在加载配置时解析 upstream 主机名，因此该检查用 `--add-host api1:127.0.0.1 --add-host api2:127.0.0.1` 满足解析、只校验语法与指令，不启动整套双副本样例；本机没有 Docker 守护进程时以 CI 结果为准。
 
 SQLite 开发库不自动迁移。若有重要数据先备份，另行执行经审核的离线导入；上线不依赖保留开发会话。
