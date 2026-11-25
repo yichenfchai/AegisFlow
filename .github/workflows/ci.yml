@@ -56,7 +56,7 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
@@ -86,7 +86,7 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -113,7 +113,7 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
@@ -140,7 +140,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -189,7 +189,7 @@ jobs:
       AEGIS_E2E_DATABASE_URL: postgres://test:test@localhost:5432/aegis_e2e?sslmode=disable
       AEGIS_E2E_REDIS_URL: redis://localhost:6379/3
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go.mod
@@ -226,7 +226,7 @@ jobs:
       AEGIS_POSTGRES_PASSWORD: ci-placeholder-postgres-password
       AEGIS_JWT_SECRET: ci-placeholder-jwt-secret
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Builds the production image from backend/Dockerfile so a broken
       # Dockerfile or Go version drift is caught here instead of at release.
       - name: Build the backend image
