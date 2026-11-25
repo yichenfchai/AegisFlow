@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router'
+import { Link, useLocation, useNavigate } from 'react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Button, ConfirmDialog, DataTable, PageHeader, Pagination, type Column } from '@/components/ui/DataTable'
 import { StatusBadge } from '@/components/ui/Badge'
@@ -27,6 +27,9 @@ export function ProjectsPage() {
   const canEdit = user?.role === 'admin' || user?.role === 'member'
   const queryClient = useQueryClient()
   const nav = useNavigate()
+  const location = useLocation()
+  // 编辑页保存成功后带 state.notice 回到列表；其它导航不会携带。
+  const notice = (location.state as { notice?: string } | null)?.notice ?? ''
   const [page, setPage] = useState(1)
   const { data, isLoading, error } = useQuery({
     queryKey: ['projects', page],
@@ -111,6 +114,11 @@ export function ProjectsPage() {
       align: 'right',
       render: (p) => (
         <div className="flex items-center justify-end gap-space-sm">
+          {canEdit && (
+            <Link to={`/projects/${p.id}/edit`} className="text-label-sm text-primary hover:underline">
+              编辑
+            </Link>
+          )}
           <Link to={`/projects/${p.id}/members`} className="text-label-sm text-primary hover:underline">
             成员
           </Link>
@@ -158,6 +166,11 @@ export function ProjectsPage() {
           ) : undefined
         }
       />
+      {notice && (
+        <p role="status" className="mb-space-md text-body-sm text-on-surface bg-surface-container border border-surface-container-highest rounded px-space-lg py-space-md">
+          {notice}
+        </p>
+      )}
       {actionError && (
         <p role="alert" className="mb-space-md text-body-sm text-error bg-error/10 rounded px-space-lg py-space-md">
           {actionError}

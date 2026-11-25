@@ -1,4 +1,4 @@
-/** Real project registry API (P2). Business demo APIs stay in ./index. */
+/** Real project registry API. */
 import { apiRequest } from '@/stores/session'
 import type { Page } from '@/api/account'
 

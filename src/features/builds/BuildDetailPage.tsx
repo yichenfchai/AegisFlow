@@ -123,8 +123,9 @@ interface StreamState extends LogState {
 
 /**
  * SSE 优先：日志与状态通过 /builds/:id/events 推送（fetch 流式读取，因为
- * EventSource 不能带 Bearer）。连接失败重试一次后回退到轮询；服务端到达
- * 连接寿命上限时按游标续传，构建终态后停止。
+ * EventSource 不能带 Bearer）。首帧 8s / 空闲 30s 超时由 buildStream 中止
+ * 连接；这里按既有逻辑重试一次后回退到轮询。连接失败重试期间保持可取消，
+ * 服务端到达连接寿命上限时按游标续传，构建终态后停止。
  */
 function useBuildStream(buildID: string, onBuild: (build: Build) => void) {
   const [state, setState] = useState<StreamState>({ buildID, lines: emptyLogs, error: '', mode: 'connecting' })
@@ -139,7 +140,20 @@ function useBuildStream(buildID: string, onBuild: (build: Build) => void) {
     const abort = new AbortController()
     let disposed = false
     let attempts = 0
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+    let wakeRetry: (() => void) | undefined
     cursor.current = 0
+
+    /** 可被卸载打断的重试等待：清理时同时清定时器并唤醒等待者退出循环。 */
+    const waitBeforeRetry = (ms: number) =>
+      new Promise<void>((resolve) => {
+        wakeRetry = resolve
+        retryTimer = setTimeout(() => {
+          retryTimer = undefined
+          wakeRetry = undefined
+          resolve()
+        }, ms)
+      })
 
     const append = (events: LogEvent[]) => {
       setState((prev) => {
@@ -193,7 +207,7 @@ function useBuildStream(buildID: string, onBuild: (build: Build) => void) {
             }))
             return
           }
-          await new Promise((resolve) => setTimeout(resolve, 500 * attempts))
+          await waitBeforeRetry(500 * attempts)
         }
       }
     }
@@ -201,6 +215,12 @@ function useBuildStream(buildID: string, onBuild: (build: Build) => void) {
     void run()
     return () => {
       disposed = true
+      if (retryTimer !== undefined) {
+        clearTimeout(retryTimer)
+        retryTimer = undefined
+      }
+      wakeRetry?.()
+      wakeRetry = undefined
       abort.abort()
     }
   }, [buildID])
