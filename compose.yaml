@@ -3,6 +3,11 @@
 # (see deploy/README.md). Production build isolation is documented in
 # deploy/README.md "构建沙箱部署"; the container-sandbox override is commented out
 # at the end of this file and is intentionally NOT enabled by default.
+#
+# Service images use the digest recorded by Docker's official image metadata
+# (docker-library/repo-info, generated from the registry API) so a moved tag
+# cannot change the acceptance stack between runs. Refresh a digest when the tag
+# is bumped: `docker manifest inspect <image:tag>` and copy the top-level digest.
 x-api: &api
   build: ./backend
   environment: &api-env
@@ -71,7 +76,7 @@ x-api: &api
   stop_grace_period: 15s
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:f9cf3e1f0066f0eb0c48707d864f0ac5941e9ff454a072077d97a4d278d07d73
     environment:
       POSTGRES_USER: aegis
       POSTGRES_PASSWORD: ${AEGIS_POSTGRES_PASSWORD:?Set AEGIS_POSTGRES_PASSWORD}
@@ -84,7 +89,7 @@ services:
       retries: 20
     networks: [aegis]
   redis:
-    image: redis:7.4-alpine
+    image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
     command: [redis-server, --appendonly, 'yes']
     volumes: [redis-data:/data]
     healthcheck:
@@ -98,7 +103,7 @@ services:
   api2:
     <<: *api
   gateway:
-    image: nginx:1.28-alpine
+    image: nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236
     ports: ['127.0.0.1:8080:8080']
     volumes: ['./deploy/nginx.conf:/etc/nginx/nginx.conf:ro']
     # Wait for both replicas to answer /healthz before accepting traffic.

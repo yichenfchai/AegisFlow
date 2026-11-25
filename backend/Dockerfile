@@ -1,4 +1,8 @@
-FROM golang:1.26-alpine AS build
+# Base images are pinned to a tag@sha256 digest (multi-arch manifest list from
+# Docker's official image metadata, docker-library/repo-info) so a moved tag
+# cannot change the build. Refresh with `docker manifest inspect <image:tag>`
+# when the Go or Alpine line is bumped.
+FROM golang:1.26-alpine@sha256:ecb67f987aa1a57794c91d19ade7ae0209f2f0f5496aaef9e6ae85ddf92d02ab AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -6,7 +10,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
 
 # Runtime image for the API (SPA static files are served by the ingress proxy).
-FROM alpine:3.22
+FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f
 # ca-certificates: outbound HTTPS (deployment targets, approval webhooks, git clone)
 # git:             AEGIS_BUILD_CLONE clones credential-free https repositories
 # docker-cli:      AEGIS_BUILD_SANDBOX=container talks to the host Docker daemon

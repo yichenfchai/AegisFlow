@@ -1,6 +1,13 @@
 # Automated dependency updates. Every Dependabot PR still needs the repository
 # owner's review plus the full CI gate before merge (see AGENTS.md): this file
 # only schedules the update PRs, it does not auto-merge them.
+#
+# Updates are grouped so one ecosystem produces one reviewable PR instead of a
+# flood of per-dependency PRs (the previous baseline produced 16 separate
+# upgrade PRs). Minor and patch updates are grouped; major updates are left
+# ungrouped for npm and Go modules because they need a deliberate compatibility
+# decision. The github-actions group covers all update types: those PRs re-pin
+# the commit SHAs in .github/workflows/*.yml, which is one review unit.
 version: 2
 updates:
   # Frontend toolchain and runtime dependencies (package.json / package-lock.json).
@@ -8,15 +15,29 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      npm-production:
+        dependency-type: production
+        update-types: ["minor", "patch"]
+      npm-development:
+        dependency-type: development
+        update-types: ["minor", "patch"]
 
   # Go module graph of the backend (backend/go.mod / backend/go.sum).
   - package-ecosystem: gomod
     directory: "/backend"
     schedule:
       interval: weekly
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # Actions used by .github/workflows/*.yml.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
