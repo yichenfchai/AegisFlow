@@ -3,6 +3,18 @@ import type { Page } from '@playwright/test'
 
 const admin = { username: 'e2e-admin', password: 'E2e-admin-password-2026' }
 
+/**
+ * 构建命令在 POSIX 由 `sh -c`、在 Windows 由 `cmd /c` 执行。Go 的 os/exec 会
+ * 为 cmd.exe 转义内嵌双引号，而 cmd 不认这种转义：整段 -e 代码会以带引号的
+ * 字符串字面量到达 node 并立即退出。因此 Windows 用无引号形式（cmd 的括号
+ * 在简单命令里按字面传递），其他平台保留带引号的等价写法；两者运行同一段
+ * node 程序，用 node 而不是平台专有命令，避免依赖 sleep/ping 的差异。
+ */
+const longRunningCommand =
+  process.platform === 'win32' ? 'node -e setTimeout(function(){},15000)' : `node -e "setTimeout(function(){},15000)"`
+const failingCommand =
+  process.platform === 'win32' ? 'node -e process.exit(3)' : `node -e "process.exit(3)"`
+
 async function login(page: Page, username = admin.username, password = admin.password) {
   await page.goto('/login')
   await page.getByLabel('用户名', { exact: true }).fill(username)
@@ -10,6 +22,28 @@ async function login(page: Page, username = admin.username, password = admin.pas
   await page.getByRole('checkbox').setChecked(true)
   await page.getByRole('button', { name: '登录', exact: true }).click()
   await expect(page).toHaveURL('/')
+}
+
+/** 通过真实向导创建带构建命令的项目（唯一名称，避免上一轮残留）。 */
+async function createProjectWithCommand(page: Page, name: string, command: string) {
+  await page.goto('/')
+  await page.getByRole('link', { name: '创建项目' }).click()
+  await page.getByLabel('项目名称').fill(name)
+  await page.getByLabel('构建命令').fill(command)
+  await page.getByRole('button', { name: '创建项目', exact: true }).click()
+  await expect(page).toHaveURL('/')
+  const projectRow = page.getByRole('row', { name: new RegExp(name) })
+  await expect(projectRow.getByText('活跃')).toBeVisible()
+  await projectRow.getByRole('button', { name: '构建', exact: true }).click()
+  await expect(page).toHaveURL('/builds')
+}
+
+/** 打开该项目的第一次构建详情（新项目 BuildNumber 恒为 1）。 */
+async function openFirstBuild(page: Page, name: string) {
+  const buildRow = page.getByRole('row', { name: new RegExp(name) })
+  await expect(buildRow).toBeVisible()
+  await buildRow.getByRole('link', { name: '#1' }).click()
+  await expect(page).toHaveURL(/\/builds\/[A-Za-z0-9_-]{16,64}$/)
 }
 
 test('构建闭环：触发、成功日志与 viewer 只读', async ({ page }) => {
@@ -100,4 +134,31 @@ test('构建闭环：触发、成功日志与 viewer 只读', async ({ page }) =
   }, projectID)
   expect(status).toBe(403)
   await viewerCtx.close()
+})
+
+test('构建运行中取消：状态变为已取消并写入取消日志', async ({ page }) => {
+  await login(page)
+  const name = `e2e-cancel-${Date.now()}`
+  await createProjectWithCommand(page, name, longRunningCommand)
+  await openFirstBuild(page, name)
+
+  // 真实 node 长任务先启动为运行中，再通过 UI 取消；不使用固定 sleep。
+  await expect(page.getByText('运行中', { exact: true })).toBeVisible({ timeout: 20_000 })
+  await page.getByRole('button', { name: '取消构建' }).click()
+  await expect(page.getByText('已取消', { exact: true })).toBeVisible({ timeout: 20_000 })
+  // worker 在取消后写入系统日志（build cancelled），SSE 尾部 flush 后可见。
+  await expect(page.getByText('build cancelled', { exact: true })).toBeVisible({ timeout: 20_000 })
+  // 终态构建不再提供取消入口。
+  await expect(page.getByRole('button', { name: '取消构建' })).toHaveCount(0)
+})
+
+test('构建失败：非零退出码记录为失败并带退出码说明', async ({ page }) => {
+  await login(page)
+  const name = `e2e-fail-${Date.now()}`
+  await createProjectWithCommand(page, name, failingCommand)
+  await openFirstBuild(page, name)
+
+  await expect(page.getByText('失败', { exact: true })).toBeVisible({ timeout: 20_000 })
+  // 失败日志来自真实进程退出码，不是伪造的演示文案。
+  await expect(page.getByText('build failed: exit status 3', { exact: true })).toBeVisible({ timeout: 20_000 })
 })

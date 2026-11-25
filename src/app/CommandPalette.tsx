@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { create } from 'zustand'
 import { Icon } from '@/components/ui/Icon'
+import { useDialogFocus } from '@/components/ui/useDialogFocus'
 import { useSession } from '@/stores/session'
 
 interface PaletteState {
@@ -29,7 +30,9 @@ export function CommandPalette() {
   const [query, setQuery] = useState('')
   const [idx, setIdx] = useState(0)
   const nav = useNavigate()
-  const inputRef = useRef<HTMLInputElement>(null)
+  const titleId = useId()
+  const close = () => setOpen(false)
+  const dialogRef = useDialogFocus(open, close)
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -37,7 +40,6 @@ export function CommandPalette() {
         e.preventDefault()
         setOpen(!open)
       }
-      if (e.key === 'Escape') setOpen(false)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -47,7 +49,6 @@ export function CommandPalette() {
     if (open) {
       setQuery('')
       setIdx(0)
-      setTimeout(() => inputRef.current?.focus(), 30)
     }
   }, [open])
 
@@ -71,20 +72,27 @@ export function CommandPalette() {
   if (!open) return null
 
   const go = (to: string) => {
-    setOpen(false)
+    close()
     nav(to)
   }
 
   return (
-    <div className="fixed inset-0 z-palette bg-black/60 flex items-start justify-center pt-[15vh]" onClick={() => setOpen(false)}>
+    <div className="fixed inset-0 z-palette bg-black/60 flex items-start justify-center pt-[15vh]" onClick={close}>
       <div
-        className="w-[560px] bg-surface-container rounded-lg border border-surface-container-highest overflow-hidden"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        className="w-[560px] bg-surface-container rounded-lg border border-surface-container-highest overflow-hidden focus:outline-none"
         onClick={(e) => e.stopPropagation()}
       >
+        <h2 id={titleId} className="sr-only">
+          全局命令面板
+        </h2>
         <div className="flex items-center gap-space-lg px-space-xl py-space-lg border-b border-surface-container-highest">
           <Icon name="search" size={18} className="text-outline" />
           <input
-            ref={inputRef}
             value={query}
             onChange={(e) => {
               setQuery(e.target.value)
@@ -95,6 +103,7 @@ export function CommandPalette() {
               if (e.key === 'ArrowUp') setIdx((i) => Math.max(0, i - 1))
               if (e.key === 'Enter' && filtered[idx]) go(filtered[idx].to)
             }}
+            aria-label="搜索页面"
             placeholder="搜索页面与构建..."
             className="flex-1 bg-transparent text-body-lg text-on-surface placeholder:text-text-3 focus:outline-none"
           />

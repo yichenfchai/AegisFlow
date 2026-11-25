@@ -90,3 +90,52 @@ test('部署目标：创建、检查、启停、删除与管理员限制', async
   expect(status).toBe(403)
   await memberCtx.close()
 })
+
+test('部署目标凭据：配置后仅显示已配置，接口与页面不回显明文', async ({ page }) => {
+  await login(page)
+  const suffix = Date.now()
+  const name = `target-secret-${suffix}`
+  const secret = `e2e-target-bearer-${suffix}`
+
+  // 回环地址允许配置凭据；创建后凭据只能以布尔状态出现。
+  await page.goto('/deploy-targets')
+  await page.getByRole('link', { name: '新建部署目标' }).click()
+  await expect(page).toHaveURL('/deploy-targets/new')
+  await page.getByLabel('名称').fill(name)
+  await page.getByLabel('环境').selectOption('staging')
+  await page.getByLabel('端点').fill('http://127.0.0.1:8080')
+  await page.getByLabel('健康路径').fill('/healthz')
+  await page.getByLabel('凭据').fill(secret)
+  await page.getByRole('button', { name: '创建', exact: true }).click()
+  await expect(page).toHaveURL('/deploy-targets')
+
+  const row = page.getByRole('row', { name: new RegExp(name) })
+  await expect(row).toBeVisible()
+  await row.getByRole('link', { name: new RegExp(name) }).click()
+  await expect(page).toHaveURL(/\/deploy-targets\/[A-Za-z0-9_-]{16,64}$/)
+  await expect(page.getByRole('heading', { name: new RegExp(name) })).toBeVisible()
+
+  // 详情页只显示“已配置”状态，替换凭据输入框为空，页面源码不含明文。
+  await expect(page.getByText('已配置', { exact: true })).toBeVisible()
+  await expect(page.getByLabel('替换凭据')).toHaveValue('')
+  expect(await page.content()).not.toContain(secret)
+
+  const targetId = new URL(page.url()).pathname.split('/').pop()!
+  const token = await page.evaluate(async () => {
+    const { accessTokenForRequest } = await import('/src/stores/session.ts')
+    return accessTokenForRequest()
+  })
+  const auth = { Authorization: `Bearer ${token}` }
+  const detail = await page.request.get(`/api/v1/deployment-targets/${targetId}`, { headers: auth })
+  expect(detail.status()).toBe(200)
+  const detailBody = await detail.text()
+  expect(detailBody).toContain('"hasSecret":true')
+  expect(detailBody).not.toContain(secret)
+
+  // 列表接口同样只返回 hasSecret，不因列表投影泄露凭据。
+  const list = await page.request.get('/api/v1/deployment-targets?limit=100&offset=0', { headers: auth })
+  expect(list.status()).toBe(200)
+  const listBody = await list.text()
+  expect(listBody).toContain(name)
+  expect(listBody).not.toContain(secret)
+})

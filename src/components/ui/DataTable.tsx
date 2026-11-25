@@ -1,4 +1,6 @@
+import { useId } from 'react'
 import { Icon } from './Icon'
+import { useDialogFocus } from './useDialogFocus'
 
 export interface Column<T> {
   key: string
@@ -307,14 +309,21 @@ export function ConfirmDialog({
   onConfirm: () => void
   onCancel: () => void
 }) {
+  const titleId = useId()
+  const dialogRef = useDialogFocus(open, onCancel)
   if (!open) return null
   return (
     <div className="fixed inset-0 z-modal bg-black/60 flex items-center justify-center" onClick={onCancel}>
       <div
-        className="bg-surface-container rounded-lg border border-surface-container-highest w-[420px] p-space-xl"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        className="bg-surface-container rounded-lg border border-surface-container-highest w-[420px] p-space-xl focus:outline-none"
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 className={`text-headline-md font-semibold mb-space-md ${danger ? 'text-error' : 'text-on-surface'}`}>
+        <h3 id={titleId} className={`text-headline-md font-semibold mb-space-md ${danger ? 'text-error' : 'text-on-surface'}`}>
           {title}
         </h3>
         <div className="text-body-md text-on-surface-variant mb-space-xl">{children}</div>

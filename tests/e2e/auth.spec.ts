@@ -39,8 +39,22 @@ test('真实登录、恢复、并发刷新、多标签页和退出撤销', async
   const other = await context.newPage()
   await Promise.all([other.goto('/'), page.reload()])
   await expect(other.getByRole('button', { name: '打开用户菜单' })).toBeVisible()
-  // Allow the three-second access token to expire while leaving the real refresh cookie valid.
-  await page.waitForTimeout(3200)
+  // 3 秒 access token 由会话存储在定时器上轮换；轮询可观察的 token 变化代替
+  // 固定 sleep，既保持“刷新后用并发请求验证会话”的原意图，又去掉 flaky 窗口。
+  const tokenBeforeRefresh = await page.evaluate(async () => {
+    const { useSession } = await import('/src/stores/session.ts')
+    return useSession.getState().accessToken
+  })
+  await expect
+    .poll(
+      () =>
+        page.evaluate(async () => {
+          const { useSession } = await import('/src/stores/session.ts')
+          return useSession.getState().accessToken
+        }),
+      { timeout: 10_000 },
+    )
+    .not.toBe(tokenBeforeRefresh)
   const result = await page.evaluate(async () => {
     const { apiRequest, useSession } = await import('/src/stores/session.ts')
     const values = await Promise.all(Array.from({ length: 5 }, () => apiRequest<{ username: string }>('/auth/me')))
@@ -242,4 +256,34 @@ test('项目管理：创建、归档恢复与角色限制', async ({ page }) => 
   })
   expect(status).toBe(403)
   await viewerCtx.close()
+})
+
+test('命令面板与确认对话框：ARIA 语义、初始焦点、Esc 关闭与焦点归还', async ({ page }) => {
+  await login(page)
+
+  // ⌘K 命令面板：role=dialog + aria-modal，打开时聚焦搜索框，Esc 关闭并归还焦点。
+  const paletteTrigger = page.getByRole('button', { name: /搜索资源/ })
+  await paletteTrigger.click()
+  const palette = page.getByRole('dialog', { name: '全局命令面板' })
+  await expect(palette).toBeVisible()
+  await expect(palette).toHaveAttribute('aria-modal', 'true')
+  await expect(palette.getByPlaceholder('搜索页面与构建...')).toBeFocused()
+  await page.keyboard.press('Escape')
+  await expect(palette).toHaveCount(0)
+  await expect(paletteTrigger).toBeFocused()
+
+  // 确认对话框：可访问名称来自 aria-labelledby，初始焦点在首个可操作控件；
+  // Esc 取消后焦点回到打开它的表格按钮，而不是丢到 body。
+  await page.goto('/settings')
+  const selfRow = page.getByRole('row').filter({ hasText: admin.username })
+  await expect(selfRow).toBeVisible()
+  const resetTrigger = selfRow.getByRole('button', { name: '重置密码' })
+  await resetTrigger.click()
+  const resetDialog = page.getByRole('dialog', { name: `重置 ${admin.username} 的密码` })
+  await expect(resetDialog).toBeVisible()
+  await expect(resetDialog).toHaveAttribute('aria-modal', 'true')
+  await expect(resetDialog.getByLabel('新密码')).toBeFocused()
+  await page.keyboard.press('Escape')
+  await expect(resetDialog).toHaveCount(0)
+  await expect(resetTrigger).toBeFocused()
 })
