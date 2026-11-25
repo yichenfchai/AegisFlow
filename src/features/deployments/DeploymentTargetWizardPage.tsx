@@ -10,6 +10,7 @@ import {
   type DeploymentTargetStatus,
 } from '@/api/deployments'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 
 const ENVIRONMENTS: DeploymentEnvironment[] = ['development', 'staging', 'production']
 const STATUSES: DeploymentTargetStatus[] = ['active', 'disabled']
@@ -25,10 +26,8 @@ function opError(cause: unknown): string {
       return '字段不合法：名称 3-64 字节且单行；端点须为 http(s) URL 且不含用户信息、查询或片段；健康路径以 / 开头；凭据仅可配合 https 或回环地址'
     }
     if (cause.status === 403) return '当前角色没有创建部署目标的权限'
-    if (cause.status === 503) return '服务依赖不可用，请稍后重试'
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return cause instanceof Error ? cause.message : '创建失败，请稍后重试'
+  return errorText(cause, '创建失败，请稍后重试')
 }
 
 /** 新建部署目标（真实接口）：管理员配置端点、环境与可选凭据。 */

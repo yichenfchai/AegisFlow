@@ -5,6 +5,7 @@ import { ConfirmDialog } from '@/components/ui/DataTable'
 import { StatusBadge } from '@/components/ui/Badge'
 import { accountAPI, type SessionInfo } from '@/api/account'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 import { fmtRel } from '@/api/format'
 
 /** 账号安全：自助修改密码 + 活跃会话管理（真实接口，无 mock） */
@@ -22,11 +23,11 @@ export function AccountSecurityPage() {
 
 function passwordError(error: unknown): string {
   if (error instanceof ApiError) {
+    // 修改密码的 401 一定来自“当前密码不正确”，需要比通用登录失效更具体的提示。
     if (error.status === 401) return '当前密码不正确'
     if (error.status === 400) return '新密码长度需为 12-72 字节'
-    if (error.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return error instanceof Error ? error.message : '请求失败，请稍后重试'
+  return errorText(error, '请求失败，请稍后重试')
 }
 
 function byteLength(value: string): number {
@@ -117,7 +118,7 @@ function SessionsCard() {
       await accountAPI.revokeSession(id)
       await refresh()
     } catch (cause) {
-      setActionError(cause instanceof Error ? cause.message : '撤销失败，请稍后重试')
+      setActionError(errorText(cause, '撤销失败，请稍后重试'))
     } finally {
       setRevokingId(null)
     }
@@ -128,7 +129,7 @@ function SessionsCard() {
       await accountAPI.revokeOtherSessions()
       await refresh()
     } catch (cause) {
-      setActionError(cause instanceof Error ? cause.message : '撤销失败，请稍后重试')
+      setActionError(errorText(cause, '撤销失败，请稍后重试'))
     } finally {
       setConfirmAll(false)
     }
@@ -182,7 +183,7 @@ function SessionsCard() {
         <p className="text-body-md text-outline py-space-lg">加载中...</p>
       ) : error ? (
         <p role="alert" className="text-body-md text-error py-space-lg">
-          {error instanceof Error ? error.message : '加载会话失败'}
+          {errorText(error, '加载会话失败')}
         </p>
       ) : (
         <DataTable columns={columns} rows={sessions} empty="没有活跃会话" />

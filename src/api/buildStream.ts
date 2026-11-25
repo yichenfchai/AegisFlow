@@ -5,6 +5,7 @@
  * reconnect when the server asks them to (lifetime cap) or when a transport
  * error happens; the polling endpoint remains the fallback. */
 import { ApiError } from '@/api/http'
+import { apiErrorText } from '@/api/errors'
 import { accessTokenForRequest } from '@/stores/session'
 import { createFrameParser } from '@/api/sseParser'
 import type { Build, LogEvent } from '@/api/builds'
@@ -97,14 +98,19 @@ export async function streamBuildEvents(
     let end: BuildStreamEnd = 'reconnect'
     let finished = false
     const parser = createFrameParser((event, data) => {
-      if (event === 'status') {
-        callbacks.onStatus(JSON.parse(data) as Build)
-      } else if (event === 'logs') {
-        callbacks.onLogs(JSON.parse(data) as LogEvent[])
-      } else if (event === 'done') {
-        const payload = JSON.parse(data) as { reason?: string }
-        end = payload.reason === 'terminal' ? 'terminal' : 'reconnect'
-        finished = true
+      try {
+        if (event === 'status') {
+          callbacks.onStatus(JSON.parse(data) as Build)
+        } else if (event === 'logs') {
+          callbacks.onLogs(JSON.parse(data) as LogEvent[])
+        } else if (event === 'done') {
+          const payload = JSON.parse(data) as { reason?: string }
+          end = payload.reason === 'terminal' ? 'terminal' : 'reconnect'
+          finished = true
+        }
+      } catch {
+        // 帧内容损坏属于服务端 / 传输异常：按统一中文文案抛出，不暴露解析细节。
+        throw new ApiError(0, 'invalid_response', apiErrorText('invalid_response'))
       }
     })
 

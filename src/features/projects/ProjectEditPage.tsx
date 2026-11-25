@@ -11,6 +11,7 @@ import {
   type ProjectVisibility,
 } from '@/api/projects'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 import { fmtRel } from '@/api/format'
 import { projectFormError, projectWriteError, type ProjectFormValues } from './projectForm'
 
@@ -58,11 +59,7 @@ export function ProjectEditPage() {
         <p role="alert" className="text-body-md text-error py-space-lg">
           {status === 404
             ? '未找到该项目：它可能是私有项目，而你不是它的成员。'
-            : status === 0
-              ? '无法连接服务，请检查网络后重试'
-              : project.error instanceof Error
-                ? project.error.message
-                : '加载项目失败'}
+            : errorText(project.error, '加载项目失败')}
         </p>
         <Link to="/" className="text-body-md text-primary hover:underline">
           返回项目列表

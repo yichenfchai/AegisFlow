@@ -1,4 +1,5 @@
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 import type { ProjectVisibility } from '@/api/projects'
 
 export function byteLength(value: string): number {
@@ -76,7 +77,6 @@ export function projectWriteError(cause: unknown, action: '创建' | '保存'): 
         ? '同名项目已存在（不区分大小写）'
         : '同名项目已存在（不区分大小写），或项目已归档（归档后为只读，需先恢复）'
     }
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return cause instanceof Error ? cause.message : `${action}失败，请稍后重试`
+  return errorText(cause, `${action}失败，请稍后重试`)
 }

@@ -22,6 +22,7 @@ import {
 } from '@/api/deployTasks'
 import { projectsAPI } from '@/api/projects'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 import { fmtRel } from '@/api/format'
 
 const PAGE_SIZE = 12
@@ -37,10 +38,8 @@ function approvalError(cause: unknown): string {
     if (cause.status === 403) return '当前角色没有该操作权限'
     if (cause.status === 404) return '审批不存在或已被删除'
     if (cause.status === 409) return '审批已被处理，或部署状态已变化，请刷新后重试'
-    if (cause.status === 503) return '服务依赖不可用，请稍后重试'
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return cause instanceof Error ? cause.message : '操作失败，请稍后重试'
+  return errorText(cause, '操作失败，请稍后重试')
 }
 
 /** 审批中心（真实接口）：生产部署的审批队列，仅待审批可操作。 */
@@ -218,7 +217,7 @@ export function ApprovalListPage() {
       )}
       {error ? (
         <p role="alert" className="text-body-md text-error py-space-lg">
-          {error instanceof Error ? error.message : '加载审批失败'}
+          {errorText(error, '加载审批失败')}
         </p>
       ) : isLoading ? (
         <p className="text-body-md text-outline py-space-lg">加载中...</p>

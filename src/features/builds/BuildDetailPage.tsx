@@ -15,6 +15,7 @@ import {
 import { streamBuildEvents } from '@/api/buildStream'
 import { projectsAPI } from '@/api/projects'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 import { fmtRel } from '@/api/format'
 import { useSession } from '@/stores/session'
 import type { LogLine } from '@/api/types'
@@ -36,9 +37,8 @@ function opError(cause: unknown, conflict = '构建状态不允许该操作'): s
     if (cause.status === 409) return conflict
     if (cause.status === 403) return '当前角色没有该操作权限'
     if (cause.status === 404) return '构建不存在或已被清理'
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return cause instanceof Error ? cause.message : '操作失败，请稍后重试'
+  return errorText(cause, '操作失败，请稍后重试')
 }
 
 const emptyLogs: LogLine[] = []
@@ -90,7 +90,7 @@ function usePollingLogs(buildID: string, terminal: boolean, enabled: boolean) {
         setState((prev) => ({
           buildID,
           lines: prev.buildID === buildID ? prev.lines : emptyLogs,
-          error: cause instanceof Error ? cause.message : '日志加载失败',
+          error: errorText(cause, '日志加载失败'),
         }))
       }
       if (cancelled) return
@@ -203,7 +203,7 @@ function useBuildStream(buildID: string, onBuild: (build: Build) => void) {
               buildID,
               lines: prev.buildID === buildID ? prev.lines : emptyLogs,
               mode: 'polling',
-              error: cause instanceof Error ? cause.message : '日志流不可用，已回退轮询',
+              error: errorText(cause, '日志流不可用，已回退轮询'),
             }))
             return
           }
@@ -254,7 +254,7 @@ export function BuildDetailPage() {
   const { data: project } = useQuery({
     queryKey: ['project', projectID],
     queryFn: () => {
-      if (!projectID) throw new Error('missing project id')
+      if (!projectID) throw new Error('构建缺少项目 ID')
       return projectsAPI.project(projectID)
     },
     enabled: Boolean(projectID),
