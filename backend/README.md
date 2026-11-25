@@ -252,7 +252,17 @@ go test -race ./...
 $env:AEGIS_OPS_DATABASE_URL = $env:AEGIS_TEST_DATABASE_URL
 $env:AEGIS_OPS_REDIS_URL = 'redis://localhost:6379/2'
 go test ./cmd/server/ -run TestRealProcessLifecycle -count=1
+# 已知漏洞扫描（CI 的 security 任务执行同一命令；当前 continue-on-error 非阻断）：
+go install golang.org/x/vuln/cmd/govulncheck@latest
+& "$(go env GOPATH)/bin/govulncheck" ./...
+# CI 的 windows 任务在 Windows 上跑不依赖 PostgreSQL/Redis 的部分：
+gofmt -l ./cmd ./internal   # 输出为空
+go vet ./...
+go build ./...
+go test ./internal/config ./internal/metrics -count=1
 ```
+
+CI（[.github/workflows/ci.yml](../.github/workflows/ci.yml)）在 `backend`（Linux、真实 PostgreSQL + Redis、`-race`）、`frontend` 与 `e2e` 之外还运行：`security` 任务的 `govulncheck ./...`（当前非阻断；发现项与升级建议见 PR 风险节）、`windows` 任务（Windows 上执行上面这组 gofmt/vet/build 与不依赖外部服务的单测，命令相同，本机 Windows 上可直接复核）和 `infra` 任务（`docker build -t aegisflow-api:ci ./backend`、占位环境变量下的 `docker compose config -q`、网关 `nginx -t`）。Windows 任务的测试范围只有 `internal/config` 与 `internal/metrics`，完整测试套件仍以 `backend` 任务为准。
 
 分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计、可见性读过滤与成员增删改、创建者不可移除与 404 枚举语义）、构建流水线（触发校验与每项目编号、成功与失败退出码、超时、取消与幂等、重启恢复为 interrupted、跨副本 worker 租约互斥与待命接管、SSE 推送与写超时豁免/终态收尾/非法游标、游标日志分页与截断、RBAC 与未接线 503）、部署目标（校验与默认值、大小写唯一与冲突、凭据 AES-256-GCM 加密与 AAD 绑定、更新时保留/替换/清空语义、非配置密钥时拒绝写入、探测成功/非 2xx/超时/网络错误与结果落库、事务内审计、admin-only RBAC 与未接线 503）、部署任务（项目/目标/版本/buildId 校验、每项目编号分配与目标快照、worker 成功/失败/超时/取消/重启恢复、部署后健康复查（首次通过/重试后通过/始终不健康/关闭）、事件游标分页、回滚版本选择与 400/409、事务内审计、目标被引用时 409、worker 租约互斥、项目写权限叠加与可见性 RBAC）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目/构建/部署目标端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
 

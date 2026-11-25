@@ -17,6 +17,6 @@
 3. 使用初始化的管理员账号登录。项目、构建、部署、账号安全与用户管理均为真实功能；创建带「构建命令」的项目后可在项目行直接触发构建。未接入的模块恒定显示未实现声明，不提供演示数据开关。
 4. 如修改访问域名或端口，同步配置后端 `AEGIS_ALLOWED_ORIGINS`。生产使用 HTTPS 并启用 `AEGIS_COOKIE_SECURE=true`。
 
-构建：`npm run build`；规范检查：`npm run lint`；单元测试：`npm test`；浏览器测试：`npx playwright install chromium` 后运行 `npm run test:e2e`（需设置专用测试服务的 `AEGIS_E2E_DATABASE_URL`、`AEGIS_E2E_REDIS_URL`，并保持 5173 和 8080 端口空闲）。
+构建：`npm run build`；规范检查：`npm run lint`；单元测试：`npm test`；浏览器测试：`npx playwright install chromium` 后运行 `npm run test:e2e`（需设置专用测试服务的 `AEGIS_E2E_DATABASE_URL`、`AEGIS_E2E_REDIS_URL`，并保持 5173 和 8080 端口空闲；本地重复运行前可用 `pwsh scripts/reset-e2e-db.ps1` 重置一次性库，加 `-WhatIf` 只打印 SQL）。CI 在 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) 的 backend/frontend/e2e 之外还执行：前端 `npm audit --audit-level=high`；`security` 任务的 `govulncheck ./...`（当前非阻断，风险见 PR）；`windows` 任务在 Windows 上检查 `gofmt -l ./cmd ./internal` 为空、`go vet ./...`、`go build ./...` 以及不依赖 PostgreSQL/Redis 的 `go test ./internal/config ./internal/metrics`；`infra` 任务的 `docker build -t aegisflow-api:ci ./backend`、`docker compose config -q` 与网关 `nginx -t`。依赖升级 PR 由 [`.github/dependabot.yml`](.github/dependabot.yml) 每周生成，仍需 owner review 后合并。
 
 开发进度、阶段验收与验证记录随 PR 维护（过程文档只在本地，不入库，见 [项目约束](AGENTS.md)）。贡献流程与协作约束见 [项目约束](AGENTS.md)：所有变更走 PR，且每个 PR 需仓库所有者 review 后合并。

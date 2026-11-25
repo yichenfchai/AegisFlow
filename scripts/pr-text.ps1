@@ -13,7 +13,10 @@ garbled PR descriptions in this repository:
     character into '?',
   * an escape interpreter (`echo -e`, `printf %b`, a shell string literal)
     turning `\a`, `\b`, `\f`, `\r` into control characters, which silently
-    eats the first letter of words such as `backend` or `npm`.
+    eats the first letter of words such as `backend` or `npm`,
+  * a lone CR (0x0D not followed by 0x0A) left behind by the same accident:
+    CRLF line endings are legal and are normalized before the check, so only
+    an orphan CR is an error.
 
 Those are exactly the checks CI runs on `pull_request` events, so a body that
 passes here passes CI.
@@ -118,6 +121,10 @@ function Test-PrText {
         $errors.Add('U+FFFD replacement character; that is the trace of a lossy encoding conversion')
     }
 
+    # CRLF is legal and is normalized away below; the control-character class
+    # deliberately excludes 0x0D so that CRLF files pass this loop. A CR that
+    # survives the normalization can only be a lone CR (0x0D not followed by
+    # 0x0A), which the per-line check below reports.
     $control = [regex] '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]'
     $lines = ($Text -replace "`r`n", "`n") -split "`n"
     $inFence = $false
@@ -131,6 +138,12 @@ function Test-PrText {
         foreach ($match in $control.Matches($line)) {
             $code = [int] [char] $match.Value
             $errors.Add(('line {0}: control character 0x{1:X2}; a shell probably interpreted a backslash escape (\a \b \f \r)' -f $lineNumber, $code))
+        }
+        # The same escape accident applied to "\r": a CR that is not part of a
+        # CRLF pair. Reported on every line (fenced code included) because it
+        # corrupts the document itself, not just a snippet.
+        if ($line.IndexOf([char] 0x0D) -ge 0) {
+            $errors.Add(('line {0}: lone CR (0x0D) not followed by LF; a shell probably interpreted a "\r" escape' -f $lineNumber))
         }
         if (-not $SkipQuestionRun -and -not $inFence) {
             # Inline code is skipped too: `a ?? b` is a legitimate TypeScript
@@ -167,7 +180,7 @@ function Write-PrTextReport {
         Write-Host 'Fix the file and send it again with --body-file (see AGENTS.md, PR text encoding rule).'
         return 1
     }
-    Write-Host "ok: ${FilePath}: valid UTF-8, no control characters, no '??' runs ($($Result.Text.Length) characters)"
+    Write-Host "ok: ${FilePath}: valid UTF-8, no control characters, no lone CR, no '??' runs ($($Result.Text.Length) characters)"
     return 0
 }
 
