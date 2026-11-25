@@ -98,10 +98,13 @@ jobs:
       - name: User sandbox privilege drop (root)
         run: sudo env PATH="$PATH" GOMODCACHE="$(go env GOMODCACHE)" GOCACHE=/tmp/aegis-go-cache HOME=/tmp go test ./internal/builds -run TestUserSandboxRunsAsTargetAccount -count=1 -v
 
-  # Supply-chain check, not a build gate: the code that ships is built by the
-  # backend job. govulncheck@latest declares a newer Go toolchain than
-  # backend/go.mod's `go` directive, so the scanner is built with the latest
-  # stable toolchain while the module graph it scans is still backend/go.mod.
+  # Supply-chain gate. The Go module graph was upgraded together with the Go
+  # toolchain (#81), so reachable module-level vulnerabilities are expected to be
+  # zero; a finding now blocks the PR. govulncheck@latest declares a newer Go
+  # toolchain than backend/go.mod's `go` directive, so the scanner is built with
+  # the latest stable toolchain while the module graph it scans is still
+  # backend/go.mod. Standard-library findings track the scanner toolchain: keep
+  # `go-version: stable` current instead of reintroducing continue-on-error.
   security:
     name: security
     runs-on: ubuntu-latest
@@ -117,12 +120,11 @@ jobs:
           cache-dependency-path: backend/go.sum
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
-      # Advisory for now: the current module graph reports known vulnerabilities
-      # (see the PR risk section / backend/README.md). TODO: drop
-      # continue-on-error after the Go module baseline is upgraded and this job
-      # has been green on main, so regressions block the merge.
+      # Blocking: a reachable vulnerability in the scanned module graph fails
+      # the job (the module baseline is upgraded, so this is a regression gate
+      # now). Standard-library findings are fixed by keeping `go-version` on a
+      # current stable patch release, not by making this step advisory again.
       - name: Scan for known vulnerabilities
-        continue-on-error: true
         run: '"$(go env GOPATH)/bin/govulncheck" ./...'
 
   # The backend job runs on Linux. This job keeps the Windows development path
