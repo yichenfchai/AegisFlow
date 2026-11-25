@@ -137,4 +137,20 @@ describe('streamBuildEvents timeouts', () => {
     await expect(pending).resolves.toBe('terminal')
     expect(vi.getTimerCount()).toBe(0)
   })
+
+  it('localizes a malformed frame instead of leaking the parser error', async () => {
+    vi.useFakeTimers()
+    stubFetch((controller) => {
+      controller.enqueue(encoder.encode('event: status\ndata: not-json\n\n'))
+    })
+    const pending = streamBuildEvents('b1', 0, new AbortController().signal, callbacks(), {
+      firstFrameMs: 1000,
+      idleMs: 1000,
+    })
+    await expect(pending).rejects.toMatchObject({
+      code: 'invalid_response',
+      message: '服务返回了无效响应，请稍后重试',
+    })
+    expect(vi.getTimerCount()).toBe(0)
+  })
 })

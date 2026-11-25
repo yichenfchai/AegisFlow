@@ -146,6 +146,16 @@ test('账号管理：创建、重置、禁用、审计与自助安全', async ({
   await row.getByRole('button', { name: '禁用', exact: true }).click()
   await page.getByRole('button', { name: '确认禁用' }).click()
   await expect(row.getByText('已禁用')).toBeVisible()
+  // 禁用账号即使密码正确也无法登录（403 account_disabled）：登录页显示中文提示，
+  // 不渲染后端英文 message。
+  const disabledCtx = await page.context().browser()!.newContext()
+  const disabledPage = await disabledCtx.newPage()
+  await disabledPage.goto('/login')
+  await disabledPage.getByLabel('用户名', { exact: true }).fill(memberName)
+  await disabledPage.getByLabel('密码', { exact: true }).fill('Acct-newpass-2026')
+  await disabledPage.getByRole('button', { name: '登录', exact: true }).click()
+  await expect(disabledPage.getByRole('alert')).toContainText('账号已被禁用，请联系管理员')
+  await disabledCtx.close()
   // 审计页可查询全部管理操作。断言限定在表格内：筛选下拉里也有同名选项。
   await page.getByRole('button', { name: '审计', exact: true }).click()
   const auditTable = page.getByRole('table')
@@ -228,6 +238,27 @@ test('项目管理：创建、归档恢复与角色限制', async ({ page }) => 
   await expect(projectAuditTable.getByText('创建项目').first()).toBeVisible()
   await expect(projectAuditTable.getByText('归档项目').first()).toBeVisible()
   await expect(projectAuditTable.getByText('恢复项目').first()).toBeVisible()
+  // 服务端校验失败与权限失败都展示统一的错误码中文文案，不泄露后端英文说明。
+  const apiMessages = await page.evaluate(async () => {
+    const { apiRequest } = await import('/src/stores/session.ts')
+    const read = async (request: Promise<unknown>) => {
+      try {
+        await request
+        return ''
+      } catch (error) {
+        return (error as { message: string }).message
+      }
+    }
+    return {
+      validation: await read(
+        apiRequest('/projects', { method: 'POST', body: JSON.stringify({ name: 'a' }) }),
+      ),
+      notFound: await read(apiRequest('/projects/0000000000000000')),
+    }
+  })
+  expect(apiMessages.validation).toBe('提交的内容不合法，请检查后重试')
+  expect(apiMessages.notFound).toBe('请求的资源不存在，或你没有查看权限')
+
   // viewer 可读列表但没有创建入口，直连 API 也被拒绝。
   const username = `proj-viewer-${Date.now()}`
   await page.getByRole('button', { name: '用户管理' }).click()

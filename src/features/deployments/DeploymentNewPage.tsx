@@ -10,6 +10,7 @@ import {
 } from '@/api/deployTasks'
 import { projectsAPI } from '@/api/projects'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 
 const VERSION_PATTERN = /^[A-Za-z0-9._+-]{1,64}$/
 
@@ -20,10 +21,8 @@ function createError(cause: unknown): string {
     }
     if (cause.status === 403) return '你在该项目没有部署权限：需要项目维护者或被允许的成员角色'
     if (cause.status === 404) return '项目不存在、对你不可见，或你在该项目没有写权限'
-    if (cause.status === 503) return '服务依赖不可用，请稍后重试'
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return cause instanceof Error ? cause.message : '创建部署失败，请稍后重试'
+  return errorText(cause, '创建部署失败，请稍后重试')
 }
 
 const targetLabel = (target: DeploymentTargetOption) =>

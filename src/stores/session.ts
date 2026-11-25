@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { ApiError, authAPI, httpRequest } from '@/api/http'
 import type { AuthSession, SessionUser } from '@/api/http'
+import { errorText } from '@/api/errors'
 
 export type { SessionUser }
 interface SessionState {
@@ -90,9 +91,10 @@ function clearSession() {
   useSession.setState({ user: null, accessToken: null, status: 'anonymous', error: null })
 }
 export function errorMessage(error: unknown): string {
-  if (error instanceof ApiError && error.code === 'account_disabled') return '账号已被禁用，请联系管理员'
+  // 登录表单里 401 既可能是密码错误也可能是会话过期，给出更贴近登录场景的提示；
+  // 其余错误（含 account_disabled、网络错误等）都走统一的错误码 → 中文映射。
   if (error instanceof ApiError && error.status === 401) return '账号、密码错误或会话已过期，请重新登录'
-  return error instanceof Error ? error.message : '请求失败，请稍后重试'
+  return errorText(error, '请求失败，请稍后重试')
 }
 function isUnauthorized(error: unknown) { return error instanceof ApiError && error.status === 401 }
 async function withSessionLock<T>(action: () => Promise<T>): Promise<T> {

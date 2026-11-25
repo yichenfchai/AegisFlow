@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Navigate, Outlet, useLocation } from 'react-router'
 import { useSession } from '@/stores/session'
+import { errorText } from '@/api/errors'
 import { Button } from '@/components/ui/DataTable'
 import { safeReturnTo } from './returnTo'
 
@@ -17,7 +18,7 @@ export function SessionGate({ children, publicOnly = false, adminOnly = false }:
   useEffect(() => {
     // The store owns initial restoration and StrictMode request deduplication.
     void restore().catch((cause: unknown) => {
-      setRestoreError(cause instanceof Error ? cause.message : '无法恢复会话，请重试')
+      setRestoreError(errorText(cause, '无法恢复会话，请重试'))
     })
   }, [restore])
 
@@ -27,7 +28,7 @@ export function SessionGate({ children, publicOnly = false, adminOnly = false }:
     try {
       await restore()
     } catch (cause) {
-      setRestoreError(cause instanceof Error ? cause.message : '无法恢复会话，请重试')
+      setRestoreError(errorText(cause, '无法恢复会话，请重试'))
     } finally {
       setRetrying(false)
     }

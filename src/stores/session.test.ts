@@ -224,4 +224,21 @@ describe('session store', () => {
     await expect(apiRequest('/jobs')).rejects.toMatchObject({ status: 401, code: 'unauthorized' })
     expect(called).toBe(false)
   })
+
+  it('login surfaces the Chinese account_disabled message instead of the backend message', async () => {
+    const { useSession, errorMessage } = await freshStore()
+    fetchMock = () => jsonResponse(403, null, 'account_disabled')
+    const error = await useSession.getState().login('admin', 'pw', false).catch((cause: unknown) => cause)
+    expect(errorMessage(error)).toBe('账号已被禁用，请联系管理员')
+    expect(errorMessage(error)).not.toContain('api message')
+  })
+
+  it('restore localizes a backend error instead of showing its English message', async () => {
+    const { useSession } = await freshStore()
+    fetchMock = () => jsonResponse(500, null, 'internal_error')
+    await useSession.getState().restore()
+    expect(useSession.getState().status).toBe('error')
+    expect(useSession.getState().error).toBe('服务器内部错误，请稍后重试')
+    expect(useSession.getState().error).not.toContain('api message')
+  })
 })
