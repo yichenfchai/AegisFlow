@@ -104,7 +104,11 @@ type Options struct {
 	HealthCheckAttempts int
 	// HealthCheckInterval waits between those probes; zero means 2s.
 	HealthCheckInterval time.Duration
-	HTTPClient          *http.Client
+	// HTTPClient overrides the probe/deploy client. The network guard (see
+	// netguard.go) is still installed when its Transport is nil or an
+	// *http.Transport; a fully custom RoundTripper dials on its own and must
+	// provide an equivalent guard itself.
+	HTTPClient *http.Client
 }
 
 // Target is the public view of a deployment target. Secret material is never
@@ -210,6 +214,8 @@ func New(db *sql.DB, opts Options) *Service {
 	client := opts.HTTPClient
 	if client == nil {
 		client = defaultHTTPClient()
+	} else {
+		client = withTargetDialGuard(client)
 	}
 	environments := opts.ApprovalEnvironments
 	if environments == nil {
@@ -235,7 +241,8 @@ func New(db *sql.DB, opts Options) *Service {
 		claimLease = minNotificationClaimLease
 	}
 	webhookClient := &http.Client{
-		Timeout: webhookTimeout,
+		Timeout:   webhookTimeout,
+		Transport: guardedTransport(),
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			// A webhook redirect could send the signed body to an unintended
 			// host; treat it as a delivery failure instead of following it.
@@ -279,21 +286,26 @@ func (s *Service) wake() {
 	}
 }
 
+// defaultHTTPClient is the probe/deploy client: cross-host redirects are
+// refused and every connection goes through the network guard.
 func defaultHTTPClient() *http.Client {
-	return &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 3 {
-			return errors.New("stopped after 3 redirects")
-		}
-		if req.URL.Host != via[0].URL.Host {
-			return errors.New("refusing cross-host redirect")
-		}
-		// Never let a redirect downgrade a TLS probe to cleartext: the stored
-		// secret travels in the Authorization header of every hop.
-		if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
-			return errors.New("refusing redirect from https to plain http")
-		}
-		return nil
-	}}
+	return &http.Client{
+		Transport: guardedTransport(),
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("stopped after 3 redirects")
+			}
+			if req.URL.Host != via[0].URL.Host {
+				return errors.New("refusing cross-host redirect")
+			}
+			// Never let a redirect downgrade a TLS probe to cleartext: the stored
+			// secret travels in the Authorization header of every hop.
+			if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+				return errors.New("refusing redirect from https to plain http")
+			}
+			return nil
+		},
+	}
 }
 
 // secretReady reports whether encryption at rest is configured.
@@ -423,7 +435,9 @@ func normalizeDeployPath(deployPath string) (string, error) {
 
 // validateEndpoint accepts an http(s) URL with a host and no userinfo, query or
 // fragment: the probe appends healthPath, so those components would either
-// confuse the probe or leak credentials into logs.
+// confuse the probe or leak credentials into logs. A host that is an IP literal
+// in a cloud metadata or link-local range is refused here; a hostname is checked
+// again per connection by the dial guard, which also covers DNS rebinding.
 func validateEndpoint(endpoint string) error {
 	if !utf8.ValidString(endpoint) || endpoint == "" || len(endpoint) > 2048 {
 		return fmt.Errorf("%w: endpoint must be a valid URL of at most 2048 bytes", ErrValidation)
@@ -434,6 +448,9 @@ func validateEndpoint(endpoint string) error {
 	parsed, err := url.Parse(endpoint)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" {
 		return fmt.Errorf("%w: endpoint must be an http or https URL with a host", ErrValidation)
+	}
+	if blockedTargetHost(parsed.Hostname()) {
+		return fmt.Errorf("%w: endpoint host must not be a link-local or cloud metadata address", ErrValidation)
 	}
 	if parsed.User != nil {
 		return fmt.Errorf("%w: endpoint must not contain userinfo", ErrValidation)
