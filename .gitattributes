@@ -1,0 +1,13 @@
+# Keep every text file LF in the repository and in the working tree; the
+# existing tracked files are already LF, so this only prevents future drift.
+* text=auto eol=lf
+
+# Binary assets must never be normalized or diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary

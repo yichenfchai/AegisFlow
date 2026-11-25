@@ -189,6 +189,12 @@ type Service struct {
 	// healthInterval spaces the probes.
 	healthAttempts int
 	healthInterval time.Duration
+	// notificationClaimLease bounds how long a claimed outbox row is invisible
+	// to other replicas; it always exceeds the maximum allowed webhook delivery.
+	notificationClaimLease time.Duration
+	// rekeyBeforeWrite is a test hook invoked before one rekey write, so a test
+	// can replace the ciphertext between the snapshot and the compare-and-swap.
+	rekeyBeforeWrite func(targetID string)
 	// leaseRetry overrides the standby lease retry in tests.
 	leaseRetry time.Duration
 }
@@ -227,6 +233,13 @@ func New(db *sql.DB, opts Options) *Service {
 	if webhookTimeout <= 0 {
 		webhookTimeout = defaultWebhookTimeout
 	}
+	// A claim lease shorter than the delivery bound would let another replica
+	// re-claim (and re-deliver) a row while the first delivery is still in
+	// flight; derive it from the configured timeout plus a fixed headroom.
+	claimLease := webhookTimeout + 30*time.Second
+	if claimLease < minNotificationClaimLease {
+		claimLease = minNotificationClaimLease
+	}
 	webhookClient := &http.Client{
 		Timeout:   webhookTimeout,
 		Transport: guardedTransport(),
@@ -245,22 +258,23 @@ func New(db *sql.DB, opts Options) *Service {
 		healthAttempts = 0
 	}
 	return &Service{
-		db:                   db,
-		projects:             opts.Projects,
-		secretKey:            append([]byte(nil), opts.SecretKey...),
-		previousKey:          append([]byte(nil), opts.PreviousSecretKey...),
-		checkTimeout:         timeout,
-		deployTimeout:        deployTimeout,
-		httpClient:           client,
-		approvalEnvironments: approvalSet,
-		approvalTTL:          approvalTTL,
-		webhookURL:           opts.ApprovalWebhookURL,
-		webhookSecret:        append([]byte(nil), opts.ApprovalWebhookSecret...),
-		webhookClient:        webhookClient,
-		notify:               make(chan struct{}, 1),
-		healthAttempts:       healthAttempts,
-		healthInterval:       healthInterval,
-		leaseRetry:           defaultLeaseRetry,
+		db:                     db,
+		projects:               opts.Projects,
+		secretKey:              append([]byte(nil), opts.SecretKey...),
+		previousKey:            append([]byte(nil), opts.PreviousSecretKey...),
+		checkTimeout:           timeout,
+		deployTimeout:          deployTimeout,
+		httpClient:             client,
+		approvalEnvironments:   approvalSet,
+		approvalTTL:            approvalTTL,
+		webhookURL:             opts.ApprovalWebhookURL,
+		webhookSecret:          append([]byte(nil), opts.ApprovalWebhookSecret...),
+		webhookClient:          webhookClient,
+		notify:                 make(chan struct{}, 1),
+		healthAttempts:         healthAttempts,
+		healthInterval:         healthInterval,
+		notificationClaimLease: claimLease,
+		leaseRetry:             defaultLeaseRetry,
 	}
 }
 

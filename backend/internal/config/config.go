@@ -59,8 +59,10 @@ type Config struct {
 	// DeployHealthInterval spaces those probes (default 2s, 1s–1m).
 	DeployHealthInterval time.Duration
 	// ApprovalEnvironments lists target environments that require an approval
-	// before execution. An empty slice disables approvals; when the variable is
-	// unset the default is ["production"].
+	// before execution. When the variable is unset the default is
+	// ["production"]; an explicitly set empty value (including only
+	// commas/whitespace) disables approvals and keeps the slice non-nil so
+	// callers cannot confuse it with the unset default.
 	ApprovalEnvironments []string
 	// ApprovalTTL bounds how long a pending approval stays valid (default 24h).
 	ApprovalTTL time.Duration
@@ -252,10 +254,14 @@ func Load() (Config, error) {
 	// Deployment approvals. Presence of the variable is authoritative: an
 	// explicitly empty value disables approvals, while an unset variable uses
 	// the production default. Only the three documented environments are valid.
+	// The result is always non-nil: deployments.New treats nil as "unset,
+	// default to production", so returning nil for an explicit empty value
+	// would silently re-enable approvals.
 	rawEnvironments, present := os.LookupEnv("AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
 	if !present {
 		rawEnvironments = "production"
 	}
+	c.ApprovalEnvironments = []string{}
 	for _, entry := range strings.Split(rawEnvironments, ",") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {

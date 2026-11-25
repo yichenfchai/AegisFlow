@@ -12,6 +12,13 @@ async function login(page: Page, remember = true) {
   await expect(page).toHaveURL('/')
 }
 
+/** 头像打开用户菜单 → 退出登录 → 确认，避免单击头像直接登出。 */
+async function logout(page: Page) {
+  await page.getByRole('button', { name: '打开用户菜单' }).click()
+  await page.getByRole('menuitem', { name: '退出登录' }).click()
+  await page.getByRole('button', { name: '确认退出' }).click()
+}
+
 test('真实登录、恢复、并发刷新、多标签页和退出撤销', async ({ page, context }) => {
   await page.goto('/settings')
   await expect(page).toHaveURL(/\/login/)
@@ -28,10 +35,10 @@ test('真实登录、恢复、并发刷新、多标签页和退出撤销', async
   expect(await page.evaluate(() => localStorage.getItem('gp_session'))).toBeNull()
   expect(await page.evaluate(() => document.cookie)).not.toContain('aegis_refresh')
   await page.reload()
-  await expect(page.getByRole('button', { name: '退出登录' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '打开用户菜单' })).toBeVisible()
   const other = await context.newPage()
   await Promise.all([other.goto('/'), page.reload()])
-  await expect(other.getByRole('button', { name: '退出登录' })).toBeVisible()
+  await expect(other.getByRole('button', { name: '打开用户菜单' })).toBeVisible()
   // Allow the three-second access token to expire while leaving the real refresh cookie valid.
   await page.waitForTimeout(3200)
   const result = await page.evaluate(async () => {
@@ -40,7 +47,7 @@ test('真实登录、恢复、并发刷新、多标签页和退出撤销', async
     return { values, token: useSession.getState().accessToken }
   })
   expect(result.values.every(u => u.username === admin.username)).toBe(true)
-  await page.getByRole('button', { name: '退出登录' }).click()
+  await logout(page)
   await expect(page).toHaveURL(/\/login/)
   await expect(other).toHaveURL(/\/login/)
   const revoked = await page.request.get('/api/v1/auth/me', { headers: { Authorization: `Bearer ${result.token}` } })
@@ -65,11 +72,11 @@ test('401最多重试一次、403不刷新、退出失败可重试', async ({ pa
   expect(attempts).toBe(2)
   await page.unroute('**/api/v1/auth/me')
   await page.route('**/api/v1/auth/logout', route => route.abort('failed'))
-  await page.getByRole('button', { name: '退出登录' }).click()
+  await logout(page)
   await expect(page.getByText(/无法连接服务/)).toBeVisible()
   await expect(page).toHaveURL('/')
   await page.unroute('**/api/v1/auth/logout')
-  await page.getByRole('button', { name: '退出登录' }).click()
+  await page.getByRole('button', { name: '重试退出' }).click()
   await expect(page).toHaveURL(/\/login/)
 })
 
@@ -84,7 +91,7 @@ test('会话 Cookie、失效刷新及非管理员限制', async ({ page, context
     return apiRequest<{ role: string }>('/users', { method: 'POST', body: JSON.stringify({ username, password, displayName: 'Test Viewer', role: 'viewer' }) })
   }, { username, password })
   expect(created.role).toBe('viewer')
-  await page.getByRole('button', { name: '退出登录' }).click()
+  await logout(page)
   await page.getByLabel('用户名', { exact: true }).fill(username)
   await page.getByLabel('密码', { exact: true }).fill(password)
   await page.getByRole('button', { name: '登录', exact: true }).click()
@@ -188,7 +195,7 @@ test('项目管理：创建、归档恢复与角色限制', async ({ page }) => 
   await page.getByLabel('项目名称').fill(name)
   await page.getByLabel('描述').fill('E2E 验证项目')
   await page.getByLabel('仓库地址 / 本地路径').fill('https://github.com/example/e2e.git')
-  await page.getByLabel('默认分支').selectOption('main')
+  await page.getByLabel('默认分支').fill('main')
   await page.getByRole('button', { name: '创建项目', exact: true }).click()
   await expect(page).toHaveURL('/')
   const row = page.getByRole('row', { name: new RegExp(name) })

@@ -136,7 +136,12 @@ func run(logger *slog.Logger) error {
 	if cfg.MetricsAddr != "" {
 		monitoring = metrics.New()
 	}
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Metrics: monitoring})
+	// Register the termination signal before building the handler: streaming
+	// handlers end their connections on this context, while server.Shutdown
+	// alone would wait out its 10s drain whenever an SSE client is connected.
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Metrics: monitoring, ShutdownContext: signalCtx})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	if monitoring != nil {
 		mux := http.NewServeMux()
@@ -169,8 +174,6 @@ func run(logger *slog.Logger) error {
 			_ = metricsServer.Shutdown(shutdownCtx)
 		}()
 	}
-	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	// The worker finalizes its in-flight build as interrupted when this
 	// context is cancelled by the shutdown path.
 	workerCtx, stopWorker := context.WithCancel(signalCtx)

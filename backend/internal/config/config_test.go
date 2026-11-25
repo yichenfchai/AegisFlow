@@ -437,7 +437,7 @@ func TestDeployHealthConfig(t *testing.T) {
 }
 
 func TestApprovalConfig(t *testing.T) {
-	t.Run("defaults", func(t *testing.T) {
+	t.Run("unset defaults to production", func(t *testing.T) {
 		setup(t)
 		c, err := Load()
 		if err != nil {
@@ -453,10 +453,11 @@ func TestApprovalConfig(t *testing.T) {
 		want    []string
 		invalid bool
 	}{
-		{"empty disables approvals", "", nil, false},
+		{"empty disables approvals", "", []string{}, false},
+		{"comma only disables approvals", ",", []string{}, false},
+		{"spaces and commas disable approvals", "  ,  ", []string{}, false},
 		{"single staging", "staging", []string{"staging"}, false},
 		{"trim and dedupe", " development , production ,production", []string{"development", "production"}, false},
-		{"spaces only disables", "  ,  ", nil, false},
 		{"unknown environment", "qa", nil, true},
 		{"wrong case", "Production", nil, true},
 		{"one unknown among valid", "staging,qa", nil, true},
@@ -465,8 +466,20 @@ func TestApprovalConfig(t *testing.T) {
 			setup(t)
 			t.Setenv("AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS", tc.value)
 			c, err := Load()
-			if (err != nil) != tc.invalid || (!tc.invalid && !slices.Equal(c.ApprovalEnvironments, tc.want)) {
+			if (err != nil) != tc.invalid {
 				t.Fatalf("environments=%v err=%v", c.ApprovalEnvironments, err)
+			}
+			if tc.invalid {
+				return
+			}
+			if !slices.Equal(c.ApprovalEnvironments, tc.want) {
+				t.Fatalf("environments=%v want=%v", c.ApprovalEnvironments, tc.want)
+			}
+			// P1-02: an explicitly set variable must never look unset. A nil
+			// result makes deployments.New fall back to ["production"], so an
+			// explicitly empty value must be a non-nil, zero-length slice.
+			if c.ApprovalEnvironments == nil {
+				t.Fatalf("explicit AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS=%q produced nil; want non-nil empty slice", tc.value)
 			}
 		})
 	}
