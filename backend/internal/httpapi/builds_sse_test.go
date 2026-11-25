@@ -3,6 +3,8 @@ package httpapi
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -210,5 +212,84 @@ func TestBuildEventsStreamStopsOnShutdown(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed >= time.Second {
 		t.Fatalf("stream ended after %v, want under 1s", elapsed)
+	}
+}
+
+// TestBuildEventsStreamConnectionLimit is the P2-14 regression: every live
+// stream holds a goroutine that queries PostgreSQL twice per 500ms tick, so an
+// unbounded stream count lets slow clients exhaust the process and its database
+// pool. With the cap set to one, a second concurrent stream must be rejected
+// fast with the shared 503 not_ready envelope, and a released slot must be
+// reusable by a later stream.
+func TestBuildEventsStreamConnectionLimit(t *testing.T) {
+	previousLimit := sseMaxConnections
+	sseMaxConnections = 1
+	t.Cleanup(func() { sseMaxConnections = previousLimit })
+
+	h, _ := testServer(t)
+	server := httptest.NewUnstartedServer(h)
+	server.Start()
+	defer server.Close()
+
+	adminToken, _, _ := loginHTTP(t, h, "admin", "a-strong-password")
+	projectID := createBuildableProject(t, h, adminToken, "sse-limit", slowShutdownCommand())
+	buildID := triggerBuild(t, h, adminToken, projectID, `{}`)
+	streamURL := server.URL + "/api/v1/builds/" + buildID + "/events"
+	open := func() *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, streamURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Accept", "text/event-stream")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	first := open()
+	if first.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(first.Body)
+		first.Body.Close()
+		t.Fatalf("first stream = %d %s, want 200", first.StatusCode, body)
+	}
+	// The 200 response is committed only after the handler reserved a slot, so
+	// the cap is already occupied when the second request arrives.
+	second := open()
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second concurrent stream = %d, want 503", second.StatusCode)
+	}
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(second.Body).Decode(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Error.Code != "not_ready" {
+		t.Fatalf("capacity error code = %q, want not_ready", envelope.Error.Code)
+	}
+
+	// Once the client disconnects, the handler releases the slot and a new
+	// stream is accepted again.
+	first.Body.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp := open()
+		if resp.StatusCode == http.StatusOK {
+			resp.Body.Close()
+			break
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if time.Now().After(deadline) {
+			t.Fatalf("stream slot was not released after the first client disconnected")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

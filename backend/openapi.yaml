@@ -20,8 +20,9 @@ info:
     mutation. This applies to same-origin clients and non-browser scripts as well.
     Origin null is not allowed. Any supplied Origin on other routes must also be
     allowlisted. CORS reflects the allowed Origin, enables credentials, and varies
-    on Origin and Sec-Fetch-Site. OPTIONS returns 204 with GET, POST, OPTIONS and
-    Authorization, Content-Type allowed; its Vary also covers request method/headers.
+    on Origin and Sec-Fetch-Site. OPTIONS returns 204 with GET, POST, PATCH,
+    DELETE, OPTIONS and Authorization, Content-Type allowed; its Vary also covers
+    request method/headers.
 
     Login/refresh set a host-only aegis_refresh cookie, Path=/api/v1/auth, HttpOnly,
     SameSite=Strict. Secure is explicitly AEGIS_COOKIE_SECURE (default false locally;
@@ -1061,7 +1062,9 @@ paths:
         streams so shutdown is not delayed. Comment frames (`: ping`) keep
         intermediaries open. Resume with `Last-Event-ID` (or `?after=`). Clients
         must send the bearer token on a streaming request; RBAC matches the
-        polling logs endpoint.
+        polling logs endpoint. Concurrent streams are capped (64 by default);
+        when the cap is reached the request fails fast with 503 and error.code
+        `not_ready`, so clients should retry after an existing stream closes.
       security:
         - bearerAuth: []
       parameters:
@@ -1088,6 +1091,11 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
+        '503':
+          description: Concurrent stream capacity is full; error.code is not_ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
   /api/v1/builds/{buildId}/cancel:
     post:
       tags: [Builds]

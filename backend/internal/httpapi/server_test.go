@@ -3,12 +3,14 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -203,4 +205,77 @@ func TestForwardedHeadersCannotBypassLoginLimit(t *testing.T) {
 			t.Fatalf("forwarded headers bypassed limit: %d", w.Code)
 		}
 	}
+}
+
+// TestCORSPreflightAdvertisesWriteMethods is the P2-15 regression: the API
+// registers PATCH and DELETE endpoints, so the preflight response must list
+// those methods or a browser blocks the real request before it is sent.
+func TestCORSPreflightAdvertisesWriteMethods(t *testing.T) {
+	h, _ := testServer(t)
+	r := httptest.NewRequest("OPTIONS", "/api/v1/projects/some-project-id", nil)
+	r.Header.Set("Origin", "http://localhost:5173")
+	r.Header.Set("Access-Control-Request-Method", "PATCH")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d %s, want 204", w.Code, w.Body.String())
+	}
+	if got, want := w.Header().Get("Access-Control-Allow-Methods"), "GET, POST, PATCH, DELETE, OPTIONS"; got != want {
+		t.Fatalf("Access-Control-Allow-Methods = %q, want %q", got, want)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Headers"); got != "Authorization, Content-Type" {
+		t.Fatalf("Access-Control-Allow-Headers = %q", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:5173" {
+		t.Fatalf("Access-Control-Allow-Origin = %q", got)
+	}
+}
+
+// TestReadyzCachesDependencyProbes is the P2-16 regression: /readyz used to ping
+// PostgreSQL and Redis on every unauthenticated request, turning the endpoint
+// into a dependency-load amplifier. Probes are cached for one second, and both
+// successful and failed results are cached.
+func TestReadyzCachesDependencyProbes(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	origins := []string{"http://localhost:5173"}
+
+	t.Run("failure cached", func(t *testing.T) {
+		var calls atomic.Int64
+		handler := New(nil, logger, func(context.Context) error {
+			calls.Add(1)
+			return errors.New("dependencies down")
+		}, origins)
+		for i := 0; i < 2; i++ {
+			w := request(handler, "GET", "/readyz", "", "")
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("readyz call %d = %d %s, want 503", i, w.Code, w.Body.String())
+			}
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("failed readiness probe ran %d times inside the one-second cache, want 1", got)
+		}
+	})
+
+	t.Run("success cached then refreshed", func(t *testing.T) {
+		var calls atomic.Int64
+		handler := New(nil, logger, func(context.Context) error {
+			calls.Add(1)
+			return nil
+		}, origins)
+		for i := 0; i < 2; i++ {
+			if w := request(handler, "GET", "/readyz", "", ""); w.Code != http.StatusOK {
+				t.Fatalf("readyz call %d = %d %s, want 200", i, w.Code, w.Body.String())
+			}
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("readiness probe ran %d times inside the one-second cache, want 1", got)
+		}
+		time.Sleep(1100 * time.Millisecond)
+		if w := request(handler, "GET", "/readyz", "", ""); w.Code != http.StatusOK {
+			t.Fatalf("readyz after cache expiry = %d %s, want 200", w.Code, w.Body.String())
+		}
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("readiness probe ran %d times after the cache expired, want 2", got)
+		}
+	})
 }
