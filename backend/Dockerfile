@@ -2,7 +2,7 @@
 # Docker's official image metadata, docker-library/repo-info) so a moved tag
 # cannot change the build. Refresh with `docker manifest inspect <image:tag>`
 # when the Go or Alpine line is bumped.
-FROM golang:1.25-alpine@sha256:1e0126852075c9c60731c8ba49088448b91f63e2aed97ca9d1a9791622a05946 AS build
+FROM golang:1.26-alpine@sha256:ecb67f987aa1a57794c91d19ade7ae0209f2f0f5496aaef9e6ae85ddf92d02ab AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
