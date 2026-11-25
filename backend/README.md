@@ -1,6 +1,6 @@
 # AegisFlow Go 后端
 
-Go 1.23+，Gin 1.11 + slog，PostgreSQL（pgx）+ Redis 共享限流，多应用实例部署，bcrypt，HS256 JWT。浏览器鉴权采用短期 Bearer access token + HttpOnly refresh Cookie；推荐前后端通过**同源代理**部署。项目注册表、最小构建闭环（触发、列表、详情、取消、游标日志）、部署目标、部署任务、部署审批与审批 Webhook 通知已实现；代码审查、安全扫描、知识库、攻击防御、自动化策略、独立密钥管理、LDAP/OIDC 与多租户等其余业务接口尚未实现。完整接口契约见 [openapi.yaml](openapi.yaml)。
+Go 1.26+，Gin 1.12 + slog，PostgreSQL（pgx）+ Redis 共享限流，多应用实例部署，bcrypt，HS256 JWT。浏览器鉴权采用短期 Bearer access token + HttpOnly refresh Cookie；推荐前后端通过**同源代理**部署。项目注册表、最小构建闭环（触发、列表、详情、取消、游标日志）、部署目标、部署任务、部署审批与审批 Webhook 通知已实现；代码审查、安全扫描、知识库、攻击防御、自动化策略、独立密钥管理、LDAP/OIDC 与多租户等其余业务接口尚未实现。完整接口契约见 [openapi.yaml](openapi.yaml)。
 
 ## 本地启动（PowerShell）
 
@@ -268,6 +268,6 @@ CI（[.github/workflows/ci.yml](../.github/workflows/ci.yml)）在 `backend`（L
 
 ## 架构
 
-cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；worker 通过租约启动并随信号上下文退出；进程生命周期验收测试见 cmd/server/ops_test.go）；cmd/rekey 是一次性维护命令，用当前钥与退役钥把存量部署凭据重加密（默认 dry run、`-apply` 才写）；internal/config 校验连接 URL、连接数、登录配额、凭据密钥与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、可见性与成员、分页与事务内审计，读写都带可见性谓词，不依赖 Gin）；internal/builds 是构建流水线（触发与编号、单 worker 租约、SKIP LOCKED 领取、临时目录执行、取消看门狗、批量日志与重启恢复，不依赖 Gin）；internal/metrics 是零依赖的 Prometheus 文本暴露（HTTP 计数/延迟直方图 + 构建状态 gauge，独立监听）；internal/deployments 是部署目标（CRUD 与探测 admin-only）与部署任务、审批（按项目写权限授权、按项目可见性过滤；目标注册表、AES-256-GCM 凭据加密、连通性探测、部署编号/快照/状态机、租约 worker、事件游标、回滚、审批与事务内审计，不依赖 Gin）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.11 与 Go 1.23 兼容。
+cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；worker 通过租约启动并随信号上下文退出；进程生命周期验收测试见 cmd/server/ops_test.go）；cmd/rekey 是一次性维护命令，用当前钥与退役钥把存量部署凭据重加密（默认 dry run、`-apply` 才写）；internal/config 校验连接 URL、连接数、登录配额、凭据密钥与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、可见性与成员、分页与事务内审计，读写都带可见性谓词，不依赖 Gin）；internal/builds 是构建流水线（触发与编号、单 worker 租约、SKIP LOCKED 领取、临时目录执行、取消看门狗、批量日志与重启恢复，不依赖 Gin）；internal/metrics 是零依赖的 Prometheus 文本暴露（HTTP 计数/延迟直方图 + 构建状态 gauge，独立监听）；internal/deployments 是部署目标（CRUD 与探测 admin-only）与部署任务、审批（按项目写权限授权、按项目可见性过滤；目标注册表、AES-256-GCM 凭据加密、连通性探测、部署编号/快照/状态机、租约 worker、事件游标、回滚、审批与事务内审计，不依赖 Gin）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.12 与 Go 1.26 兼容。
 
 本地双实例样例见 [compose.yaml](../compose.yaml) 与 [部署说明](../deploy/README.md)。应用副本可横向扩展，但数据库、Redis、入口网关的高可用需另行部署；样例单节点依赖不等于整套服务高可用。数据库集成测试未配置 URL 会明确 Skip，不能将跳过当作生产验证通过。
