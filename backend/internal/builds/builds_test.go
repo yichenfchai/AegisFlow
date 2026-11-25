@@ -352,6 +352,37 @@ func TestBuildOutputIsRedacted(t *testing.T) {
 	}
 }
 
+// pemBlockCommand prints a multi-line private-key PEM block followed by a
+// marker line. The body has no recognizable token shape: only the cross-line
+// BEGIN/END state machine can keep it out of the log.
+func pemBlockCommand() string {
+	if runtime.GOOS == "windows" {
+		return "echo -----BEGIN OPENSSH PRIVATE KEY----- & echo cHJpdmF0ZS1rZXktYm9keS1saW5l & echo -----END OPENSSH PRIVATE KEY----- & echo after-key"
+	}
+	return "printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\\ncHJpdmF0ZS1rZXktYm9keS1saW5l\\n-----END OPENSSH PRIVATE KEY-----\\nafter-key\\n'"
+}
+
+// TestBuildOutputRedactsMultilinePrivateKey is the P2-10 end-to-end regression:
+// a PEM key printed over several lines must not reach the log table, while the
+// line after the block still does.
+func TestBuildOutputRedactsMultilinePrivateKey(t *testing.T) {
+	s, registry := testService(t)
+	startWorker(t, s)
+	project := createProject(t, registry, "pem-redaction-project", pemBlockCommand())
+	build, err := s.Trigger(context.Background(), testActor, project.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, s, build.ID, StatusSucceeded)
+	joined := waitForLog(t, s, build.ID, "after-key")
+	if strings.Contains(joined, "cHJpdmF0ZS1rZXktYm9keS1saW5l") {
+		t.Fatalf("private key body leaked into the build log: %s", joined)
+	}
+	if !strings.Contains(joined, "[redacted]") {
+		t.Fatalf("private key block was not marked as redacted: %s", joined)
+	}
+}
+
 // outsiderActor is a global member who is not a member of the private project.
 var outsiderActor = auth.Actor{ID: "outsider-0000000000001", Username: "otto", Role: "member", RequestID: "req-outsider"}
 

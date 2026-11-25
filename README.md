@@ -8,7 +8,7 @@
 
 ## 构建执行边界（P3 第一批）
 
-构建命令在系统临时目录用 shell 执行，超时由 `AEGIS_BUILD_TIMEOUT` 控制，单次工作区大小受 `AEGIS_BUILD_DISK`（默认 2g）约束；状态为排队/运行/成功/失败/取消/中断。多副本通过 PostgreSQL 会话级租约保证同一时刻只有一个 worker：只有持锁副本在启动时把遗留的运行中构建标记为中断并领取任务，其余副本待命，持锁进程消失后自动接管。执行隔离由 `AEGIS_BUILD_SANDBOX` 选择：`container`（生产推荐）为每个构建启动一次性容器——无网络、只读根文件系统、只有构建目录可写，CPU/内存/进程数硬上限，超时或取消会杀掉容器；`user`（仅 Linux，服务需以 root 启动）通过 `setpriv` 把构建降权到 `AEGIS_BUILD_USER` 指定的专用账号；`none`（默认）以服务进程身份执行，仅供开发。三种模式都不继承 `AEGIS_*` 服务凭据，`HOME`/临时目录位于 0700 构建目录，输出在落库前脱敏（fail closed）。`AEGIS_BUILD_CLONE=true` 时先浅克隆项目仓库（`repoUrl`）再在仓库内执行命令，只支持无凭据的 https / `git@` 地址，本地路径需额外开启 `AEGIS_BUILD_ALLOW_LOCAL_REPO`，私有仓库凭据本批不支持。日志与状态优先经 SSE 推送（前端用带 Bearer 的 fetch 流式读取，token 不进 URL），连接失败时自动回退到 `after` 游标轮询。
+构建命令在系统临时目录用 shell 执行，超时由 `AEGIS_BUILD_TIMEOUT` 控制，单次工作区大小受 `AEGIS_BUILD_DISK`（默认 2g）约束（看门狗无法测量目录大小时 fail-closed 取消构建）；状态为排队/运行/成功/失败/取消/中断。多副本通过 PostgreSQL 会话级租约保证同一时刻只有一个 worker：只有持锁副本在启动时把遗留的运行中构建标记为中断并领取任务，其余副本待命，持锁进程消失后自动接管。执行隔离由 `AEGIS_BUILD_SANDBOX` 选择：`container`（生产推荐）为每个构建启动一次性容器——无网络、只读根文件系统、只有构建目录可写，CPU/内存/进程数硬上限，非 Windows 平台以服务进程 uid/gid 的 `--user <uid>:<gid>` 运行（容器内非 root），超时或取消会杀掉容器；`user`（仅 Linux，服务需以 root 启动）通过 `setpriv` 把构建降权到 `AEGIS_BUILD_USER` 指定的专用账号（拒绝 uid 0 的账号）；`none`（默认）以服务进程身份执行，仅供开发。三种模式都不继承 `AEGIS_*` 服务凭据，`HOME`/临时目录位于 0700 构建目录，输出与 system 行在落库前脱敏（多行 PEM 私钥块、任意 scheme 内联凭据、HTTP Basic 均已覆盖，fail closed）。`AEGIS_BUILD_CLONE=true` 时先浅克隆项目仓库（`repoUrl`）再在仓库内执行命令，只支持无凭据的 https / `git@` 地址，本地路径需额外开启 `AEGIS_BUILD_ALLOW_LOCAL_REPO`，私有仓库凭据本批不支持。日志与状态优先经 SSE 推送（前端用带 Bearer 的 fetch 流式读取，token 不进 URL），连接失败时自动回退到 `after` 游标轮询。
 
 ## 本地联调
 

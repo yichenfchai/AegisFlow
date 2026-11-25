@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -72,10 +73,31 @@ func TestContainerCommandArguments(t *testing.T) {
 			t.Fatalf("docker args missing %q: %s", want, args)
 		}
 	}
+	// P2-09: on non-Windows hosts the build must run as the service identity
+	// so the mounted 0700 workspace is writable and the container is not root.
+	// Docker Desktop on Windows maps ids itself, so the flag is omitted there.
+	if uid, gid, known := containerIdentity(); known {
+		if want := "--user " + strconv.Itoa(uid) + ":" + strconv.Itoa(gid); !strings.Contains(args, want) {
+			t.Fatalf("docker args missing %q: %s", want, args)
+		}
+	} else if strings.Contains(args, "--user") {
+		t.Fatalf("docker args carry --user on a platform without host uid mapping: %s", args)
+	}
 	for _, entry := range cmd.Env {
 		if strings.HasPrefix(entry, "AEGIS_") {
 			t.Fatalf("docker client environment leaked %q", entry)
 		}
+	}
+}
+
+// TestContainerUserArgument pins both platform policies without depending on
+// the host: a known identity renders uid:gid, an unknown one omits the flag.
+func TestContainerUserArgument(t *testing.T) {
+	if got := containerUserArgument(1000, 1001, true); len(got) != 2 || got[0] != "--user" || got[1] != "1000:1001" {
+		t.Fatalf("known identity argument = %v", got)
+	}
+	if got := containerUserArgument(0, 0, false); got != nil {
+		t.Fatalf("unknown identity argument = %v, want none", got)
 	}
 }
 

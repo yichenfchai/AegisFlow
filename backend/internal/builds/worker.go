@@ -87,10 +87,13 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 	// operator, or a disk-limit breach; the watchdog and clone share it.
 	runCtx, cancelRun := context.WithCancel(execCtx)
 	defer cancelRun()
-	var diskExceeded atomic.Bool
+	// diskStopped records the watchdog's verdict so the terminal path can log a
+	// reason: a measured breach and an unverifiable workspace fail the build
+	// for different reasons.
+	var diskStopped atomic.Pointer[diskStopReason]
 	if s.diskLimit > 0 {
-		go watchDiskUsage(runCtx, workDir, s.diskLimit, func() {
-			diskExceeded.Store(true)
+		go watchDiskUsage(runCtx, workDir, s.diskLimit, func(reason diskStopReason) {
+			diskStopped.Store(&reason)
 			cancelRun()
 		})
 	}
@@ -130,8 +133,8 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 			writer.systemf("cloning %s (branch %q)", displayRepoURL(build.RepoURL), build.Branch)
 			if err = s.cloneRepository(runCtx, build.RepoURL, build.Branch, workDir); err != nil {
 				switch {
-				case diskExceeded.Load():
-					writer.systemf("build exceeded the disk limit of %s during clone", formatBytes(s.diskLimit))
+				case diskStopped.Load() != nil:
+					writer.systemf("%s", diskStopMessage(diskStopped.Load(), s.diskLimit, " during clone"))
 				case execCtx.Err() == context.DeadlineExceeded:
 					writer.systemf("build timed out after %s during clone", s.timeout)
 				case ctx.Err() != nil:
@@ -257,9 +260,9 @@ func (s *Service) execute(ctx context.Context, build *Build) {
 	watchWG.Wait()
 
 	switch {
-	case diskExceeded.Load():
+	case diskStopped.Load() != nil:
 		s.sandbox.stop(containerName)
-		writer.systemf("build exceeded the disk limit of %s", formatBytes(s.diskLimit))
+		writer.systemf("%s", diskStopMessage(diskStopped.Load(), s.diskLimit, ""))
 		s.finish(build, StatusFailed)
 	case execCtx.Err() == context.DeadlineExceeded:
 		s.sandbox.stop(containerName)
@@ -313,13 +316,50 @@ type logWriter struct {
 	max       int
 	count     int
 	truncated bool
-	// redacted counts credential-shaped values replaced in output; dropped
-	// counts lines withheld because a matched value survived redaction.
+	// redacted counts credential-shaped values (and multi-line private-key
+	// block lines) replaced in output; dropped counts lines withheld because a
+	// matched value survived redaction.
 	redacted int
 	dropped  int
 	done     chan struct{}
 	mu       sync.Mutex
 	pending  []LogEvent
+	// pemOpen tracks, per stream, whether a PEM private-key block is open. The
+	// block has no per-line credential shape, so every line until the matching
+	// END marker must be withheld; per-stream state keeps one pipe's block from
+	// swallowing the other pipe's output. Guarded by mu; nil means no block.
+	pemOpen map[string]bool
+}
+
+// redactMessage applies the cross-line private-key state machine and then the
+// single-line rules. It returns the message to store, the stream it belongs to
+// (block lines become system events), the number of redacted values and the
+// fail-closed flag. The caller must hold w.mu.
+func (w *logWriter) redactMessage(stream, message string) (string, string, int, bool) {
+	begin := privateKeyBeginPattern.MatchString(message)
+	end := privateKeyEndPattern.MatchString(message)
+	if w.pemOpen == nil {
+		w.pemOpen = make(map[string]bool)
+	}
+	switch {
+	case w.pemOpen[stream]:
+		// Stay inside the block until the END marker; a missing END keeps
+		// redacting to the end of the stream (fail closed).
+		if end {
+			delete(w.pemOpen, stream)
+		}
+		return pemRedactedMessage, "system", 1, true
+	case begin:
+		// A complete single-line block never opens the state, and a stray BEGIN
+		// without END keeps the rest of that stream redacted.
+		if !end {
+			w.pemOpen[stream] = true
+		}
+		return pemRedactedMessage, "system", 1, true
+	default:
+		redacted, hits, ok := redactOutputLine(message)
+		return redacted, stream, hits, ok
+	}
 }
 
 func newLogWriter(s *Service, buildID string, max int) *logWriter {
@@ -401,15 +441,14 @@ func (w *logWriter) systemf(format string, args ...any) {
 }
 
 // append caps total events and per-line length; output past the cap drops.
-// Command output is redacted before it is stored: a line whose credential value
-// survives redaction is dropped entirely rather than persisted (fail closed).
+// Every message is redacted before it is stored, including system lines: a line
+// whose credential value survives redaction is dropped entirely rather than
+// persisted (fail closed), and a multi-line private-key block is replaced with
+// one marker per line until its END delimiter.
 func (w *logWriter) append(stream, message string) {
-	hits, ok := 0, true
-	if stream != "system" {
-		message, hits, ok = redactOutputLine(message)
-	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	message, stream, hits, ok := w.redactMessage(stream, message)
 	w.redacted += hits
 	if !ok {
 		w.dropped++
@@ -450,7 +489,7 @@ func (w *logWriter) close() {
 	redacted, dropped := w.redacted, w.dropped
 	w.mu.Unlock()
 	if redacted > 0 {
-		w.systemf("redacted %d sensitive value(s) from build output", redacted)
+		w.systemf("redacted %d sensitive value(s) from build output and system lines", redacted)
 	}
 	if dropped > 0 {
 		w.systemf("dropped %d output line(s) that still matched a sensitive pattern", dropped)

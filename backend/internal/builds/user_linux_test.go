@@ -43,17 +43,45 @@ func TestUserCommandArguments(t *testing.T) {
 }
 
 // TestProbeUserSandbox asserts both halves of the fail-closed preflight: as a
-// non-root process it refuses, and as root it accepts a real account.
+// non-root process it refuses, and as root it accepts a real account and still
+// rejects root as the build account.
 func TestProbeUserSandbox(t *testing.T) {
 	err := ProbeUserSandbox("nobody")
 	if os.Geteuid() == 0 {
 		if err != nil {
 			t.Fatalf("root probe for nobody failed: %v", err)
 		}
+		if err = ProbeUserSandbox("root"); err == nil || !strings.Contains(err.Error(), "uid 0") {
+			t.Fatalf("root probe for root = %v, want a uid 0 rejection", err)
+		}
 		return
 	}
 	if err == nil || !strings.Contains(err.Error(), "root") {
 		t.Fatalf("non-root probe should demand root, got %v", err)
+	}
+}
+
+// TestUserSandboxRejectsRootBuildAccount is the P2-09 regression: setting
+// AEGIS_BUILD_USER=root would silently undo the privilege drop, so the startup
+// probe and every execution path must refuse a uid-0 account. The check runs
+// before any chown, so it is asserted without needing root.
+func TestUserSandboxRejectsRootBuildAccount(t *testing.T) {
+	account, err := user.Lookup("root")
+	if err != nil {
+		t.Fatalf("look up root: %v", err)
+	}
+	if account.Uid != "0" {
+		t.Fatalf("root uid = %q, want 0 on Linux", account.Uid)
+	}
+	if _, err = lookupSandboxUser("root"); err == nil || !strings.Contains(err.Error(), "uid 0") {
+		t.Fatalf("lookup root = %v, want a uid 0 rejection", err)
+	}
+	sandbox := Sandbox{Mode: SandboxUser, User: "root"}
+	if _, err = sandbox.commandForBuild(context.Background(), "n", "/tmp/work", "/tmp/work", "echo hi"); err == nil || !strings.Contains(err.Error(), "uid 0") {
+		t.Fatalf("commandForBuild root = %v, want a uid 0 rejection", err)
+	}
+	if err = sandbox.prepareUserWorkspace(t.TempDir()); err == nil || !strings.Contains(err.Error(), "uid 0") {
+		t.Fatalf("prepareUserWorkspace root = %v, want a uid 0 rejection", err)
 	}
 }
 
