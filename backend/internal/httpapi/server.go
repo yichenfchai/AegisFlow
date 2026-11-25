@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -55,10 +57,23 @@ type Server struct {
 	// shutdownCtx is never nil: New substitutes context.Background() when the
 	// embedder does not pass one, so streaming selects can always wait on it.
 	shutdownCtx context.Context
+	// readyMu guards the /readyz probe cache. Both outcomes are cached, so
+	// unauthenticated readiness polls cannot amplify load on PostgreSQL/Redis.
+	readyMu  sync.Mutex
+	readyErr error
+	readyAt  time.Time
+	// sseConnections counts live build-event streams; the cap lives in
+	// sseMaxConnections.
+	sseConnections atomic.Int64
 }
 
 const refreshCookieName = "aegis_refresh"
 const refreshCookiePath = "/api/v1/auth"
+
+// readyCacheTTL bounds how often /readyz probes shared dependencies. The
+// endpoint is unauthenticated, so a per-request Ping on PostgreSQL and Redis is
+// a cheap way for an external caller to amplify load on both.
+const readyCacheTTL = time.Second
 
 // Options is explicit deployment configuration; Secure is never inferred from headers.
 type Options struct {
@@ -110,9 +125,7 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	router.Use(s.middleware())
 	router.GET("/healthz", func(c *gin.Context) { s.respond(c, 200, gin.H{"status": "ok"}) })
 	router.GET("/readyz", func(c *gin.Context) {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
-		defer cancel()
-		if err := s.ready(ctx); err != nil {
+		if err := s.readyError(c.Request.Context()); err != nil {
 			s.fail(c, 503, "not_ready", "dependencies unavailable")
 			return
 		}
@@ -186,6 +199,29 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }
+
+// readyError probes the shared dependencies behind the readyCacheTTL cache.
+// Success and failure are both cached: a healthy dependency is not re-checked on
+// every poll, and a failing one is not hammered several times per second. The
+// per-probe budget stays at two seconds.
+func (s *Server) readyError(ctx context.Context) error {
+	s.readyMu.Lock()
+	if !s.readyAt.IsZero() && time.Since(s.readyAt) < readyCacheTTL {
+		err := s.readyErr
+		s.readyMu.Unlock()
+		return err
+	}
+	s.readyMu.Unlock()
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	err := s.ready(probeCtx)
+	s.readyMu.Lock()
+	s.readyErr = err
+	s.readyAt = time.Now()
+	s.readyMu.Unlock()
+	return err
+}
+
 func (s *Server) login(c *gin.Context) {
 	// No in-process fallback: all instances must share the same quota.
 	if s.limiter == nil {
@@ -771,6 +807,12 @@ func (s *Server) getBuildLogs(c *gin.Context) {
 	s.respond(c, 200, gin.H{"items": events})
 }
 
+// sseMaxConnections caps concurrent build-event streams. Every stream runs a
+// goroutine that queries PostgreSQL twice per 500ms poll, so an unbounded count
+// lets slow clients exhaust goroutines and database connections. It is a
+// variable so tests can shrink it and restore the default.
+var sseMaxConnections int64 = 64
+
 const (
 	// ssePollInterval is how often a stream checks PostgreSQL for new events.
 	ssePollInterval = 500 * time.Millisecond
@@ -784,7 +826,23 @@ const (
 	sseMaxLifetime = 10 * time.Minute
 	// sseLogBatch bounds the events carried by one frame.
 	sseLogBatch = 500
+	// sseWriteTimeout bounds one frame write so a client that stops reading
+	// cannot pin the stream goroutine in a blocking write.
+	sseWriteTimeout = 10 * time.Second
 )
+
+// acquireSSEConnection reserves one of the sseMaxConnections stream slots; false
+// means the server is at capacity and the caller should fail fast.
+func (s *Server) acquireSSEConnection() bool {
+	if s.sseConnections.Add(1) > sseMaxConnections {
+		s.sseConnections.Add(-1)
+		return false
+	}
+	return true
+}
+
+// releaseSSEConnection returns a slot reserved by acquireSSEConnection.
+func (s *Server) releaseSSEConnection() { s.sseConnections.Add(-1) }
 
 // streamBuildEvents pushes log events and status changes as Server-Sent
 // Events. Fetch-based clients attach the bearer token, so the normal
@@ -805,6 +863,14 @@ func (s *Server) streamBuildEvents(c *gin.Context) {
 	if !ok {
 		return
 	}
+	// Reserve a slot only after the caller has been validated, and before any
+	// response bytes are committed, so an over-capacity request still gets a
+	// clean 503 envelope instead of a truncated event stream.
+	if !s.acquireSSEConnection() {
+		s.fail(c, 503, "not_ready", "build log stream capacity is full; retry later")
+		return
+	}
+	defer s.releaseSSEConnection()
 	// The server-wide WriteTimeout would kill a long-lived stream; clear it for
 	// this response only. ResponseController unwraps Gin's writer.
 	controller := http.NewResponseController(c.Writer)
@@ -818,7 +884,7 @@ func (s *Server) streamBuildEvents(c *gin.Context) {
 	c.Writer.Flush()
 
 	status := build.Status
-	if !writeSSE(c, "status", "", mustJSON(build)) {
+	if !writeSSE(c, controller, "status", "", mustJSON(build)) {
 		return
 	}
 	var quietSince time.Time
@@ -837,12 +903,13 @@ func (s *Server) streamBuildEvents(c *gin.Context) {
 			// so without this branch an open stream would hold the drain until
 			// the shutdown deadline expires and the process exits non-zero.
 			// Tell the client why the stream ended and return immediately.
-			writeSSE(c, "done", "", []byte(`{"reason":"shutdown"}`))
+			writeSSE(c, controller, "done", "", []byte(`{"reason":"shutdown"}`))
 			return
 		case <-lifetime.C:
-			writeSSE(c, "done", "", []byte(`{"reason":"reconnect"}`))
+			writeSSE(c, controller, "done", "", []byte(`{"reason":"reconnect"}`))
 			return
 		case <-heartbeat.C:
+			sseArmWriteDeadline(controller)
 			if _, err := c.Writer.WriteString(": ping\n\n"); err != nil {
 				return
 			}
@@ -854,7 +921,7 @@ func (s *Server) streamBuildEvents(c *gin.Context) {
 			}
 			if len(events) > 0 {
 				after = events[len(events)-1].ID
-				if !writeSSE(c, "logs", strconv.FormatInt(after, 10), mustJSON(events)) {
+				if !writeSSE(c, controller, "logs", strconv.FormatInt(after, 10), mustJSON(events)) {
 					return
 				}
 				quietSince = time.Time{}
@@ -865,7 +932,7 @@ func (s *Server) streamBuildEvents(c *gin.Context) {
 			}
 			if current.Status != status {
 				status = current.Status
-				if !writeSSE(c, "status", "", mustJSON(current)) {
+				if !writeSSE(c, controller, "status", "", mustJSON(current)) {
 					return
 				}
 				quietSince = time.Time{}
@@ -874,7 +941,7 @@ func (s *Server) streamBuildEvents(c *gin.Context) {
 				if quietSince.IsZero() {
 					quietSince = time.Now()
 				} else if time.Since(quietSince) >= sseTailQuiet {
-					writeSSE(c, "done", "", []byte(`{"reason":"terminal"}`))
+					writeSSE(c, controller, "done", "", []byte(`{"reason":"terminal"}`))
 					return
 				}
 			}
@@ -882,8 +949,17 @@ func (s *Server) streamBuildEvents(c *gin.Context) {
 	}
 }
 
+// sseArmWriteDeadline bounds the next frame write. A ResponseWriter that cannot
+// carry a deadline (HTTP/2 in some setups, or a bare recorder) reports
+// http.ErrNotSupported; that degrades to the previous unbounded write instead of
+// failing the stream.
+func sseArmWriteDeadline(controller *http.ResponseController) {
+	_ = controller.SetWriteDeadline(time.Now().Add(sseWriteTimeout))
+}
+
 // writeSSE writes one Server-Sent Events frame; false means the client is gone.
-func writeSSE(c *gin.Context, event, id string, data []byte) bool {
+func writeSSE(c *gin.Context, controller *http.ResponseController, event, id string, data []byte) bool {
+	sseArmWriteDeadline(controller)
 	var frame strings.Builder
 	if id != "" {
 		frame.WriteString("id: ")
@@ -1497,7 +1573,7 @@ func (s *Server) middleware() gin.HandlerFunc {
 		if c.Request.Method == http.MethodOptions {
 			c.Writer.Header().Add("Vary", "Access-Control-Request-Method")
 			c.Writer.Header().Add("Vary", "Access-Control-Request-Headers")
-			c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 			c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
 			c.AbortWithStatus(204)
 			return
