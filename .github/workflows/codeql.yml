@@ -1,0 +1,70 @@
+name: CodeQL
+
+# Static security analysis of the Go backend and the TypeScript/JavaScript
+# frontend. The repository is public, so GitHub code scanning (and the SARIF
+# upload below) works without a GitHub Advanced Security licence. Findings land
+# in the repository's "Security / Code scanning" tab.
+#
+# Third-party actions are pinned to a full commit SHA with the human-readable
+# version in a trailing comment; the Dependabot github-actions group updates
+# both. Keep the SHAs here in sync with .github/workflows/ci.yml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, Monday 03:23 UTC. Scheduled scans re-run the current query packs
+    # against the default branch, catching newly published queries between
+    # commits.
+    - cron: "23 3 * * 1"
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # One language failing must not hide the other language's result.
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            # The Go extractor needs a compile; the build step below is it.
+            build-mode: manual
+          - language: javascript-typescript
+            # Interpreted language: no build step is required.
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # CodeQL's Go extractor requires a Go toolchain on the runner; pin the
+      # same version the backend module declares so extraction matches CI.
+      - if: matrix.language == 'go'
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      # backend is its own Go module, so the manual build runs there rather
+      # than at the repository root (which has no go.mod).
+      - name: Build Go for CodeQL
+        if: matrix.language == 'go'
+        working-directory: backend
+        run: go build ./...
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          category: "/language:${{ matrix.language }}"

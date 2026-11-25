@@ -1,5 +1,12 @@
 name: CI
 
+# Third-party actions are pinned to a full commit SHA with the human-readable
+# version in a trailing comment, and container images to a tag@sha256 digest, so
+# a moved tag cannot silently change what CI executes. The Dependabot
+# github-actions group keeps the SHAs current; refresh image digests deliberately
+# when the tags are bumped. The digests below are the multi-arch manifest-list
+# digests recorded by Docker's official image metadata (docker-library/repo-info,
+# generated from the registry API).
 on:
   pull_request:
   push:
@@ -20,7 +27,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:17-alpine@sha256:f9cf3e1f0066f0eb0c48707d864f0ac5941e9ff454a072077d97a4d278d07d73
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -33,7 +40,7 @@ jobs:
           --health-timeout 3s
           --health-retries 20
       redis:
-        image: redis:7.4-alpine
+        image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
         ports:
           - 6379:6379
         options: >-
@@ -56,8 +63,8 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
@@ -65,8 +72,25 @@ jobs:
         run: test -z "$(gofmt -l ./cmd ./internal)"
       - name: Vet
         run: go vet ./...
-      - name: Test (race, real PostgreSQL and Redis)
-        run: go test -race ./... -count=1
+      - name: Test (race, real PostgreSQL and Redis, coverage)
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./... -count=1
+      # Statement-coverage floor for the backend suite. Measured on 2026-11-25
+      # against real PostgreSQL 17 + Redis 7.4 with the race detector: 77.6%
+      # total. CI runs additional Linux-only tests, so its profile should be at
+      # least this (the separate root-only run below is not part of the
+      # profile). The floor is deliberately conservative: measured coverage
+      # - 3 points, rounded down to a multiple of 5. Raise it (never lower it)
+      # as the number improves.
+      - name: Enforce backend statement-coverage floor
+        run: |
+          set -eu
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')"
+          printf 'total backend statement coverage: %s%%\n' "$total"
+          floor=70
+          if awk -v got="$total" -v floor="$floor" 'BEGIN { exit !(got + 0 < floor) }'; then
+            printf 'error: backend coverage %s%% is below the %s%% floor (see the workflow comment)\n' "$total" "$floor" >&2
+            exit 1
+          fi
       - name: Build
         run: go build ./cmd/server
       # The user sandbox only works as root (chown + setpriv); the regular test
@@ -86,8 +110,8 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: stable
           cache-dependency-path: backend/go.sum
@@ -113,8 +137,8 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
@@ -140,8 +164,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -164,7 +188,7 @@ jobs:
     timeout-minutes: 25
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:17-alpine@sha256:f9cf3e1f0066f0eb0c48707d864f0ac5941e9ff454a072077d97a4d278d07d73
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -178,7 +202,7 @@ jobs:
           --health-timeout 3s
           --health-retries 20
       redis:
-        image: redis:7.4-alpine
+        image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
         ports:
           - 6379:6379
         options: >-
@@ -189,12 +213,12 @@ jobs:
       AEGIS_E2E_DATABASE_URL: postgres://test:test@localhost:5432/aegis_e2e?sslmode=disable
       AEGIS_E2E_REDIS_URL: redis://localhost:6379/3
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -208,7 +232,7 @@ jobs:
       # diagnose a browser-only failure after the runner is gone.
       - name: Upload Playwright artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: playwright-artifacts
           path: test-results/
@@ -226,7 +250,7 @@ jobs:
       AEGIS_POSTGRES_PASSWORD: ci-placeholder-postgres-password
       AEGIS_JWT_SECRET: ci-placeholder-jwt-secret
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Builds the production image from backend/Dockerfile so a broken
       # Dockerfile or Go version drift is caught here instead of at release.
       - name: Build the backend image
@@ -240,4 +264,4 @@ jobs:
       # loading the config, so the isolated container needs api1/api2 in
       # /etc/hosts; nothing listens or is served, only the config is validated.
       - name: Validate the gateway nginx config
-        run: docker run --rm --add-host api1:127.0.0.1 --add-host api2:127.0.0.1 -v "$PWD/deploy/nginx.conf:/etc/nginx/nginx.conf:ro" nginx:1.28-alpine nginx -t
+        run: docker run --rm --add-host api1:127.0.0.1 --add-host api2:127.0.0.1 -v "$PWD/deploy/nginx.conf:/etc/nginx/nginx.conf:ro" nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236 nginx -t
