@@ -1,6 +1,6 @@
 # AegisFlow Go 后端
 
-Go 1.26+，Gin 1.12 + slog，PostgreSQL（pgx）+ Redis 共享限流，多应用实例部署，bcrypt，HS256 JWT。浏览器鉴权采用短期 Bearer access token + HttpOnly refresh Cookie；推荐前后端通过**同源代理**部署。项目注册表、最小构建闭环（触发、列表、详情、取消、游标日志）、部署目标、部署任务、部署审批与审批 Webhook 通知已实现；代码审查、安全扫描、知识库、攻击防御、自动化策略、独立密钥管理、LDAP/OIDC 与多租户等其余业务接口尚未实现。完整接口契约见 [openapi.yaml](openapi.yaml)。
+Go 1.26+，Gin 1.12 + slog，PostgreSQL（pgx）+ Redis 共享限流，多应用实例部署，bcrypt，HS256 JWT。浏览器鉴权采用短期 Bearer access token + HttpOnly refresh Cookie；推荐前后端通过**同源代理**部署。项目注册表、最小构建闭环（触发、列表、详情、取消、游标日志）、部署目标、部署任务、部署审批与审批 Webhook 通知、审查中心（门禁式变更审查的请求/决策/取消、编号与审计）已实现；安全扫描、知识库、攻击防御、自动化策略、独立密钥管理、LDAP/OIDC 与多租户等其余业务接口尚未实现。完整接口契约见 [openapi.yaml](openapi.yaml)。
 
 ## 本地启动（PowerShell）
 
@@ -104,6 +104,12 @@ server: {
 | GET | /api/v1/approvals | Bearer + admin；`?limit=&offset=&status=` | `{items,total,limit,offset}`，最新在前 |
 | POST | /api/v1/approvals/{id}/approve | Bearer + admin；**`{}`** | Approval；重复批准幂等 200，冲突 409 |
 | POST | /api/v1/approvals/{id}/reject | Bearer + admin；`{reason?}`（可选、trim、单行、≤512 字节） | Approval；重复拒绝幂等 200，冲突 409 |
+| GET | /api/v1/projects/{id}/reviews | Bearer（可见者）；`?status=&limit=&offset=` | `{items,total,limit,offset}`，最新在前；不可见项目 404 |
+| POST | /api/v1/projects/{id}/reviews | Bearer + 项目写权限（admin，或可写项目的 member）；`{subject,description?,version?,externalUrl?}` | Review，201（pending）；不可见 404 |
+| GET | /api/v1/reviews/{id} | Bearer（可见者） | Review；不可见 404 |
+| POST | /api/v1/reviews/{id}/approve | Bearer + 全局 admin 或项目 maintainer；**`{reason?}`**（可选、trim、单行、≤512 字节） | Review；重复批准幂等 200，终态 409 |
+| POST | /api/v1/reviews/{id}/reject | Bearer + 全局 admin 或项目 maintainer；**`{reason}`**（必填、trim、单行、≤512 字节） | Review；重复拒绝幂等 200，终态 409 |
+| POST | /api/v1/reviews/{id}/cancel | Bearer + 发起人本人或 admin/maintainer；**`{}`** | Review；重复取消幂等 200，终态 409 |
 
 **所有 auth POST（包括 login）强制恰好一个 Origin，且精确匹配允许列表**；缺失、不匹配、`null` 或跨站请求返回 `403 origin_denied`，在登录、轮换和退出之前拦截。非浏览器 curl/脚本也必须带该 Origin。其他请求如果携带 Origin 也须符合允许列表。全局拒绝 `Sec-Fetch-Site: cross-site`。允许来源响应包含 `Access-Control-Allow-Origin: <原始允许源>`、`Access-Control-Allow-Credentials: true`，`Vary: Origin, Sec-Fetch-Site`；OPTIONS 额外 Vary 请求方法与请求头，允许 `GET, POST, PATCH, DELETE, OPTIONS` 和 Authorization/Content-Type（覆盖全部 PATCH/DELETE 端点）。
 
@@ -172,6 +178,16 @@ server: {
 - 可观测与边界：日志只记录审批 id、事件、尝试次数与 `http <code>`/`network error`，不记录 URL、签名密钥或 payload；通知失败不回滚、不改变审批或部署状态。没有管理 API、手动重放或通知历史页面；失败行保留在表中供运维排查。
 - 审计：通知 outbox 与审批审计同事务；不新增一条独立审计动作，避免把投递重试写进业务审计。OpenAPI 无新增路由。
 
+### 审查中心（P5-A，门禁式）
+
+- 定位：对项目的一次变更（版本标签或外部构建链接）发起审查，由项目 maintainer 批准或拒绝，全程审计，并允许发起人/维护者取消。后续批次再把审查接入部署门禁与外部检查结果；本批只交付 API、数据、审计、文档与测试，前端页面未接入。
+- 接口：`POST|GET /api/v1/projects/{projectId}/reviews`、`GET /api/v1/reviews/{id}`、`POST /api/v1/reviews/{id}/approve|reject|cancel`。发起复用项目写权限叠加（admin，或可写项目的 member）；批准/拒绝要求**全局 admin 或该项目 maintainer**（`projects.AuthorizeDecide`，比写权限更严：public 项目的普通 member 不能决策）；取消允许发起人本人，或 admin/maintainer。列表与详情按项目可见性过滤，不可见一律 404。
+- 字段：`subject` 必填、3–200 字节、单行（trim 后校验）、`description` ≤2000 字节、`version` ≤64 字节单行（trim）、`externalUrl` 可选、仅 http(s)、禁止 userinfo/fragment、≤2048 字节；`externalUrl` 只做展示与校验，服务端不抓取。`number` 是项目内自增序号，在 `projects` 行锁下从 `review_count` 分配（与构建/部署编号同一模式）；并发创建不会重号。
+- 状态机：`pending → approved | rejected | cancelled`，终态不可变。批准/拒绝/取消都只接受 pending，其余状态返回 409；重试已处于目标终态的请求幂等返回 200 与同一结果，且不重复写审计。`decidedBy/decidedByName/decidedAt` 记录决策（取消也记录取消人与时间），`reason` 保存批准的可选理由/拒绝的必填理由；取消不带理由，pending 时这些字段在 JSON 中省略。
+- 审计：`review.request`（detail `project=<id> number=<n>`）、`review.approve`/`review.reject`/`review.cancel`（objectType `review`，detail 只写 `number=<n>` 及 reason（如有）），四项审计与编号分配、状态变更在同一事务提交；subject/description/version/externalUrl 正文不进入审计。重复的幂等请求不重复记账。
+- 迁移：schema v11 新增 `reviews` 表、`projects.review_count`、`UNIQUE(project_id,number)` 与 `(project_id,status,created_at)`、`(status,created_at)` 索引；`project_id` 外键级联删除。
+- 本批边界：部署门禁自动放行/阻断、外部检查结果回写、通知渠道与前端审查页面均未做。
+
 ### 运行指标（P4）
 
 - 可选启用：`AEGIS_METRICS_ADDR=127.0.0.1:9090` 时服务在**独立监听地址**提供 `GET /metrics`（Prometheus 文本格式，`text/plain; version=0.0.4`）。默认关闭；该端点**没有用户鉴权**（scraper 无法持会话），因此只应绑定回环地址，或仅经受保护的代理暴露，且不要与 API 端口共用。
@@ -233,7 +249,7 @@ User 字段为 `id/username/displayName/role/disabled/createdAt`，无密码或�
 - SQLite 开发库不会自动导入 PostgreSQL。现阶段开发数据可重新初始化；如有需要保留的用户，必须先备份并单独编写审核过的离线迁移，保留 bcrypt 哈希、校验用户名大小写唯一性并撤销旧会话，不能直接复制文件或将 SQLite 挂共享盘。
 - /readyz 同时检查 PostgreSQL 和 Redis；Redis 故障使就绪返回 503，登录也 503。探测结果在进程内缓存 1 秒（成功与失败都缓存，探测超时仍为 2 秒），因此无鉴权的 /readyz 轮询不会按请求数放大对依赖的负载。已存在 Bearer 会话在 PostgreSQL 正常时仍可鉴权；负载均衡是否摘除整个实例取决于运维策略。
 - 请求 ID、slog JSON 访问日志、鉴权操作日志、panic 恢复、安全响应头、HTTP 超时、信号触发优雅退出；日志不记录密码、Cookie、令牌、正文。
-- 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）、部署目标增删改查与探测（deployment_target.create / deployment_target.update / deployment_target.remove / deployment_target.check）、部署创建/取消/回滚（deployment.create / deployment.cancel / deployment.rollback）。构建、成员、部署目标与部署任务审计都和状态变更在同一事务提交；幂等重复取消不重复记账，detail 只写项目/成员与构建号或角色（重试额外写 `retry_of=<原构建号>`），不写命令或凭据。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），支持 `action`/`objectType`/`result`/`actor`/`from`/`to` 服务端筛选（AND 组合，同时作用于分页与 total；`from`/`to` 接受 RFC3339 或 `YYYY-MM-DD`，只给日期时 `to` 覆盖该 UTC 全天）。
+- 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）、部署目标增删改查与探测（deployment_target.create / deployment_target.update / deployment_target.remove / deployment_target.check）、部署创建/取消/回滚（deployment.create / deployment.cancel / deployment.rollback）、审批请求/批准/拒绝/过期（approval.request / approval.approve / approval.reject / approval.expire）、审查请求与批准/拒绝/取消（review.request / review.approve / review.reject / review.cancel，objectType `review`）。构建、成员、部署目标、部署任务、审批与审查审计都和状态变更在同一事务提交；幂等重复取消不重复记账，detail 只写项目/成员与构建号或角色（重试额外写 `retry_of=<原构建号>`）、审查编号与理由，不写命令或凭据，也不写审查正文。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），支持 `action`/`objectType`/`result`/`actor`/`from`/`to` 服务端筛选（AND 组合，同时作用于分页与 total；`from`/`to` 接受 RFC3339 或 `YYYY-MM-DD`，只给日期时 `to` 覆盖该 UTC 全天）。
 - 审计保留策略可选：`AEGIS_AUDIT_RETENTION` 未设置或为 `0` 时永久保留（默认）；设置 24h–8760h 后，与过期会话清理共用的小时任务会删除早于该窗口的审计行。删除是运维显式选择，默认不丢证据。
 - 过期会话与 refresh 历史由后台任务每小时清理（启动时先执行一次）：删除超过绝对期限的会话及其全部 refresh 令牌记录。重放检测只需保留到会话有效期，这与文档化的保留边界一致。
 
@@ -264,10 +280,10 @@ go test ./internal/config ./internal/metrics -count=1
 
 CI（[.github/workflows/ci.yml](../.github/workflows/ci.yml)）在 `backend`（Linux、真实 PostgreSQL + Redis、`-race`）、`frontend` 与 `e2e` 之外还运行：`security` 任务的 `govulncheck ./...`（当前非阻断；发现项与升级建议见 PR 风险节）、`windows` 任务（Windows 上执行上面这组 gofmt/vet/build 与不依赖外部服务的单测，命令相同，本机 Windows 上可直接复核）和 `infra` 任务（`docker build -t aegisflow-api:ci ./backend`、占位环境变量下的 `docker compose config -q`、网关 `nginx -t`）。Windows 任务的测试范围只有 `internal/config` 与 `internal/metrics`，完整测试套件仍以 `backend` 任务为准。
 
-分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计、可见性读过滤与成员增删改、创建者不可移除与 404 枚举语义）、构建流水线（触发校验与每项目编号、成功与失败退出码、超时、取消与幂等、重启恢复为 interrupted、跨副本 worker 租约互斥与待命接管、SSE 推送与写超时豁免/终态收尾/非法游标、游标日志分页与截断、RBAC 与未接线 503）、部署目标（校验与默认值、大小写唯一与冲突、凭据 AES-256-GCM 加密与 AAD 绑定、更新时保留/替换/清空语义、非配置密钥时拒绝写入、探测成功/非 2xx/超时/网络错误与结果落库、事务内审计、admin-only RBAC 与未接线 503）、部署任务（项目/目标/版本/buildId 校验、每项目编号分配与目标快照、worker 成功/失败/超时/取消/重启恢复、部署后健康复查（首次通过/重试后通过/始终不健康/关闭）、事件游标分页、回滚版本选择与 400/409、事务内审计、目标被引用时 409、worker 租约互斥、项目写权限叠加与可见性 RBAC）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目/构建/部署目标端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
+分层测试覆盖 auth 核心（持久化、并发轮换/重放撤销、remember、绝对期限、版本迁移、多连接池会话互通、改密/重置/禁用/角色/最后管理员保护、会话列表与撤销、审计、过期清理）、projects 注册表（校验、大小写唯一、归档只读与恢复、分页与状态过滤、事务内审计、可见性读过滤与成员增删改、创建者不可移除与 404 枚举语义）、构建流水线（触发校验与每项目编号、成功与失败退出码、超时、取消与幂等、重启恢复为 interrupted、跨副本 worker 租约互斥与待命接管、SSE 推送与写超时豁免/终态收尾/非法游标、游标日志分页与截断、RBAC 与未接线 503）、部署目标（校验与默认值、大小写唯一与冲突、凭据 AES-256-GCM 加密与 AAD 绑定、更新时保留/替换/清空语义、非配置密钥时拒绝写入、探测成功/非 2xx/超时/网络错误与结果落库、事务内审计、admin-only RBAC 与未接线 503）、部署任务（项目/目标/版本/buildId 校验、每项目编号分配与目标快照、worker 成功/失败/超时/取消/重启恢复、部署后健康复查（首次通过/重试后通过/始终不健康/关闭）、事件游标分页、回滚版本选择与 400/409、事务内审计、目标被引用时 409、worker 租约互斥、项目写权限叠加与可见性 RBAC）、审查中心（subject/description/version/externalUrl 校验与项目内自增编号、并发创建不重号、可见性 404 与写权限 403/404、maintainer/admin 决策矩阵与发起人取消、pending→approved/rejected/cancelled 状态机与幂等、终态 409、事务内审计且 detail 不含审查正文、分页与状态过滤）、HTTP（Cookie flags、Secure 显式配置、默认/session/持久模式、轮换、幂等退出、缺 Cookie、JSON 降级拒绝、CSRF、credentialed CORS、Bearer/RBAC、严格 JSON、限流/错误封装、账号管理与项目/构建/部署目标/审查端点、未接线依赖 503）、真实进程生命周期（编译真实二进制、随机端口、readyz、登录与项目创建、Windows CTRL_BREAK/SIGTERM 优雅退出且退出码 0、重启后 access token/refresh Cookie/项目数据存活），以及真实 httptest.Server + CookieJar 登录→刷新→退出链路。
 
 ## 架构
 
-cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；worker 通过租约启动并随信号上下文退出；进程生命周期验收测试见 cmd/server/ops_test.go）；cmd/rekey 是一次性维护命令，用当前钥与退役钥把存量部署凭据重加密（默认 dry run、`-apply` 才写）；internal/config 校验连接 URL、连接数、登录配额、凭据密钥与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、可见性与成员、分页与事务内审计，读写都带可见性谓词，不依赖 Gin）；internal/builds 是构建流水线（触发与编号、单 worker 租约、SKIP LOCKED 领取、临时目录执行、取消看门狗、批量日志与重启恢复，不依赖 Gin）；internal/metrics 是零依赖的 Prometheus 文本暴露（HTTP 计数/延迟直方图 + 构建状态 gauge，独立监听）；internal/deployments 是部署目标（CRUD 与探测 admin-only）与部署任务、审批（按项目写权限授权、按项目可见性过滤；目标注册表、AES-256-GCM 凭据加密、连通性探测、部署编号/快照/状态机、租约 worker、事件游标、回滚、审批与事务内审计，不依赖 Gin）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.12 与 Go 1.26 兼容。
+cmd/server 负责配置、PostgreSQL 连接池、Redis、迁移与标准库 http.Server 生命周期（监听器先 net.Listen 再 Serve，日志报告实际绑定地址；worker 通过租约启动并随信号上下文退出；进程生命周期验收测试见 cmd/server/ops_test.go）；cmd/rekey 是一次性维护命令，用当前钥与退役钥把存量部署凭据重加密（默认 dry run、`-apply` 才写）；internal/config 校验连接 URL、连接数、登录配额、凭据密钥与可信代理；internal/dbmigrate 拥有唯一版本化迁移账本（auth 表与后续模块表共用）；internal/auth 负责用户/密码/会话/JWT；internal/projects 是项目注册表（校验、活跃/归档生命周期、可见性与成员、分页与事务内审计，读写都带可见性谓词，不依赖 Gin）；internal/builds 是构建流水线（触发与编号、单 worker 租约、SKIP LOCKED 领取、临时目录执行、取消看门狗、批量日志与重启恢复，不依赖 Gin）；internal/metrics 是零依赖的 Prometheus 文本暴露（HTTP 计数/延迟直方图 + 构建状态 gauge，独立监听）；internal/deployments 是部署目标（CRUD 与探测 admin-only）与部署任务、审批（按项目写权限授权、按项目可见性过滤；目标注册表、AES-256-GCM 凭据加密、连通性探测、部署编号/快照/状态机、租约 worker、事件游标、回滚、审批与事务内审计，不依赖 Gin）；internal/reviews 是审查中心（项目内审查编号在项目行锁下分配、pending→approved/rejected/cancelled 状态机、maintainer/admin 决策与发起人取消、事务内审计与可见性过滤，不依赖 Gin）；internal/ratelimit 负责 Redis 共享限流；internal/httpapi 负责 Gin 路由与 Cookie、Origin、CORS、Bearer/RBAC。JSON 解码按请求校验，不更改 Gin 全局 binding。Gin 1.12 与 Go 1.26 兼容。
 
 本地双实例样例见 [compose.yaml](../compose.yaml) 与 [部署说明](../deploy/README.md)。应用副本可横向扩展，但数据库、Redis、入口网关的高可用需另行部署；样例单节点依赖不等于整套服务高可用。数据库集成测试未配置 URL 会明确 Skip，不能将跳过当作生产验证通过。

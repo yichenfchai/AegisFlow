@@ -5,7 +5,7 @@ info:
   description: |
     Machine-readable contract for the AegisFlow backend: browser authentication,
     users and audit, the project registry, builds, deployment targets, deployment
-    tasks, approvals, health and metrics.
+    tasks, approvals, the review center, health and metrics.
 
     Multi-instance PostgreSQL backend with Redis shared rate limiting behind a same-origin reverse proxy (recommended).
     All JSON responses use data/error plus requestId envelopes. All responses include
@@ -60,6 +60,8 @@ tags:
     description: Deployment tasks, lifecycle events, cancellation and rollback; every route is authorized against the project write overlay and filtered by project visibility
   - name: Approvals
     description: Admin-only deployment approval queue (approve, reject, expiry)
+  - name: Reviews
+    description: Project review center (gate-style change reviews) with maintainer/admin decisions, cancellation and a per-project number sequence
   - name: Audit
     description: Persistent authentication and account-management audit trail
   - name: Health
@@ -1806,6 +1808,241 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/projects/{projectId}/reviews:
+    get:
+      tags: [Reviews]
+      operationId: listProjectReviews
+      summary: List a project's reviews (visible projects)
+      description: |
+        Newest first, filtered by project visibility: an invisible private
+        project answers 404 rather than an empty page. status is optional and
+        limited to pending/approved/rejected/cancelled.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: status
+          in: query
+          required: false
+          description: Filter by review status; omit for all
+          schema: { type: string, enum: [pending, approved, rejected, cancelled] }
+      responses:
+        '200':
+          description: Review page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ReviewPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Reviews]
+      operationId: createReview
+      summary: Request a review (project write access)
+      description: |
+        creation follows the project write overlay: a global admin, or a member
+        that can write the project (public, or private and maintainer). subject
+        is required (3-200 bytes on one line); description (<=2000 bytes),
+        version (<=64 bytes on one line) and externalUrl (http(s) without
+        userinfo or fragment, <=2048 bytes) are optional review context.
+        externalUrl is display-only: the server never fetches it. number is
+        allocated per project under the project row lock, the review starts
+        pending, and review.request is audited in the same transaction.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateReviewInput' }
+      responses:
+        '201':
+          description: Review created; status is pending
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Review' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/reviews/{reviewId}:
+    get:
+      tags: [Reviews]
+      operationId: getReview
+      summary: Get one review (visible projects)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: reviewId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Review with its current state and decision fields
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Review' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/reviews/{reviewId}/approve:
+    post:
+      tags: [Reviews]
+      operationId: approveReview
+      summary: Approve a pending review (global admin or project maintainer)
+      description: |
+        Moves a pending review to approved and records decidedBy/decidedAt plus
+        the optional reason, in one transaction with a review.approve audit row.
+        Repeating on an already approved review is idempotent and writes no
+        second audit row; any other non-pending status is 409. An invisible
+        project stays 404; a visible project the caller does not maintain is 403.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: reviewId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApproveReviewInput' }
+      responses:
+        '200':
+          description: Approved (or already approved) review
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Review' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/reviews/{reviewId}/reject:
+    post:
+      tags: [Reviews]
+      operationId: rejectReview
+      summary: Reject a pending review (global admin or project maintainer)
+      description: |
+        Moves a pending review to rejected and records decidedBy/decidedAt plus
+        the required reason, in one transaction with a review.reject audit row.
+        reason is required, trimmed, at most 512 bytes and single-line.
+        Repeating on an already rejected review is idempotent and writes no
+        second audit row; any other non-pending status is 409.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: reviewId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RejectReviewInput' }
+      responses:
+        '200':
+          description: Rejected (or already rejected) review
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Review' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/reviews/{reviewId}/cancel:
+    post:
+      tags: [Reviews]
+      operationId: cancelReview
+      summary: Cancel a pending review (requester, global admin or project maintainer)
+      description: |
+        The requester may withdraw their own pending request; everybody else
+        needs the reviewer overlay (global admin or project maintainer).
+        decidedBy/decidedAt record who cancelled and when; reason stays absent
+        because the cancel payload carries no reason. Repeating on an already
+        cancelled review is idempotent and writes no second audit row; approval
+        or rejection is a conflict (409).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: reviewId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200':
+          description: Cancelled (or already cancelled) review
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Review' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
 components:
   securitySchemes:
     bearerAuth:
@@ -2264,6 +2501,58 @@ components:
       additionalProperties: false
       properties:
         reason: { type: string, maxLength: 512, description: 'Optional, trimmed, single line, no control characters; included in the audit detail' }
+    Review:
+      type: object
+      additionalProperties: false
+      required: [id, projectId, number, subject, description, version, externalUrl, status, requestedBy, requestedByName, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        projectId: { type: string }
+        number: { type: integer, format: int64, minimum: 1, description: Per-project monotonic sequence allocated under the project row lock }
+        subject: { type: string, description: 3-200 UTF-8 bytes on one line; trimmed }
+        description: { type: string, description: At most 2000 UTF-8 bytes }
+        version: { type: string, description: 'At most 64 UTF-8 bytes on one line; trimmed; empty allowed' }
+        externalUrl: { type: string, description: 'Empty when the request omitted it; otherwise an absolute http(s) review link without userinfo or fragment, at most 2048 UTF-8 bytes; display-only and never fetched' }
+        status: { type: string, enum: [pending, approved, rejected, cancelled], description: pending -> approved/rejected/cancelled; terminal statuses never change again }
+        requestedBy: { type: string, description: Actor id of the requester }
+        requestedByName: { type: string, description: Requesting username resolved from the account }
+        decidedBy: { type: string, description: Deciding (or cancelling) actor id; absent while pending }
+        decidedByName: { type: string, description: Deciding (or cancelling) username; absent while pending }
+        decidedAt: { type: integer, format: int64, description: Unix seconds of the decision or cancellation; absent while pending }
+        reason: { type: string, description: Optional approve reason or required reject reason; absent when the decision carried none }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+        updatedAt: { type: integer, format: int64, description: Unix seconds }
+    ReviewPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Review' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
+    CreateReviewInput:
+      type: object
+      additionalProperties: false
+      required: [subject]
+      properties:
+        subject: { type: string, maxLength: 200, description: Required; 3-200 UTF-8 bytes on one line; trimmed before validation }
+        description: { type: string, maxLength: 2000, description: Optional; at most 2000 UTF-8 bytes }
+        version: { type: string, maxLength: 64, description: Optional; at most 64 UTF-8 bytes on one line; trimmed before validation }
+        externalUrl: { type: string, maxLength: 2048, description: 'Optional absolute http(s) URL without userinfo or fragment, at most 2048 UTF-8 bytes; empty means absent' }
+    ApproveReviewInput:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: string, maxLength: 512, description: 'Optional; trimmed; at most 512 UTF-8 bytes on one line; no control characters; stored and included in the audit detail when present' }
+    RejectReviewInput:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason: { type: string, minLength: 1, maxLength: 512, description: 'Required; trimmed; at most 512 UTF-8 bytes on one line; no control characters; stored and included in the audit detail' }
     AuditEntry:
       type: object
       additionalProperties: false
@@ -2273,8 +2562,8 @@ components:
         createdAt: { type: integer, format: int64, description: Unix seconds }
         actorId: { type: string, description: Empty for system rows }
         actorUsername: { type: string }
-        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check, deployment.create, deployment.cancel, deployment.rollback, approval.request, approval.approve, approval.reject, approval.expire] }
-        objectType: { type: string, enum: [user, session, project, build, deployment_target, deployment, approval] }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check, deployment.create, deployment.cancel, deployment.rollback, approval.request, approval.approve, approval.reject, approval.expire, review.request, review.approve, review.reject, review.cancel] }
+        objectType: { type: string, enum: [user, session, project, build, deployment_target, deployment, approval, review] }
         objectId: { type: string }
         result: { type: string, enum: [success, failure] }
         detail: { type: string, description: Safe context such as role transitions or revoked counts; never secrets }

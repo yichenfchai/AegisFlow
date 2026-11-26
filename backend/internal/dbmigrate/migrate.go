@@ -224,6 +224,35 @@ var Migrations = [][]string{{
 	`CREATE INDEX IF NOT EXISTS auth_sessions_expires_idx ON auth_sessions(expires_at)`,
 	`CREATE INDEX IF NOT EXISTS auth_audit_actor_idx ON auth_audit(actor_id)`,
 	`CREATE INDEX IF NOT EXISTS builds_status_created_idx ON builds(status, created_at, id)`,
+}, {
+	// Review center (P5-A, gate-style): a review is one immutable request record
+	// whose status only moves pending -> approved/rejected/cancelled. number is a
+	// per-project monotonic sequence allocated from projects.review_count under
+	// the project row lock (the build_count/deploy_count pattern), so it survives
+	// concurrent creators and stays the human-facing reference for later
+	// deployment-gate and external-result wiring. decided_by/decided_at/reason
+	// stay NULL until a decision exists, so "not decided yet" is not encoded as a
+	// zero timestamp. The project foreign key cascades on delete even though the
+	// current API never deletes projects: review rows have no meaning without it.
+	`ALTER TABLE projects ADD COLUMN review_count BIGINT NOT NULL DEFAULT 0`,
+	`CREATE TABLE reviews (
+	 id TEXT PRIMARY KEY,
+	 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+	 number BIGINT NOT NULL,
+	 subject TEXT NOT NULL,
+	 description TEXT NOT NULL DEFAULT '',
+	 version TEXT NOT NULL DEFAULT '',
+	 external_url TEXT NOT NULL DEFAULT '',
+	 status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','cancelled')),
+	 requested_by TEXT NOT NULL DEFAULT '',
+	 decided_by TEXT,
+	 decided_at BIGINT,
+	 reason TEXT,
+	 created_at BIGINT NOT NULL,
+	 updated_at BIGINT NOT NULL)`,
+	`CREATE UNIQUE INDEX reviews_project_number_idx ON reviews(project_id, number)`,
+	`CREATE INDEX reviews_project_status_created_idx ON reviews(project_id, status, created_at)`,
+	`CREATE INDEX reviews_status_created_idx ON reviews(status, created_at)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped
