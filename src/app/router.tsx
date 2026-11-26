@@ -17,13 +17,16 @@ import { DeploymentDetailPage } from '@/features/deployments/DeploymentDetailPag
 import { ApprovalListPage } from '@/features/approvals/ApprovalListPage'
 import { ReviewListPage } from '@/features/reviews/ReviewListPage'
 import { ReviewDetailPage } from '@/features/reviews/ReviewDetailPage'
+import { ScanListPage } from '@/features/scans/ScanListPage'
+import { ScanDetailPage } from '@/features/scans/ScanDetailPage'
+import { DefenseListPage } from '@/features/defense/DefenseListPage'
 import { DeploymentTargetsPage } from '@/features/deployments/DeploymentTargetsPage'
 import { DeploymentTargetWizardPage } from '@/features/deployments/DeploymentTargetWizardPage'
 import { DeploymentTargetDetailPage } from '@/features/deployments/DeploymentTargetDetailPage'
 
 /**
- * 真实页面（项目、构建、部署、审批、审查、账号、用户与审计）不进 Gate；非主线页面
- * 恒定显示 UnimplementedPage，不提供演示数据。
+ * 真实页面（项目、构建、部署、审批、审查、安全扫描、攻击防御、账号、用户与审计）不进
+ * Gate；非主线页面恒定显示 UnimplementedPage，不提供演示数据。
  */
 export const router = createBrowserRouter([
   { path: '/login', element: <LoginPage /> },
@@ -53,8 +56,11 @@ export const router = createBrowserRouter([
       { path: '/reviews', element: <ReviewListPage /> },
       { path: '/reviews/:id', element: <ReviewDetailPage /> },
 
+      // 安全扫描：外部工具签名回写结果登记，按项目可见性过滤；详情展示报告外链
+      { path: '/scans', element: <ScanListPage /> },
+      { path: '/scans/:id', element: <ScanDetailPage /> },
+
       // 非主线业务：恒定未实现
-      { path: '/scans', element: <UnimplementedPage title="安全扫描" /> },
       { path: '/knowledge', element: <UnimplementedPage title="知识库" /> },
 
       // 管理员入口：真实部署目标、审批、用户与审计；其余为未实现占位
@@ -65,7 +71,7 @@ export const router = createBrowserRouter([
           { path: '/deploy-targets/new', element: <DeploymentTargetWizardPage /> },
           { path: '/deploy-targets/:id', element: <DeploymentTargetDetailPage /> },
           { path: '/approvals', element: <ApprovalListPage /> },
-          { path: '/defense', element: <UnimplementedPage title="攻击防御" /> },
+          { path: '/defense', element: <DefenseListPage /> },
           { path: '/audit', element: <UnimplementedPage title="自动化审计" /> },
           { path: '/audit/report', element: <UnimplementedPage title="昨夜托管报告" /> },
           { path: '/policies', element: <UnimplementedPage title="自动化策略" /> },

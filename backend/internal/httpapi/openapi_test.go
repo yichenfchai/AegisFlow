@@ -24,16 +24,19 @@ var openAPIMethods = map[string]bool{
 // publicOperations are the operations that may omit a Bearer security
 // requirement: login/refresh/logout rely on the Origin check (and, for
 // refresh/logout, the refresh cookie), the health endpoints are not
-// session-scoped, and the external-result webhook proves authorization with its
-// X-AegisFlow HMAC signature headers instead of a user session. Everything else
-// under /api/v1 must document a security requirement. /healthz and /readyz are
-// outside the /api/v1 prefix, but they are listed so the public exception set is
-// explicit rather than implied.
+// session-scoped, and the signed ingest webhooks (external review results,
+// scan results, defense events) prove authorization with their X-AegisFlow HMAC
+// signature headers instead of a user session. Everything else under /api/v1
+// must document a security requirement. /healthz and /readyz are outside the
+// /api/v1 prefix, but they are listed so the public exception set is explicit
+// rather than implied.
 var publicOperations = map[string]bool{
 	"POST /api/v1/auth/login":                          true,
 	"POST /api/v1/auth/refresh":                        true,
 	"POST /api/v1/auth/logout":                         true,
 	"POST /api/v1/reviews/{reviewId}/external-results": true,
+	"POST /api/v1/projects/{projectId}/scans":          true,
+	"POST /api/v1/security-events":                     true,
 	"GET /healthz":                                     true,
 	"GET /readyz":                                      true,
 }

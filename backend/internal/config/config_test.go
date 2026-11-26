@@ -29,7 +29,7 @@ func unsetEnv(t *testing.T, key string) {
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_SECRET_KEY_PREVIOUS", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_DEPLOY_HEALTH_ATTEMPTS", "AEGIS_DEPLOY_HEALTH_INTERVAL", "AEGIS_APPROVAL_TTL", "AEGIS_APPROVAL_WEBHOOK_URL", "AEGIS_APPROVAL_WEBHOOK_SECRET", "AEGIS_APPROVAL_WEBHOOK_TIMEOUT", "AEGIS_REVIEW_WEBHOOK_SECRET"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_SECRET_KEY_PREVIOUS", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_DEPLOY_HEALTH_ATTEMPTS", "AEGIS_DEPLOY_HEALTH_INTERVAL", "AEGIS_APPROVAL_TTL", "AEGIS_APPROVAL_WEBHOOK_URL", "AEGIS_APPROVAL_WEBHOOK_SECRET", "AEGIS_APPROVAL_WEBHOOK_TIMEOUT", "AEGIS_REVIEW_WEBHOOK_SECRET", "AEGIS_INGEST_WEBHOOK_SECRET"} {
 		t.Setenv(key, "")
 	}
 	unsetEnv(t, "AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
@@ -661,6 +661,54 @@ func TestReviewWebhookSecretConfig(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			setup(t)
 			t.Setenv("AEGIS_REVIEW_WEBHOOK_SECRET", tc.secret)
+			if _, err := Load(); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+// TestIngestWebhookSecretConfig covers the scan/security-event signing key: it is
+// independent from the review webhook secret, unset keeps the ingest endpoints
+// closed (503) while everything else loads, and a configured value must be
+// 16-256 bytes.
+func TestIngestWebhookSecretConfig(t *testing.T) {
+	t.Run("unset closes ingest", func(t *testing.T) {
+		setup(t)
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(c.IngestWebhookSecret) != 0 || len(c.ReviewWebhookSecret) != 0 {
+			t.Fatalf("ingest secret = %q, review secret = %q, want both unset", c.IngestWebhookSecret, c.ReviewWebhookSecret)
+		}
+	})
+	t.Run("valid secret", func(t *testing.T) {
+		setup(t)
+		t.Setenv("AEGIS_INGEST_WEBHOOK_SECRET", "0123456789abcdef")
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(c.IngestWebhookSecret) != "0123456789abcdef" || len(c.ReviewWebhookSecret) != 0 {
+			t.Fatalf("ingest secret = %q review secret = %q", c.IngestWebhookSecret, c.ReviewWebhookSecret)
+		}
+	})
+	t.Run("maximum length", func(t *testing.T) {
+		setup(t)
+		t.Setenv("AEGIS_INGEST_WEBHOOK_SECRET", strings.Repeat("k", 256))
+		c, err := Load()
+		if err != nil || len(c.IngestWebhookSecret) != 256 {
+			t.Fatalf("ingest secret length = %d err=%v", len(c.IngestWebhookSecret), err)
+		}
+	})
+	for _, tc := range []struct{ name, secret string }{
+		{"too short", "0123456789abcde"},
+		{"too long", strings.Repeat("k", 257)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_INGEST_WEBHOOK_SECRET", tc.secret)
 			if _, err := Load(); err == nil {
 				t.Fatal("expected validation error")
 			}

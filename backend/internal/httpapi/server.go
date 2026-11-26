@@ -25,6 +25,8 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 	"github.com/yichenfchai/AegisFlow/backend/internal/reviews"
+	"github.com/yichenfchai/AegisFlow/backend/internal/scans"
+	"github.com/yichenfchai/AegisFlow/backend/internal/securityevents"
 )
 
 type contextKey int
@@ -45,19 +47,26 @@ func requestID(c *gin.Context) string {
 }
 
 type Server struct {
-	auth         *auth.Service
-	projects     *projects.Service
-	builds       *builds.Service
-	deployments  *deployments.Service
-	reviews      *reviews.Service
-	logger       *slog.Logger
-	ready        func(context.Context) error
-	origins      map[string]bool
-	limiter      ratelimit.Limiter
-	cookieSecure bool
+	auth        *auth.Service
+	projects    *projects.Service
+	builds      *builds.Service
+	deployments *deployments.Service
+	reviews     *reviews.Service
+	scans       *scans.Service
+	// securityEvents is the admin-only defense-event store.
+	securityEvents *securityevents.Service
+	logger         *slog.Logger
+	ready          func(context.Context) error
+	origins        map[string]bool
+	limiter        ratelimit.Limiter
+	cookieSecure   bool
 	// reviewWebhookSecret authenticates inbound external-result deliveries with
 	// HMAC-SHA256; empty keeps that endpoint closed (503).
 	reviewWebhookSecret []byte
+	// ingestWebhookSecret authenticates the signed scan and security-event
+	// deliveries (AEGIS_INGEST_WEBHOOK_SECRET). Empty keeps both endpoints closed
+	// (503) while their read routes stay available.
+	ingestWebhookSecret []byte
 	metrics             *metrics.Registry
 	// shutdownCtx is never nil: New substitutes context.Background() when the
 	// embedder does not pass one, so streaming selects can always wait on it.
@@ -97,10 +106,19 @@ type Options struct {
 	// Reviews enables the review-gate routes; nil fails closed with 503 like any
 	// other missing shared dependency.
 	Reviews *reviews.Service
+	// Scans enables the scan-registry routes; nil fails closed with 503.
+	Scans *scans.Service
+	// SecurityEvents enables the admin-only defense-event routes; nil fails
+	// closed with 503.
+	SecurityEvents *securityevents.Service
 	// ReviewWebhookSecret verifies signed inbound external review results
 	// (AEGIS_REVIEW_WEBHOOK_SECRET). Empty keeps the external-results endpoint
 	// closed with 503; the read route stays available to authenticated viewers.
 	ReviewWebhookSecret []byte
+	// IngestWebhookSecret verifies signed inbound scan and security-event
+	// deliveries (AEGIS_INGEST_WEBHOOK_SECRET). Empty keeps both machine
+	// endpoints closed with 503; their read routes stay available.
+	IngestWebhookSecret []byte
 	// Metrics, when set, records request counters and latency histograms keyed
 	// by the matched route template. Nil disables recording.
 	Metrics *metrics.Registry
@@ -121,8 +139,11 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
-	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, reviews: opts.Reviews, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure,
-		reviewWebhookSecret: append([]byte(nil), opts.ReviewWebhookSecret...), metrics: opts.Metrics, shutdownCtx: shutdownCtx}
+	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, reviews: opts.Reviews,
+		scans: opts.Scans, securityEvents: opts.SecurityEvents, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure,
+		reviewWebhookSecret: append([]byte(nil), opts.ReviewWebhookSecret...),
+		ingestWebhookSecret: append([]byte(nil), opts.IngestWebhookSecret...),
+		metrics:             opts.Metrics, shutdownCtx: shutdownCtx}
 	for _, o := range origins {
 		s.origins[o] = true
 	}
@@ -231,6 +252,23 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	// AEGIS_REVIEW_WEBHOOK_SECRET is not configured.
 	reviewRoutes.GET("/:id/external-results", s.listReviewExternalResults)
 	api.POST("/reviews/:id/external-results", s.ingestReviewExternalResult)
+	// Scan results: the write side is a signed machine-to-machine webhook, while
+	// the project-scoped and global reads are normal authenticated routes that
+	// follow project visibility. The project route reuses Gin's :id wildcard name
+	// so it shares the tree with the other /projects/:id routes.
+	projectRoutes.GET("/:id/scans", s.listProjectScans)
+	api.POST("/projects/:id/scans", s.ingestScan)
+	scanRoutes := api.Group("/scans", s.authenticate())
+	scanRoutes.GET("", s.listScansGlobal)
+	scanRoutes.GET("/:id", s.getScan)
+	// Defense events are global administrative objects: reads and acknowledgement
+	// require the admin role, while the ingest webhook is trusted through its HMAC
+	// signature headers and stays outside the session groups.
+	securityEventRoutes := api.Group("/security-events", s.authenticate(), s.requireAdmin())
+	securityEventRoutes.GET("", s.listSecurityEvents)
+	securityEventRoutes.GET("/:id", s.getSecurityEvent)
+	securityEventRoutes.POST("/:id/ack", s.ackSecurityEvent)
+	api.POST("/security-events", s.ingestSecurityEvent)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }

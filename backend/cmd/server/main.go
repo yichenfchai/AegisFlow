@@ -23,6 +23,8 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 	"github.com/yichenfchai/AegisFlow/backend/internal/reviews"
+	"github.com/yichenfchai/AegisFlow/backend/internal/scans"
+	"github.com/yichenfchai/AegisFlow/backend/internal/securityevents"
 )
 
 func main() {
@@ -116,6 +118,12 @@ func run(logger *slog.Logger) error {
 		WebhookSecret:  cfg.ApprovalWebhookSecret,
 		WebhookTimeout: cfg.ApprovalWebhookTimeout,
 	})
+	// Scan results and defense events are external evidence: the services only
+	// store and serve rows, while the HTTP layer authenticates the signed ingest
+	// webhook with AEGIS_INGEST_WEBHOOK_SECRET. Neither module runs a scanner or
+	// a detection engine.
+	scanRegistry := scans.New(db)
+	defenseEvents := securityevents.New(db)
 	pipeline := builds.New(db, registry).WithSandbox(builds.Sandbox{
 		Mode:   builds.SandboxMode(cfg.BuildSandbox),
 		Image:  cfg.BuildImage,
@@ -155,7 +163,7 @@ func run(logger *slog.Logger) error {
 	// alone would wait out its 10s drain whenever an SSE client is connected.
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Reviews: reviewCenter, ReviewWebhookSecret: cfg.ReviewWebhookSecret, Metrics: monitoring, ShutdownContext: signalCtx})
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Reviews: reviewCenter, Scans: scanRegistry, SecurityEvents: defenseEvents, ReviewWebhookSecret: cfg.ReviewWebhookSecret, IngestWebhookSecret: cfg.IngestWebhookSecret, Metrics: monitoring, ShutdownContext: signalCtx})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	if monitoring != nil {
 		mux := http.NewServeMux()
