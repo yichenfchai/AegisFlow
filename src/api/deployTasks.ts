@@ -28,6 +28,8 @@ export interface Deployment {
   buildId: string
   rollbackOf: string
   approvalId: string
+  /** Approved review snapshot when the deployment was gated on a review; empty otherwise. */
+  reviewId: string
   triggeredBy: string
   detail: string
   createdAt: number
@@ -68,6 +70,8 @@ export interface DeployInput {
   targetId: string
   version: string
   buildId?: string
+  /** Optional unless the target environment is in AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS. */
+  reviewId?: string
 }
 
 /**
@@ -103,10 +107,11 @@ export const deployTasksAPI = {
       method: 'POST',
       body: '{}',
     }),
-  rollback: (id: string) =>
+  /** `reviewId` follows the same optional review gate as a fresh deployment. */
+  rollback: (id: string, reviewId?: string) =>
     apiRequest<Deployment>(`/deployments/${encodeURIComponent(id)}/rollback`, {
       method: 'POST',
-      body: '{}',
+      body: JSON.stringify(reviewId ? { reviewId } : {}),
     }),
   /** `after` is the exclusive event id cursor (same semantics as build logs). */
   events: (id: string, after = 0, limit = 200) =>

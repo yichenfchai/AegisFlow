@@ -15,12 +15,14 @@ import { DeploymentListPage } from '@/features/deployments/DeploymentListPage'
 import { DeploymentNewPage } from '@/features/deployments/DeploymentNewPage'
 import { DeploymentDetailPage } from '@/features/deployments/DeploymentDetailPage'
 import { ApprovalListPage } from '@/features/approvals/ApprovalListPage'
+import { ReviewListPage } from '@/features/reviews/ReviewListPage'
+import { ReviewDetailPage } from '@/features/reviews/ReviewDetailPage'
 import { DeploymentTargetsPage } from '@/features/deployments/DeploymentTargetsPage'
 import { DeploymentTargetWizardPage } from '@/features/deployments/DeploymentTargetWizardPage'
 import { DeploymentTargetDetailPage } from '@/features/deployments/DeploymentTargetDetailPage'
 
 /**
- * 真实页面（项目、构建、部署、审批、账号、用户与审计）不进 Gate；非主线页面
+ * 真实页面（项目、构建、部署、审批、审查、账号、用户与审计）不进 Gate；非主线页面
  * 恒定显示 UnimplementedPage，不提供演示数据。
  */
 export const router = createBrowserRouter([
@@ -47,10 +49,11 @@ export const router = createBrowserRouter([
       { path: '/deploys/new', element: <DeploymentNewPage /> },
       { path: '/deploys/:id', element: <DeploymentDetailPage /> },
 
+      // 审查中心：真实接口，全局列表按项目可见性过滤，决策权限由服务端强制
+      { path: '/reviews', element: <ReviewListPage /> },
+      { path: '/reviews/:id', element: <ReviewDetailPage /> },
+
       // 非主线业务：恒定未实现
-      { path: '/reviews', element: <UnimplementedPage title="审查中心" /> },
-      { path: '/reviews/new', element: <UnimplementedPage title="发起审查" /> },
-      { path: '/reviews/:id', element: <UnimplementedPage title="审查详情" /> },
       { path: '/scans', element: <UnimplementedPage title="安全扫描" /> },
       { path: '/knowledge', element: <UnimplementedPage title="知识库" /> },
 
