@@ -177,16 +177,9 @@ func TestBuildClonesRepository(t *testing.T) {
 		t.Fatalf("build repoUrl snapshot = %q", build.RepoURL)
 	}
 	waitForStatus(t, service, build.ID, StatusSucceeded)
-	logs, err := service.Logs(ctx, testActor, build.ID, 0, maxLogPageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	output := joinLogs(logs)
+	output := waitForLog(t, service, build.ID, "repository cloned")
 	if !strings.Contains(output, "from-repository") {
 		t.Fatalf("command did not run inside the clone:\n%s", output)
-	}
-	if !strings.Contains(output, "repository cloned") {
-		t.Fatalf("missing clone system line:\n%s", output)
 	}
 }
 
@@ -203,13 +196,7 @@ func TestBuildCloneDisabledRunsEmptyWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForStatus(t, service, build.ID, StatusSucceeded)
-	logs, err := service.Logs(ctx, testActor, build.ID, 0, maxLogPageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(joinLogs(logs), "cloning is disabled") {
-		t.Fatal("expected an explicit system line about cloning being disabled")
-	}
+	waitForLog(t, service, build.ID, "cloning is disabled")
 }
 
 func TestBuildCloneFailureFailsTheBuild(t *testing.T) {
@@ -227,13 +214,7 @@ func TestBuildCloneFailureFailsTheBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForStatus(t, service, build.ID, StatusFailed)
-	logs, err := service.Logs(ctx, testActor, build.ID, 0, maxLogPageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(joinLogs(logs), "git clone failed") {
-		t.Fatal("expected a clone failure system line")
-	}
+	waitForLog(t, service, build.ID, "git clone failed")
 }
 
 // TestBuildDiskLimitStopsBuild clones a repository larger than the cap and

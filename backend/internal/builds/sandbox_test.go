@@ -125,21 +125,11 @@ func TestContainerSandboxRunsBuild(t *testing.T) {
 	}
 	waitForStatus(t, s, build.ID, StatusSucceeded)
 
-	logs, err := s.Logs(ctx, testActor, build.ID, 0, maxLogPageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var joined strings.Builder
-	for _, event := range logs {
-		joined.WriteString(event.Message)
-		joined.WriteString("\n")
-	}
-	output := joined.String()
+	// Poll for the container output: the worker flushes the final log batch
+	// after the terminal status update, so an immediate read races the flush.
+	output := waitForLog(t, s, build.ID, "container-ok")
 	if !strings.Contains(output, "root-fs-read-only") || strings.Contains(output, "root-fs-writable") {
 		t.Fatalf("container root filesystem looks writable:\n%s", output)
-	}
-	if !strings.Contains(output, "container-ok") {
-		t.Fatalf("container output missing:\n%s", output)
 	}
 	if strings.Contains(output, "AEGIS_JWT_SECRET") || strings.Contains(output, "must-not-leak") {
 		t.Fatalf("service credentials reached the container:\n%s", output)
@@ -176,7 +166,7 @@ func TestContainerSandboxTimeoutLeavesNoContainer(t *testing.T) {
 	waitForStatus(t, s, build.ID, StatusFailed)
 
 	name := "aegis-build-" + build.ID
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		out, err := exec.Command("docker", "ps", "-aq", "--filter", "name="+name).CombinedOutput()
 		if err != nil {

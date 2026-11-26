@@ -107,8 +107,9 @@ func overlongOutputCommand(t *testing.T) string {
 func TestBuildKeepsReadingAfterOverlongLine(t *testing.T) {
 	s, registry := testService(t)
 	// Also exercises the public timeout setter: a blocking read must surface as
-	// a successful build well inside this deadline.
-	s.WithTimeout(4 * time.Second)
+	// a successful build well inside this deadline. The deadline is deliberately
+	// well above the command's runtime so a loaded CI runner cannot trip it.
+	s.WithTimeout(15 * time.Second)
 	startWorker(t, s)
 	project := createProject(t, registry, "overlong-line", overlongOutputCommand(t))
 	build, err := s.Trigger(context.Background(), testActor, project.ID, "")

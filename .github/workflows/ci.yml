@@ -78,7 +78,12 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test (race, real PostgreSQL and Redis, coverage)
-        run: go test -race -coverprofile=coverage.out -covermode=atomic ./... -count=1
+        # Package-level serialization (-p 1): the build tests assert on timing
+        # and on Docker/file-system effects, so running every package against
+        # the same PostgreSQL, Redis and Docker daemon concurrently on a shared
+        # runner caused intermittent timing failures. Every test still runs with
+        # -race; only cross-package parallelism is removed.
+        run: go test -race -p 1 -coverprofile=coverage.out -covermode=atomic ./... -count=1
       # Statement-coverage floor for the backend suite. Measured on 2026-11-25
       # against real PostgreSQL 17 + Redis 7.4 with the race detector: 77.6%
       # total. CI runs additional Linux-only tests, so its profile should be at
