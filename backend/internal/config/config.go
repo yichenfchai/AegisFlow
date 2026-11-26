@@ -72,6 +72,13 @@ type Config struct {
 	ApprovalWebhookSecret []byte
 	// ApprovalWebhookTimeout bounds one webhook delivery (default 5s, max 30s).
 	ApprovalWebhookTimeout time.Duration
+	// ReviewWebhookSecret verifies the HMAC-SHA256 signature of inbound external
+	// review-result deliveries (AEGIS_REVIEW_WEBHOOK_SECRET). Empty disables the
+	// external-results endpoint (it answers 503), so a deployment that does not
+	// integrate external tools keeps a closed inbound surface. The outbound
+	// review-event notifications reuse ApprovalWebhookURL/Secret/Timeout: one
+	// receiver channel carries both approval.* and review.* events.
+	ReviewWebhookSecret []byte
 	// RequireReviewEnvironments lists target environments whose deployments
 	// must reference an approved review. Empty (the default, including an
 	// explicitly empty value or only commas/whitespace) disables the gate: the
@@ -341,6 +348,17 @@ func Load() (Config, error) {
 		}
 	} else if os.Getenv("AEGIS_APPROVAL_WEBHOOK_SECRET") != "" {
 		return c, errors.New("AEGIS_APPROVAL_WEBHOOK_SECRET requires AEGIS_APPROVAL_WEBHOOK_URL")
+	}
+	// The inbound external-result webhook is separate from the outbound approval
+	// channel: its secret authenticates third-party requests, so an unset value
+	// simply leaves that endpoint closed (503) instead of disabling anything
+	// else. A configured value must be long enough for HMAC-SHA256 to be
+	// meaningful; it is never echoed in an error.
+	if raw := os.Getenv("AEGIS_REVIEW_WEBHOOK_SECRET"); raw != "" {
+		if len(raw) < 16 || len(raw) > 256 {
+			return c, errors.New("AEGIS_REVIEW_WEBHOOK_SECRET must contain 16-256 bytes")
+		}
+		c.ReviewWebhookSecret = []byte(raw)
 	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {
 		origin = strings.TrimSpace(origin)

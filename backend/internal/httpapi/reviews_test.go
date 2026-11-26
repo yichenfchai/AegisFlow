@@ -22,6 +22,13 @@ import (
 // the project registry, mirroring cmd/server.
 func reviewTestServer(t *testing.T) (http.Handler, *auth.Service, *sql.DB) {
 	t.Helper()
+	return reviewTestServerWithOptions(t, Options{})
+}
+
+// reviewTestServerWithOptions is reviewTestServer with explicit options (for
+// example ReviewWebhookSecret for the signed external-result route).
+func reviewTestServerWithOptions(t *testing.T, options Options) (http.Handler, *auth.Service, *sql.DB) {
+	t.Helper()
 	db := testutil.OpenPostgres(t)
 	s := auth.New(db, strings.Repeat("k", 32), time.Minute, time.Hour)
 	if err := s.Migrate(context.Background()); err != nil {
@@ -32,11 +39,16 @@ func reviewTestServer(t *testing.T) (http.Handler, *auth.Service, *sql.DB) {
 	}
 	registry := projects.New(db)
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	return New(s, logger, db.PingContext, []string{"http://localhost:5173"}, Options{
-		Limiter:  newTestLimiter(),
-		Projects: registry,
-		Reviews:  reviews.New(db, registry),
-	}), s, db
+	if options.Limiter == nil {
+		options.Limiter = newTestLimiter()
+	}
+	if options.Projects == nil {
+		options.Projects = registry
+	}
+	if options.Reviews == nil {
+		options.Reviews = reviews.New(db, registry)
+	}
+	return New(s, logger, db.PingContext, []string{"http://localhost:5173"}, options), s, db
 }
 
 type reviewEnvelope struct {
