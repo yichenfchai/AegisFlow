@@ -4,6 +4,7 @@ import { DataTable, PageHeader, Pagination, type Column } from '@/components/ui/
 import { StatusBadge } from '@/components/ui/Badge'
 import { buildsAPI, BUILD_STATUS_TEXT, BUILD_STATUS_TONE, type Build } from '@/api/builds'
 import { projectsAPI } from '@/api/projects'
+import { errorText } from '@/api/errors'
 import { fmtRel } from '@/api/format'
 import { useState } from 'react'
 
@@ -60,7 +61,7 @@ export function BuildListPage() {
       <PageHeader title="构建" subtitle="全部项目的构建记录；在项目列表触发构建" />
       {error ? (
         <p role="alert" className="text-body-md text-error py-space-lg">
-          {error instanceof Error ? error.message : '加载构建失败'}
+          {errorText(error, '加载构建失败')}
         </p>
       ) : isLoading ? (
         <p className="text-body-md text-outline py-space-lg">加载中...</p>

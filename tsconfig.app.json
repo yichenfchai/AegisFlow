@@ -21,6 +21,9 @@
       "@/*": ["./src/*"]
     },
 
+    /* 严格类型检查：禁止隐式 any、null/undefined 收窄与 this 等宽松逃逸 */
+    "strict": true,
+
     /* Linting */
     "noUnusedLocals": true,
     "noUnusedParameters": true,

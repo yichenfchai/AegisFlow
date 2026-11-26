@@ -14,6 +14,7 @@ import {
 import { Segmented, StatusBadge } from '@/components/ui/Badge'
 import { adminAPI, AUDIT_ACTION_TEXT, AUDIT_OBJECT_TEXT, type AccountUser, type AuditEntry, type AuditFilters } from '@/api/account'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 import { useSession } from '@/stores/session'
 import { fmtRel } from '@/api/format'
 
@@ -44,11 +45,11 @@ export function SettingsPage() {
 
 function opError(cause: unknown): string {
   if (cause instanceof ApiError) {
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
+    // 400/404 在账号管理里有可操作的具体含义，优先于通用错误码文案。
     if (cause.status === 400) return '操作被拒绝：参数不合法，或触发最后管理员保护'
     if (cause.status === 404) return '目标用户不存在，请刷新列表'
   }
-  return cause instanceof Error ? cause.message : '操作失败，请稍后重试'
+  return errorText(cause, '操作失败，请稍后重试')
 }
 
 function UsersTab() {
@@ -153,7 +154,7 @@ function UsersTab() {
         <p className="text-body-md text-outline py-space-lg">加载中...</p>
       ) : loadError ? (
         <p role="alert" className="text-body-md text-error py-space-lg">
-          {loadError instanceof Error ? loadError.message : '加载用户失败'}
+          {errorText(loadError, '加载用户失败')}
         </p>
       ) : (
         <>
@@ -418,7 +419,7 @@ function AuditTab() {
       </div>
       {error ? (
         <p role="alert" className="text-body-md text-error py-space-lg">
-          {error instanceof Error ? error.message : '加载审计失败'}
+          {errorText(error, '加载审计失败')}
         </p>
       ) : isLoading ? (
         <p className="text-body-md text-outline py-space-lg">加载中...</p>

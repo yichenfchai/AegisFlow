@@ -87,12 +87,15 @@ test('项目可见性与成员：私有项目、邀请、非成员不可见、ma
     const { apiRequest } = await import('/src/stores/session.ts')
     try {
       await apiRequest(`/projects/${id}/builds`, { method: 'POST', body: '{}' })
-      return 201
+      return { status: 201, message: '' }
     } catch (error) {
-      return (error as { status: number }).status
+      const apiError = error as { status: number; message: string }
+      return { status: apiError.status, message: apiError.message }
     }
   }, projectID)
-  expect(forbidden).toBe(403)
+  expect(forbidden.status).toBe(403)
+  // 403 的展示文案来自统一错误码映射（中文），后端英文 message 不会泄露。
+  expect(forbidden.message).toBe('当前账号没有执行该操作的权限')
   await viewerCtx.close()
 
   // 提升为维护者后，同一个账号可以触发构建。

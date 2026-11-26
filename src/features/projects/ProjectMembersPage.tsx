@@ -13,6 +13,7 @@ import {
 import { adminAPI } from '@/api/account'
 import { useSession } from '@/stores/session'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 import { fmtRel } from '@/api/format'
 
 type MemberRow = ProjectMember & { id: string }
@@ -23,9 +24,8 @@ function memberError(cause: unknown, action: string): string {
     if (cause.status === 404) return '项目不可见，或成员不存在'
     if (cause.status === 409) return '该用户已经是项目成员'
     if (cause.status === 400) return '请求不合法：角色只能是维护者或查看者，且项目创建者不能被移除'
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return cause instanceof Error ? cause.message : '操作失败，请稍后重试'
+  return errorText(cause, '操作失败，请稍后重试')
 }
 
 /**
