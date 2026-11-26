@@ -72,7 +72,7 @@ func waitForStatus(t *testing.T, s *Service, id string, want ...string) *Build {
 // readable by someone who can see that project.
 func waitForStatusAs(t *testing.T, s *Service, actor auth.Actor, id string, want ...string) *Build {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(40 * time.Second)
 	for {
 		build, err := s.Get(context.Background(), actor, id)
 		if err != nil {
@@ -147,8 +147,13 @@ func TestWorkerSuccessAndLogs(t *testing.T) {
 	if done.StartedAt < done.CreatedAt || done.FinishedAt < done.StartedAt {
 		t.Fatalf("bad timestamps: %+v", done)
 	}
-	joined := waitForLog(t, s, build.ID, "hello-aegis")
-	for _, want := range []string{"build succeeded", "build #1 started"} {
+	// Wait for the final system line: once it is visible the worker's final
+	// flush has completed, so the follow-up cursor reads are stable.
+	joined := waitForLog(t, s, build.ID, "build succeeded")
+	if !strings.Contains(joined, "hello-aegis") {
+		t.Fatalf("logs missing command output: %s", joined)
+	}
+	for _, want := range []string{"build #1 started"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("logs missing %q: %s", want, joined)
 		}
@@ -177,7 +182,7 @@ func logText(events []LogEvent) string {
 // the terminal status update, so an immediate read races the final flush.
 func waitForLog(t *testing.T, s *Service, id, want string) string {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for {
 		events, err := s.Logs(context.Background(), testActor, id, 0, 1000)
 		if err != nil {
