@@ -5,7 +5,8 @@ info:
   description: |
     Machine-readable contract for the AegisFlow backend: browser authentication,
     users and audit, the project registry, builds, deployment targets, deployment
-    tasks, approvals, the review center, health and metrics.
+    tasks, approvals, the review center, the scan registry and defense events,
+    health and metrics.
 
     Multi-instance PostgreSQL backend with Redis shared rate limiting behind a same-origin reverse proxy (recommended).
     All JSON responses use data/error plus requestId envelopes. All responses include
@@ -62,6 +63,10 @@ tags:
     description: Admin-only deployment approval queue (approve, reject, expiry)
   - name: Reviews
     description: Project review center (gate-style change reviews) with maintainer/admin decisions, cancellation, a per-project number sequence, signed inbound external results and review-event notifications over the shared approval webhook channel
+  - name: Scans
+    description: Scan-result registry fed by signed inbound deliveries from external scanning tools; reads follow project visibility; AegisFlow never runs a scanner
+  - name: SecurityEvents
+    description: Admin-only defense-event registry fed by signed inbound deliveries from external detection tools; an administrator acknowledges events with an audited state change
   - name: Audit
     description: Persistent authentication and account-management audit trail
   - name: Health
@@ -2199,6 +2204,376 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /api/v1/projects/{projectId}/scans:
+    get:
+      tags: [Scans]
+      operationId: listProjectScans
+      summary: List a project's scan results (visible projects)
+      description: |
+        Newest first, filtered by project visibility: an invisible private
+        project answers 404 rather than an empty page. verdict is optional and
+        limited to passed/failed/warning.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: verdict
+          in: query
+          required: false
+          description: Filter by scan verdict; omit for all
+          schema: { type: string, enum: [passed, failed, warning] }
+      responses:
+        '200':
+          description: Scan page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ScanPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Scans]
+      operationId: ingestScan
+      summary: Append a signed scan result (HMAC webhook, no session)
+      description: |
+        Machine-to-machine webhook for external scanning tools; AegisFlow never
+        runs a scanner itself. It is not a browser session route and requires no
+        Bearer token: the caller proves possession of
+        AEGIS_INGEST_WEBHOOK_SECRET by signing the exact raw body. Required
+        headers: X-AegisFlow-Timestamp (Unix seconds, within 300s of the server
+        clock), X-AegisFlow-Signature
+        (sha256=<hex HMAC-SHA256(secret, timestamp + "." + rawBody)>) and
+        X-AegisFlow-Delivery (8-128 characters of A-Z a-z 0-9 . _ -, the
+        idempotency key). A missing, malformed, stale or future-dated signature
+        header is 401. The payload appends one immutable scan row to an existing
+        project. A repeated delivery id returns the stored row with 200 (no new
+        row); a new delivery returns 201. Unknown projects are 404. When
+        AEGIS_INGEST_WEBHOOK_SECRET is unset the endpoint answers 503 while the
+        read routes stay available. The response never contains signing headers
+        or secret material.
+      security: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - { $ref: '#/components/parameters/IngestTimestamp' }
+        - { $ref: '#/components/parameters/IngestSignature' }
+        - { $ref: '#/components/parameters/IngestDelivery' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateScanInput' }
+      responses:
+        '201':
+          description: Scan result appended
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Scan' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '200':
+          description: Delivery id already stored; the original scan is returned unchanged
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Scan' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Missing, invalid, stale or future-dated X-AegisFlow signature headers or delivery id; error.code is unauthorized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The stored delivery row was removed concurrently; retry with a new deliveryId
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503':
+          description: AEGIS_INGEST_WEBHOOK_SECRET is not configured; error.code is dependencies_unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /api/v1/scans:
+    get:
+      tags: [Scans]
+      operationId: listScans
+      summary: List scan results across projects (visible projects)
+      description: |
+        Newest first, restricted to the projects the caller can see: a global
+        admin sees every scan, while other roles see scans of public projects
+        plus projects they created or belong to. projectId and verdict are
+        optional filters; filtering by an invisible project returns an empty
+        page instead of an error, matching the global review and deployment
+        lists, so the filter cannot be used to enumerate private project ids.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: projectId
+          in: query
+          required: false
+          description: Filter by project id; omit for all visible projects
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - name: verdict
+          in: query
+          required: false
+          description: Filter by scan verdict; omit for all
+          schema: { type: string, enum: [passed, failed, warning] }
+      responses:
+        '200':
+          description: Scan page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ScanPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/scans/{scanId}:
+    get:
+      tags: [Scans]
+      operationId: getScan
+      summary: Get one scan result (visible projects)
+      description: An invisible project is 404, exactly like the project itself.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: scanId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Scan result with its project name and delivery evidence
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/Scan' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/security-events:
+    get:
+      tags: [SecurityEvents]
+      operationId: listSecurityEvents
+      summary: List defense events (admin-only)
+      description: |
+        Newest occurrence first, filtered by the optional severity, status and
+        source query parameters. Defense events are global administrative
+        objects: member/viewer callers receive 403.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: severity
+          in: query
+          required: false
+          description: Filter by severity; omit for all
+          schema: { type: string, enum: [low, medium, high, critical] }
+        - name: status
+          in: query
+          required: false
+          description: Filter by status; omit for all
+          schema: { type: string, enum: [open, acknowledged] }
+        - name: source
+          in: query
+          required: false
+          description: Filter by external source name (exact match)
+          schema: { type: string, minLength: 1, maxLength: 64 }
+      responses:
+        '200':
+          description: Defense event page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/SecurityEventPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [SecurityEvents]
+      operationId: ingestSecurityEvent
+      summary: Append a signed defense event (HMAC webhook, no session)
+      description: |
+        Machine-to-machine webhook for external detection tools; AegisFlow never
+        runs a detection engine itself. It is not a browser session route and
+        requires no Bearer token: the caller proves possession of
+        AEGIS_INGEST_WEBHOOK_SECRET by signing the exact raw body. Required
+        headers: X-AegisFlow-Timestamp (Unix seconds, within 300s of the server
+        clock), X-AegisFlow-Signature
+        (sha256=<hex HMAC-SHA256(secret, timestamp + "." + rawBody)>) and
+        X-AegisFlow-Delivery (8-128 characters of A-Z a-z 0-9 . _ -, the
+        idempotency key). A missing, malformed, stale or future-dated signature
+        header is 401. The payload appends one immutable event that stays open
+        until an administrator acknowledges it. A repeated delivery id returns
+        the stored event with 200 (no new row); a new delivery returns 201. When
+        AEGIS_INGEST_WEBHOOK_SECRET is unset the endpoint answers 503 while the
+        read routes stay available.
+      security: []
+      parameters:
+        - { $ref: '#/components/parameters/IngestTimestamp' }
+        - { $ref: '#/components/parameters/IngestSignature' }
+        - { $ref: '#/components/parameters/IngestDelivery' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateSecurityEventInput' }
+      responses:
+        '201':
+          description: Defense event appended; status is open
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/SecurityEvent' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '200':
+          description: Delivery id already stored; the original event is returned unchanged
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/SecurityEvent' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Missing, invalid, stale or future-dated X-AegisFlow signature headers or delivery id; error.code is unauthorized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '409':
+          description: The stored delivery row was removed concurrently; retry with a new deliveryId
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503':
+          description: AEGIS_INGEST_WEBHOOK_SECRET is not configured; error.code is dependencies_unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /api/v1/security-events/{eventId}:
+    get:
+      tags: [SecurityEvents]
+      operationId: getSecurityEvent
+      summary: Get one defense event (admin-only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Defense event with its acknowledgement state
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/SecurityEvent' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/security-events/{eventId}/ack:
+    post:
+      tags: [SecurityEvents]
+      operationId: ackSecurityEvent
+      summary: Acknowledge a defense event (admin-only)
+      description: |
+        Moves an open event to acknowledged and records acknowledgedBy,
+        acknowledgedByName and acknowledgedAt, in one transaction with a
+        security_event.ack audit row whose detail only carries the event id,
+        severity and type (never the summary). Repeating on an already
+        acknowledged event is idempotent and writes no second audit row. An
+        unknown event is 404 and a non-admin caller is 403.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200':
+          description: Acknowledged (or already acknowledged) defense event
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/SecurityEvent' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
 components:
   securitySchemes:
     bearerAuth:
@@ -2247,6 +2622,24 @@ components:
       in: header
       required: true
       description: 8-128 characters of A-Z a-z 0-9 . _ -; the sender's idempotency key
+      schema: { type: string, pattern: '^[A-Za-z0-9._-]{8,128}$' }
+    IngestTimestamp:
+      name: X-AegisFlow-Timestamp
+      in: header
+      required: true
+      description: Unix seconds; must be within 300s of the server clock (replay window)
+      schema: { type: integer, format: int64 }
+    IngestSignature:
+      name: X-AegisFlow-Signature
+      in: header
+      required: true
+      description: 'sha256=<hex HMAC-SHA256(AEGIS_INGEST_WEBHOOK_SECRET, timestamp + "." + rawBody)>'
+      schema: { type: string, pattern: '^sha256=[a-f0-9]{64}$' }
+    IngestDelivery:
+      name: X-AegisFlow-Delivery
+      in: header
+      required: true
+      description: 8-128 characters of A-Z a-z 0-9 . _ -; globally unique idempotency key
       schema: { type: string, pattern: '^[A-Za-z0-9._-]{8,128}$' }
   requestBodies:
     EmptyObject:
@@ -2762,6 +3155,82 @@ components:
         verdict: { type: string, enum: [passed, failed, warning] }
         summary: { type: string, maxLength: 500, description: Optional; at most 500 UTF-8 bytes; newlines preserved, other control characters removed }
         url: { type: string, maxLength: 2048, description: 'Optional absolute http(s) URL without userinfo or fragment; display-only, never fetched' }
+    Scan:
+      type: object
+      additionalProperties: false
+      required: [id, projectId, projectName, source, tool, version, verdict, summary, receivedAt]
+      properties:
+        id: { type: string }
+        projectId: { type: string }
+        projectName: { type: string, description: Project name resolved from the project registry for display }
+        source: { type: string, description: 'External tool name: 1-64 UTF-8 bytes on one line, trimmed' }
+        tool: { type: string, description: 'Optional tool name: at most 64 UTF-8 bytes on one line, trimmed; empty when omitted' }
+        version: { type: string, description: 'Optional tool version: at most 64 UTF-8 bytes on one line, trimmed; empty when omitted' }
+        verdict: { type: string, enum: [passed, failed, warning] }
+        summary: { type: string, description: 'At most 1000 UTF-8 bytes; newlines preserved, other control characters removed; empty when the delivery carried no note' }
+        reportUrl: { type: string, description: 'Absent when omitted; otherwise an absolute http(s) URL without userinfo or fragment, at most 2048 UTF-8 bytes; display-only and never fetched' }
+        receivedAt: { type: integer, format: int64, description: Unix seconds when the server accepted the delivery }
+    ScanPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Scan' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
+    CreateScanInput:
+      type: object
+      additionalProperties: false
+      required: [source, verdict]
+      properties:
+        source: { type: string, minLength: 1, maxLength: 64, description: Required external tool name; at most 64 UTF-8 bytes on one line, trimmed before validation }
+        tool: { type: string, maxLength: 64, description: 'Optional tool name; at most 64 UTF-8 bytes on one line, trimmed before validation' }
+        version: { type: string, maxLength: 64, description: 'Optional tool version; at most 64 UTF-8 bytes on one line, trimmed before validation' }
+        verdict: { type: string, enum: [passed, failed, warning] }
+        summary: { type: string, maxLength: 1000, description: 'Optional; at most 1000 UTF-8 bytes; newlines preserved, other control characters removed' }
+        reportUrl: { type: string, maxLength: 2048, description: 'Optional absolute http(s) URL without userinfo or fragment; display-only, never fetched' }
+    SecurityEvent:
+      type: object
+      additionalProperties: false
+      required: [id, source, severity, eventType, summary, status, occurredAt, receivedAt]
+      properties:
+        id: { type: string }
+        source: { type: string, description: 'External detection source: 1-64 UTF-8 bytes on one line, trimmed' }
+        severity: { type: string, enum: [low, medium, high, critical] }
+        eventType: { type: string, description: 'Event type: 1-64 UTF-8 bytes on one line, trimmed' }
+        summary: { type: string, description: 'At most 1000 UTF-8 bytes; newlines preserved, other control characters removed' }
+        status: { type: string, enum: [open, acknowledged], description: open -> acknowledged; acknowledged events never change again }
+        detailsUrl: { type: string, description: 'Absent when omitted; otherwise an absolute http(s) URL without userinfo or fragment, at most 2048 UTF-8 bytes; display-only and never fetched' }
+        occurredAt: { type: integer, format: int64, description: Unix seconds when the source observed the event; defaults to receivedAt when the delivery omitted it }
+        receivedAt: { type: integer, format: int64, description: Unix seconds when the server accepted the delivery }
+        acknowledgedBy: { type: string, description: Admin actor id; absent while open }
+        acknowledgedByName: { type: string, description: Acknowledging admin username; absent while open }
+        acknowledgedAt: { type: integer, format: int64, description: Unix seconds of the acknowledgement; absent while open }
+    SecurityEventPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/SecurityEvent' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
+    CreateSecurityEventInput:
+      type: object
+      additionalProperties: false
+      required: [source, severity, eventType, summary]
+      properties:
+        source: { type: string, minLength: 1, maxLength: 64, description: Required external source name; at most 64 UTF-8 bytes on one line, trimmed before validation }
+        severity: { type: string, enum: [low, medium, high, critical] }
+        eventType: { type: string, minLength: 1, maxLength: 64, description: Required event type; at most 64 UTF-8 bytes on one line, trimmed before validation }
+        summary: { type: string, minLength: 1, maxLength: 1000, description: 'Required; 1-1000 UTF-8 bytes; newlines preserved, other control characters removed' }
+        occurredAt: { type: integer, format: int64, description: 'Optional Unix seconds; defaults to now, must not be more than 300 seconds in the future' }
+        detailsUrl: { type: string, maxLength: 2048, description: 'Optional absolute http(s) URL without userinfo or fragment; display-only, never fetched' }
     AuditEntry:
       type: object
       additionalProperties: false
@@ -2771,8 +3240,8 @@ components:
         createdAt: { type: integer, format: int64, description: Unix seconds }
         actorId: { type: string, description: Empty for system rows }
         actorUsername: { type: string }
-        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check, deployment.create, deployment.cancel, deployment.rollback, approval.request, approval.approve, approval.reject, approval.expire, review.request, review.approve, review.reject, review.cancel] }
-        objectType: { type: string, enum: [user, session, project, build, deployment_target, deployment, approval, review] }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check, deployment.create, deployment.cancel, deployment.rollback, approval.request, approval.approve, approval.reject, approval.expire, review.request, review.approve, review.reject, review.cancel, security_event.ack] }
+        objectType: { type: string, enum: [user, session, project, build, deployment_target, deployment, approval, review, security_event] }
         objectId: { type: string }
         result: { type: string, enum: [success, failure] }
         detail: { type: string, description: Safe context such as role transitions or revoked counts; never secrets }

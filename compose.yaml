@@ -46,6 +46,10 @@ x-api: &api
     # Inbound external review-result HMAC key (16-256 bytes). Empty keeps the
     # signed result webhook closed (503); independent of the outbound URL above.
     AEGIS_REVIEW_WEBHOOK_SECRET: ${AEGIS_REVIEW_WEBHOOK_SECRET:-}
+    # Inbound HMAC key (16-256 bytes) for the signed scan and security-event
+    # webhooks (POST /api/v1/projects/{id}/scans, POST /api/v1/security-events).
+    # Empty keeps both closed (503); independent of the review webhook key.
+    AEGIS_INGEST_WEBHOOK_SECRET: ${AEGIS_INGEST_WEBHOOK_SECRET:-}
     # Build execution. none is for local acceptance only (runs as the service
     # account); container needs the host Docker socket, see the override snippet.
     AEGIS_BUILD_SANDBOX: ${AEGIS_BUILD_SANDBOX:-none}

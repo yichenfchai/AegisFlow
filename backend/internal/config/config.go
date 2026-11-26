@@ -79,6 +79,12 @@ type Config struct {
 	// review-event notifications reuse ApprovalWebhookURL/Secret/Timeout: one
 	// receiver channel carries both approval.* and review.* events.
 	ReviewWebhookSecret []byte
+	// IngestWebhookSecret verifies the HMAC-SHA256 signature of inbound scan and
+	// security-event deliveries (AEGIS_INGEST_WEBHOOK_SECRET, P5 batch A). Empty
+	// keeps both signed ingest endpoints closed (503) while their authenticated
+	// read routes stay available; a configured value must be 16-256 bytes and is
+	// never echoed in an error.
+	IngestWebhookSecret []byte
 	// RequireReviewEnvironments lists target environments whose deployments
 	// must reference an approved review. Empty (the default, including an
 	// explicitly empty value or only commas/whitespace) disables the gate: the
@@ -359,6 +365,17 @@ func Load() (Config, error) {
 			return c, errors.New("AEGIS_REVIEW_WEBHOOK_SECRET must contain 16-256 bytes")
 		}
 		c.ReviewWebhookSecret = []byte(raw)
+	}
+	// The scan/security-event ingest webhook shares the exact signature scheme
+	// of the external-result endpoint but keeps its own secret: a tool that may
+	// report scan results does not automatically gain access to review evidence.
+	// An unset value leaves both ingest endpoints closed (503), never affects the
+	// read routes, and is not an error.
+	if raw := os.Getenv("AEGIS_INGEST_WEBHOOK_SECRET"); raw != "" {
+		if len(raw) < 16 || len(raw) > 256 {
+			return c, errors.New("AEGIS_INGEST_WEBHOOK_SECRET must contain 16-256 bytes")
+		}
+		c.IngestWebhookSecret = []byte(raw)
 	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {
 		origin = strings.TrimSpace(origin)

@@ -17,12 +17,11 @@ const UNIMPLEMENTED_TEXT = '此模块的真实业务接口尚未实现，当前�
 test('未实现模块恒定显示声明，不提供演示数据或伪造操作', async ({ page }) => {
   await login(page)
 
-  // 侧边栏入口真实存在：从项目列表可导航到仍未实现的安全扫描。
-  await page.locator('aside').getByRole('link', { name: '安全扫描' }).click()
-  await expect(page).toHaveURL('/scans')
+  // 侧边栏入口真实存在：从项目列表可导航到仍未实现的知识库。
+  await page.locator('aside').getByRole('link', { name: '知识库' }).click()
+  await expect(page).toHaveURL('/knowledge')
 
   for (const [path, title] of [
-    ['/scans', '安全扫描'],
     ['/knowledge', '知识库'],
   ] as const) {
     await page.goto(path)

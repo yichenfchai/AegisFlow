@@ -1,6 +1,7 @@
 import { defineConfig } from '@playwright/test'
 import { randomBytes } from 'node:crypto'
 import { E2E_REVIEW_WEBHOOK_SECRET } from './tests/e2e/reviewExternalResults'
+import { E2E_INGEST_WEBHOOK_SECRET } from './tests/e2e/ingestWebhook'
 
 if (!process.env.AEGIS_E2E_DATABASE_URL || !process.env.AEGIS_E2E_REDIS_URL) {
   throw new Error('Set AEGIS_E2E_DATABASE_URL to a dedicated disposable PostgreSQL database and AEGIS_E2E_REDIS_URL before E2E tests')
@@ -43,6 +44,9 @@ export default defineConfig({
         // deliveries against the same value the backend verifies. It never
         // leaves the disposable E2E environment.
         AEGIS_REVIEW_WEBHOOK_SECRET: E2E_REVIEW_WEBHOOK_SECRET,
+        // Fixed test-only HMAC secret for the signed scan/security-event ingest
+        // webhooks (scans-defense spec); also disposable and never reused.
+        AEGIS_INGEST_WEBHOOK_SECRET: E2E_INGEST_WEBHOOK_SECRET,
       },
     },
     { command: 'npm run dev -- --host localhost --strictPort', url: 'http://localhost:5173', reuseExistingServer: false },

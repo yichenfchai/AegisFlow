@@ -295,6 +295,45 @@ var Migrations = [][]string{{
 	 created_at BIGINT NOT NULL,
 	 UNIQUE (review_id, event))`,
 	`CREATE INDEX review_notifications_pending_idx ON review_notifications(status, next_attempt_at, id)`,
+}, {
+	// Scan registry and defense events (P5 remaining modules, batch A). Both
+	// tables are append-only evidence for signed inbound deliveries: the
+	// delivery id is globally unique, so a retried webhook returns the stored row
+	// instead of duplicating it. scans belongs to one project and cascades on
+	// delete (a scan has no meaning without its project); verdict is the only
+	// accepted external judgement. security_events is global (defense is not
+	// project-scoped): a source reports one event that stays open until an admin
+	// acknowledges it, and acknowledged_by/acknowledged_at stay NULL until then,
+	// so "not acknowledged yet" is not encoded as a zero timestamp. Neither
+	// table stores request headers or signing material.
+	`CREATE TABLE scans (
+	 id TEXT PRIMARY KEY,
+	 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+	 delivery_id TEXT NOT NULL UNIQUE,
+	 source TEXT NOT NULL,
+	 tool TEXT NOT NULL DEFAULT '',
+	 version TEXT NOT NULL DEFAULT '',
+	 verdict TEXT NOT NULL CHECK(verdict IN ('passed','failed','warning')),
+	 summary TEXT NOT NULL DEFAULT '',
+	 report_url TEXT,
+	 received_at BIGINT NOT NULL)`,
+	`CREATE INDEX scans_project_received_idx ON scans(project_id, received_at DESC, id)`,
+	`CREATE INDEX scans_verdict_received_idx ON scans(verdict, received_at DESC)`,
+	`CREATE TABLE security_events (
+	 id TEXT PRIMARY KEY,
+	 delivery_id TEXT NOT NULL UNIQUE,
+	 source TEXT NOT NULL,
+	 severity TEXT NOT NULL CHECK(severity IN ('low','medium','high','critical')),
+	 event_type TEXT NOT NULL,
+	 summary TEXT NOT NULL,
+	 details_url TEXT,
+	 status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','acknowledged')),
+	 occurred_at BIGINT NOT NULL,
+	 received_at BIGINT NOT NULL,
+	 acknowledged_by TEXT,
+	 acknowledged_at BIGINT)`,
+	`CREATE INDEX security_events_status_occurred_idx ON security_events(status, occurred_at DESC, id)`,
+	`CREATE INDEX security_events_severity_occurred_idx ON security_events(severity, occurred_at DESC)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped
