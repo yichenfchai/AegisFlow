@@ -3,7 +3,7 @@ import { Link, useLocation, useParams } from 'react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Button, ConfirmDialog, Field, Input, PageHeader } from '@/components/ui/DataTable'
 import { StatusBadge } from '@/components/ui/Badge'
-import { REVIEW_STATUS_TEXT, REVIEW_STATUS_TONE, reviewsAPI, type Review } from '@/api/reviews'
+import { REVIEW_STATUS_TEXT, REVIEW_STATUS_TONE, REVIEW_VERDICT_TEXT, REVIEW_VERDICT_TONE, reviewsAPI, type Review } from '@/api/reviews'
 import { projectsAPI } from '@/api/projects'
 import { ApiError } from '@/api/http'
 import { errorText } from '@/api/errors'
@@ -12,9 +12,9 @@ import { useSession } from '@/stores/session'
 import { reviewActionError, reviewReasonValidation } from './reviewForm'
 
 /**
- * 审查详情（真实接口）：展示审查正文、状态、决定人与理由、外部链接；待审查时
- * 按角色展示批准/拒绝（维护者或管理员）与取消（发起人、维护者或管理员）。
- * 按钮只是交互镜像，服务端逐请求校验。
+ * 审查详情（真实接口）：展示审查正文、状态、决定人与理由、外部链接，以及外部
+ * 工具签名回写的只读结果（E4B）；待审查时按角色展示批准/拒绝（维护者或管理员）
+ * 与取消（发起人、维护者或管理员）。按钮只是交互镜像，服务端逐请求校验。
  */
 export function ReviewDetailPage() {
   const { id = '' } = useParams<{ id: string }>()
@@ -40,6 +40,14 @@ export function ReviewDetailPage() {
   })
   const review = reviewQuery.data
   const projectId = review?.projectId ?? ''
+  // 外部结果是只读证据；独立查询失败不影响审查本体与决策交互。
+  const externalResultsQuery = useQuery({
+    queryKey: ['review-external-results', id],
+    queryFn: () => reviewsAPI.listExternalResults(id),
+    enabled: id !== '',
+    retry: false,
+  })
+  const externalResults = externalResultsQuery.data?.items ?? []
   const projectsQuery = useQuery({
     queryKey: ['projects'],
     queryFn: () => projectsAPI.projects(100, 0),
@@ -261,6 +269,100 @@ export function ReviewDetailPage() {
           </div>
         </section>
       </div>
+
+      <section
+        aria-labelledby="review-external-results-heading"
+        className="mt-gutter bg-surface-container rounded-lg border border-surface-container-highest p-space-xl"
+      >
+        <div className="flex flex-wrap items-end justify-between gap-space-md mb-space-lg">
+          <div>
+            <h2 id="review-external-results-heading" className="text-headline-md font-semibold">
+              外部结果
+            </h2>
+            <p className="text-label-sm text-outline mt-space-xs">
+              外部扫描/审查工具通过签名接口回写的只读证据，不会改变审查状态；AegisFlow 不会抓取报告地址。
+            </p>
+          </div>
+          {externalResults.length > 0 && (
+            <span className="text-label-sm text-outline">共 {externalResults.length} 条 · 最新在前</span>
+          )}
+        </div>
+        {externalResultsQuery.isPending ? (
+          <div role="status">
+            <span className="sr-only">正在加载外部结果</span>
+            <div aria-hidden className="space-y-space-md">
+              {[0, 1].map((row) => (
+                <div
+                  key={row}
+                  className="animate-pulse rounded border border-surface-container-highest bg-surface-container-low p-space-lg"
+                >
+                  <div className="h-4 w-32 rounded bg-surface-container-highest/70" />
+                  <div className="mt-space-md h-3 w-3/4 rounded bg-surface-container-highest/70" />
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : externalResultsQuery.error ? (
+          <div className="rounded border border-error/40 bg-error/5 p-space-lg">
+            <p role="alert" className="text-body-sm text-error">
+              {errorText(externalResultsQuery.error, '加载外部结果失败，请稍后重试')}
+            </p>
+            <Button
+              variant="secondary"
+              size="sm"
+              className="mt-space-md"
+              disabled={externalResultsQuery.isFetching}
+              onClick={() => void externalResultsQuery.refetch()}
+            >
+              {externalResultsQuery.isFetching ? '正在重试...' : '重试加载外部结果'}
+            </Button>
+          </div>
+        ) : externalResults.length === 0 ? (
+          <p className="py-space-lg text-body-md text-outline">暂无外部结果</p>
+        ) : (
+          <ul className="space-y-space-md">
+            {externalResults.map((result) => (
+              <li
+                key={result.id}
+                className="rounded border border-surface-container-highest bg-surface-container-low p-space-lg"
+              >
+                <div className="flex flex-wrap items-center gap-space-md">
+                  <StatusBadge tone={REVIEW_VERDICT_TONE[result.verdict]}>
+                    {REVIEW_VERDICT_TEXT[result.verdict]}
+                  </StatusBadge>
+                  <span className="break-all text-body-md font-medium text-on-surface">{result.source}</span>
+                  <span
+                    className="ml-auto text-label-sm text-outline"
+                    title={new Date(result.receivedAt * 1000).toLocaleString()}
+                  >
+                    {fmtRel(result.receivedAt * 1000)}
+                  </span>
+                </div>
+                {result.summary ? (
+                  <p className="mt-space-md max-h-40 overflow-y-auto whitespace-pre-wrap break-all text-body-sm text-on-surface-variant">
+                    {result.summary}
+                  </p>
+                ) : (
+                  <p className="mt-space-md text-body-sm text-outline">（未提供摘要）</p>
+                )}
+                {result.url && (
+                  <div className="mt-space-md">
+                    <a
+                      href={result.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-body-sm text-primary hover:underline"
+                    >
+                      查看外部报告
+                    </a>
+                    <div className="mt-space-xs break-all font-mono text-label-sm text-outline">{result.url}</div>
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       <ConfirmDialog
         open={approveOpen}

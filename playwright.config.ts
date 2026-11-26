@@ -1,5 +1,6 @@
 import { defineConfig } from '@playwright/test'
 import { randomBytes } from 'node:crypto'
+import { E2E_REVIEW_WEBHOOK_SECRET } from './tests/e2e/reviewExternalResults'
 
 if (!process.env.AEGIS_E2E_DATABASE_URL || !process.env.AEGIS_E2E_REDIS_URL) {
   throw new Error('Set AEGIS_E2E_DATABASE_URL to a dedicated disposable PostgreSQL database and AEGIS_E2E_REDIS_URL before E2E tests')
@@ -38,6 +39,10 @@ export default defineConfig({
         // The suite drives many accounts from one address inside a minute; the
         // production default quota of 10 would reject valid logins mid-run.
         AEGIS_LOGIN_RATE_LIMIT: '100',
+        // Fixed test-only HMAC secret so the external-results spec can sign
+        // deliveries against the same value the backend verifies. It never
+        // leaves the disposable E2E environment.
+        AEGIS_REVIEW_WEBHOOK_SECRET: E2E_REVIEW_WEBHOOK_SECRET,
       },
     },
     { command: 'npm run dev -- --host localhost --strictPort', url: 'http://localhost:5173', reuseExistingServer: false },

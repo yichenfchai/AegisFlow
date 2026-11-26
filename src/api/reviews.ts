@@ -4,6 +4,34 @@ import type { Page } from '@/api/account'
 
 export type ReviewStatus = 'pending' | 'approved' | 'rejected' | 'cancelled'
 
+/** Verdict reported by an external scanner; display-only evidence. */
+export type ReviewVerdict = 'passed' | 'failed' | 'warning'
+
+/**
+ * One immutable external result written back by a signed external tool (E4).
+ * External results are evidence only: they never change the review status or
+ * the deployment gate. `summary` preserves newlines and may be empty; `url` is
+ * empty when absent and is display-only (the server never fetches it).
+ */
+export interface ReviewExternalResult {
+  id: string
+  reviewId: string
+  deliveryId: string
+  /** External tool name, 1-64 bytes on one line. */
+  source: string
+  verdict: ReviewVerdict
+  /** At most 500 bytes; empty when the delivery carried no note. */
+  summary: string
+  /** Empty or an absolute http(s) URL without userinfo or fragment. */
+  url: string
+  /** Unix seconds when the server accepted the delivery. */
+  receivedAt: number
+}
+
+export interface ReviewExternalResultList {
+  items: ReviewExternalResult[]
+}
+
 /**
  * One gate-style change review. `decidedBy` / `decidedByName` / `decidedAt` /
  * `reason` are only present once a decision (or cancellation) exists; a pending
@@ -96,6 +124,11 @@ export const reviewsAPI = {
       method: 'POST',
       body: '{}',
     }),
+  /** Read-only external evidence for a visible review, newest first (server caps at 50). */
+  listExternalResults: (id: string) =>
+    apiRequest<ReviewExternalResultList>(
+      `/reviews/${encodeURIComponent(id)}/external-results`,
+    ),
 }
 
 export const REVIEW_STATUS_TEXT: Record<ReviewStatus, string> = {
@@ -118,4 +151,18 @@ export const REVIEW_STATUS_TONE: Record<
 /** Display label for a review option in pickers: "#12 subject · v1.2.3". */
 export function reviewOptionLabel(review: Pick<Review, 'number' | 'subject' | 'version'>): string {
   return `#${review.number} ${review.subject}${review.version ? ` · ${review.version}` : ''}`
+}
+
+/** Chinese verdict labels for external results: passed=通过 / failed=失败 / warning=警告. */
+export const REVIEW_VERDICT_TEXT: Record<ReviewVerdict, string> = {
+  passed: '通过',
+  failed: '失败',
+  warning: '警告',
+}
+
+/** Badge tone per verdict: passed green / failed red / warning amber. */
+export const REVIEW_VERDICT_TONE: Record<ReviewVerdict, 'success' | 'error' | 'warning'> = {
+  passed: 'success',
+  failed: 'error',
+  warning: 'warning',
 }
