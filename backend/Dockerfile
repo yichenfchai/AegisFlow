@@ -1,8 +1,10 @@
-# Base images are pinned to a tag@sha256 digest (multi-arch manifest list from
-# Docker's official image metadata, docker-library/repo-info) so a moved tag
-# cannot change the build. Refresh with `docker manifest inspect <image:tag>`
-# when the Go or Alpine line is bumped.
-FROM golang:1.26-alpine@sha256:ecb67f987aa1a57794c91d19ade7ae0209f2f0f5496aaef9e6ae85ddf92d02ab AS build
+# Base images are pinned to a tag@sha256 digest (the multi-arch OCI image index
+# digest returned by Docker Hub's registry API) so a moved tag cannot change the
+# build. Refresh deliberately when the Go or Alpine line is bumped: resolve the
+# new digest with `docker manifest inspect <image:tag>`, or query
+# registry-1.docker.io's /v2/.../manifests/<tag> endpoint and read the
+# Docker-Content-Digest header, then update the pin below.
+FROM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
