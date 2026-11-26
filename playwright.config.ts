@@ -7,13 +7,35 @@ if (!process.env.AEGIS_E2E_DATABASE_URL || !process.env.AEGIS_E2E_REDIS_URL) {
   throw new Error('Set AEGIS_E2E_DATABASE_URL to a dedicated disposable PostgreSQL database and AEGIS_E2E_REDIS_URL before E2E tests')
 }
 
+// Optional OIDC SSO suite (P5 batch D). AEGIS_E2E_OIDC=1 starts the local fake
+// provider and injects AEGIS_OIDC_* into the backend, so the login page shows
+// the SSO button and tests/e2e/oidc.spec.ts runs. Without it the default suite
+// is unchanged and proves the unconfigured deployment has no SSO button.
+const oidcE2E = process.env.AEGIS_E2E_OIDC === '1'
+const oidcProviderPort = 9099
+const oidcProviderBase = `http://127.0.0.1:${oidcProviderPort}`
+
 export default defineConfig({
   testDir: './tests/e2e',
+  // The SSO spec needs the fake provider and OIDC-enabled backend, so it is
+  // excluded from the default (unconfigured) run rather than silently skipped.
+  testIgnore: oidcE2E ? [] : ['**/oidc.spec.ts'],
   fullyParallel: false,
   workers: 1,
   timeout: 45_000,
   use: { baseURL: 'http://localhost:5173', browserName: 'chromium', trace: 'retain-on-failure' },
   webServer: [
+    ...(oidcE2E
+      ? [
+          {
+            command: 'node tests/e2e/fakeOidcProvider.mjs',
+            url: `${oidcProviderBase}/.well-known/openid-configuration`,
+            reuseExistingServer: false,
+            timeout: 60_000,
+            env: { AEGIS_FAKE_OIDC_PORT: String(oidcProviderPort) },
+          },
+        ]
+      : []),
     {
       command: 'go run ./cmd/server',
       cwd: './backend',
@@ -49,6 +71,18 @@ export default defineConfig({
         // Fixed test-only HMAC secret for the signed scan/security-event ingest
         // webhooks (scans-defense spec); also disposable and never reused.
         AEGIS_INGEST_WEBHOOK_SECRET: E2E_INGEST_WEBHOOK_SECRET,
+        // Optional fake-provider SSO (see AEGIS_E2E_OIDC above). The redirect
+        // URL is the browser-visible Vite origin, which proxies /api to the
+        // backend; the issuer is the local throwaway provider.
+        ...(oidcE2E
+          ? {
+              AEGIS_OIDC_ISSUER: oidcProviderBase,
+              AEGIS_OIDC_CLIENT_ID: 'aegisflow-e2e',
+              AEGIS_OIDC_REDIRECT_URL: 'http://localhost:5173/api/v1/auth/oidc/callback',
+              AEGIS_OIDC_AUTO_PROVISION: 'true',
+              AEGIS_OIDC_LABEL: '企业单点登录',
+            }
+          : {}),
       },
     },
     { command: 'npm run dev -- --host localhost --strictPort', url: 'http://localhost:5173', reuseExistingServer: false },

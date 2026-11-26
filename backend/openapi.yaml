@@ -254,6 +254,135 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/auth/oidc/config:
+    get:
+      tags: [Auth]
+      operationId: oidcConfig
+      summary: Report whether OIDC single sign-on is configured
+      description: |
+        Public probe used by the login page. When AEGIS_OIDC_ISSUER is unset the
+        response is enabled=false with an empty label, and the issuer, client id
+        and redirect URL are never revealed. When configured it returns the
+        configured button label (default 企业单点登录). GET only, so no Origin
+        header applies, and the probe does not count against the login limit.
+      security: []
+      responses:
+        '200':
+          description: OIDC availability
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/OIDCConfig' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/auth/oidc/start:
+    get:
+      tags: [Auth]
+      operationId: oidcStart
+      summary: Begin the OIDC authorization-code + PKCE flow
+      description: |
+        Public browser navigation (GET only). Answers 503 dependencies_unavailable
+        when AEGIS_OIDC_ISSUER is unset, and counts against the same shared Redis
+        login quota as POST /auth/login (429 with Retry-After; 503 without a local
+        fallback). Generates a 32-byte state, a 32-byte nonce and a 43-character
+        PKCE verifier, stores SHA-256(state) with the nonce, verifier, redirect
+        target and a 10-minute expiry, and sets the one-time aegis_oidc_state
+        cookie (HttpOnly, Secure only when AEGIS_COOKIE_SECURE=true, SameSite=Lax,
+        Path=/api/v1/auth/oidc, Max-Age=600). Redirects (302) to the discovered
+        authorization_endpoint with response_type=code, client_id, redirect_uri,
+        scope, state, nonce, code_challenge and code_challenge_method=S256.
+        Client_secret_post is added only when AEGIS_OIDC_CLIENT_SECRET is set;
+        otherwise the public-client PKCE flow is used.
+      parameters:
+        - name: redirectTo
+          in: query
+          required: false
+          description: Same-origin relative path to return to after login; must start with /, must not start with // and must contain no scheme or backslash. Anything else falls back to /
+          schema: { type: string, maxLength: 2048 }
+      responses:
+        '302':
+          description: Redirect to the provider authorization endpoint
+          headers:
+            Location: { schema: { type: string }, description: Provider authorization URL with state, nonce and PKCE challenge }
+            Set-Cookie: { $ref: '#/components/headers/OIDCStateCookie' }
+        '429':
+          description: Login rate limit exceeded; error.code is rate_limited
+          headers:
+            Retry-After:
+              description: Retry delay in seconds
+              schema: { type: string, pattern: '^[1-9][0-9]*$' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '503':
+          description: OIDC is unconfigured, or the shared login limiter is unavailable (fail closed); error.code is dependencies_unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/auth/oidc/callback:
+    get:
+      tags: [Auth]
+      operationId: oidcCallback
+      summary: Complete the OIDC flow and open the local session
+      description: |
+        Public browser navigation (GET only) and the redirect target registered as
+        AEGIS_OIDC_REDIRECT_URL. The query state must match the one-time
+        aegis_oidc_state cookie (constant-time compare) and the matching state row
+        is consumed atomically, so a replayed callback cannot mint a second
+        session. The code is exchanged at the token endpoint (client_secret_post
+        only when configured, PKCE verifier always sent), and the returned
+        id_token is verified: RS256 signature against the provider JWKS (kid
+        lookup, refresh on rotation), exact issuer, audience containing client_id,
+        exp/iat/nbf with 60s clock skew, nonce, azp when present, and a verified
+        non-empty email. A local account is linked by case-insensitive verified
+        email; a disabled account is refused, an unknown account is refused unless
+        AEGIS_OIDC_AUTO_PROVISION=true, which may only create a member (never an
+        admin). Success sets the same aegis_refresh cookie as a password login and
+        redirects (302) to the validated in-site path. Every failure redirects to
+        /login?sso_error=<code> and never carries provider text. This GET is the
+        one documented exception to the global Sec-Fetch-Site: cross-site
+        rejection: it is a top-level cross-site navigation from the provider,
+        protected by the one-time state cookie and the atomically consumed state
+        row instead.      parameters:
+        - name: state
+          in: query
+          required: true
+          schema: { type: string, maxLength: 256 }
+        - name: code
+          in: query
+          required: true
+          schema: { type: string, maxLength: 4096 }
+      responses:
+        '302':
+          description: |
+            Success redirects to the validated in-site path and includes the
+            aegis_refresh session cookie (HttpOnly, SameSite=Strict, session
+            cookie: SSO login does not set remember). Failure redirects to
+            /login?sso_error=<state_expired|token_exchange_failed|invalid_token|email_unverified|account_not_found|account_disabled|server_error>.
+            The aegis_oidc_state cookie is always deleted.
+          headers:
+            Location: { schema: { type: string } }
+            Set-Cookie: { schema: { type: string }, description: 'aegis_refresh on success; aegis_oidc_state deletion on every response' }
+        '429':
+          description: Login rate limit exceeded; error.code is rate_limited
+          headers:
+            Retry-After:
+              description: Retry delay in seconds
+              schema: { type: string, pattern: '^[1-9][0-9]*$' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '503':
+          description: OIDC is unconfigured, or the shared login limiter is unavailable (fail closed); error.code is dependencies_unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/auth/me:
     get:
       tags: [Auth]
@@ -3143,6 +3272,12 @@ components:
     DeletedRefreshCookie:
       description: Empty aegis_refresh cookie with matching Path/HttpOnly/SameSite/Secure, Max-Age=0 and an expired Expires
       schema: { type: string }
+    OIDCStateCookie:
+      description: |
+        aegis_oidc_state=<state>; Path=/api/v1/auth/oidc; HttpOnly;
+        SameSite=Lax (needed for the top-level GET navigation back from the
+        provider); Secure only when explicitly configured; Max-Age=600.
+      schema: { type: string }
   schemas:
     RequestID:
       type: string
@@ -3171,6 +3306,17 @@ components:
       maxLength: 64
       pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$'
       description: ASCII only; uniqueness and login lookup are case-insensitive
+    OIDCConfig:
+      type: object
+      additionalProperties: false
+      required: [enabled, label]
+      properties:
+        enabled:
+          type: boolean
+          description: True only when AEGIS_OIDC_ISSUER is configured and startup discovery succeeded
+        label:
+          type: string
+          description: Login-page button label when enabled; empty when disabled (issuer and client id are never exposed)
     Password:
       type: string
       format: password
