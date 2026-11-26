@@ -101,7 +101,7 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 ### 审查中心（P5-A，门禁式）
 
 - 定位：对项目的一次变更（版本标签或外部构建链接）发起审查，由项目 maintainer 批准或拒绝，全程审计，并允许发起人/维护者取消；E2 起审查可接入部署门禁（见「部署审查门禁」），E4 起外部工具可通过签名接口回写只读结果并触发审查事件通知。
-- 接口：`POST|GET /api/v1/projects/{projectId}/reviews`、`GET /api/v1/reviews`（全局列表，任何已登录角色，按项目可见性过滤，支持 `projectId`/`status`/分页）、`GET /api/v1/reviews/{id}`、`POST /api/v1/reviews/{id}/approve|reject|cancel`。
+- 接口：`POST|GET /api/v1/projects/{projectId}/reviews`、`GET /api/v1/reviews`（全局列表，任何已登录角色，按项目可见性过滤，支持 `projectId`/`status`/分页）、`GET /api/v1/reviews/{id}`、`POST /api/v1/reviews/{id}/approve|reject|cancel`、`GET /api/v1/reviews/{id}/external-results`（外部结果只读列表，项目可见者）。
 - 授权：发起复用项目写权限（`projects.AuthorizeWrite`：admin，或可写项目的 member；不可见 404、可见但无权 403）；批准/拒绝要求**全局 admin 或该项目 maintainer**（`projects.AuthorizeDecide`，比写权限更严，public 项目的普通 member 不能决策）；取消允许发起人本人或 admin/maintainer。项目内列表与详情按项目可见性过滤，不可见一律 404；全局列表同样按可见性过滤，但 `projectId` 过滤不可见项目时返回空列表（与 `GET /api/v1/deployments` 一致，不可枚举）。
 - 校验：`subject` 必填、3–200 字节、单行（trim）；`description` ≤2000 字节；`version` ≤64 字节单行（trim）；`externalUrl` 可选、仅 http(s)、禁止 userinfo/fragment、≤2048 字节，只展示不抓取；批准/拒绝的 `reason` trim、单行、≤512 字节，拒绝必填。
 - 编号与状态：`number` 在 `projects` 行锁下项目内自增；状态机 `pending → approved | rejected | cancelled`，终态不可变，非 pending 决策返回 409；已处于目标终态的重复请求幂等返回 200 且不重复审计。`decidedBy/decidedAt` 记录决策或取消者与时间，`reason` 记录批准/拒绝理由。
@@ -122,7 +122,7 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 - 载荷与校验：严格 JSON（≤16 KiB、未知/`null` 字段拒绝）`{source,verdict,summary?,url?}`；`source` 必填 1–64 字节单行，`verdict ∈ passed|failed|warning`，`summary` ≤500 字节（保留换行、去除其他控制字符），`url` 可选、仅 http(s)、无 userinfo/fragment、≤2048 字节。同一 `deliveryId` 重复回写返回 200 + 既有记录（不新增）；未知审查 404；非法字段 400。**外部结果不改变审查状态机，也不改变部署门禁判定**，只是只读证据。
 - 读取：`GET /api/v1/reviews/{id}/external-results`（Bearer，项目可见者）按 `receivedAt` 倒序最多 50 条；不可见/不存在 404。响应不含签名头或密钥。
 - 出站通知：`review.requested`（创建）、`review.approved`/`review.rejected`（决策）、`review.cancelled`（取消）在与状态变更/审计同一事务写入 `review_notifications` outbox（`UNIQUE(review_id,event)` 防重复），payload 含 `deliveryId/event/occurredAt/project{id,name}/review{...快照...}`，不含凭据、Cookie、令牌或请求头；由独立 notifier 以 1s 轮询、`FOR UPDATE SKIP LOCKED` + claim lease、10s 起指数退避（上限 1h、最多 8 次）投递，成功 `delivered`、失败 `last_error` + `pending`/`failed`。投递头 `X-AegisFlow-Event`/`X-AegisFlow-Delivery`/`X-AegisFlow-Signature`（对 payload JSON 本体签名），至少一次语义，接收方按 delivery id 去重。通知失败不回滚审查状态。
-- 审计与迁移：外部结果与通知投递**不新增**业务审计动作（外部结果不是本地状态变更；通知重试不写业务审计）。schema v13 新增 `review_external_results` 与 `review_notifications` 两表及索引；两表 `review_id` 外键级联删除。外部结果的前端展示与 E2E 留待 E4B。
+- 审计与迁移：外部结果与通知投递**不新增**业务审计动作（外部结果不是本地状态变更；通知重试不写业务审计）。schema v13 新增 `review_external_results` 与 `review_notifications` 两表及索引；两表 `review_id` 外键级联删除。外部结果在前端审查详情页只读回显（来源、中文 verdict 徽章、保留换行的摘要与报告外链），E2E 覆盖签名回写后回显与重复 `deliveryId` 幂等。
 
 ## 客户端会话生命周期
 
@@ -172,6 +172,6 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 前端不再提供业务演示数据或演示开关：项目、构建、部署、审查、账号与审计始终调用真实接口，未接入模块恒定显示未实现声明，不用演示数据冒充业务结果。登录与鉴权没有 mock 回退。
 
-后端验证：go test ./...、go vet ./...。前端验证：npm run build、npm run lint、npm test（session store 单元测试）。浏览器验证：先 npx playwright install chromium，再 npm run test:e2e；先设置 AEGIS_TEST_DATABASE_URL/AEGIS_TEST_REDIS_URL 运行后端真实集成测试；浏览器测试需另设置 AEGIS_E2E_DATABASE_URL/AEGIS_E2E_REDIS_URL 指向专用可丢弃服务，测试启动本地前后端，要求 8080、5173 端口空闲。E2E 后端显式设置 AEGIS_LOGIN_RATE_LIMIT=100，因为同一地址在一分钟内驱动多个账号登录；生产默认配额仍是 10。测试账号仅存在测试临时库；端到端配置使用随机 JWT 密钥，不使用生产数据。
+后端验证：go test ./...、go vet ./...。前端验证：npm run build、npm run lint、npm test（session store 单元测试）。浏览器验证：先 npx playwright install chromium，再 npm run test:e2e；先设置 AEGIS_TEST_DATABASE_URL/AEGIS_TEST_REDIS_URL 运行后端真实集成测试；浏览器测试需另设置 AEGIS_E2E_DATABASE_URL/AEGIS_E2E_REDIS_URL 指向专用可丢弃服务，测试启动本地前后端，要求 8080、5173 端口空闲。E2E 后端显式设置 AEGIS_LOGIN_RATE_LIMIT=100，因为同一地址在一分钟内驱动多个账号登录；生产默认配额仍是 10。测试账号仅存在测试临时库；端到端配置使用随机 JWT 密钥，不使用生产数据。E2E 的 webServer 还会注入固定的一次性测试密钥 `AEGIS_REVIEW_WEBHOOK_SECRET`，仅供外部结果用例计算 HMAC 签名回写，不进入生产配置。
 
-验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出；构建闭环覆盖 UI 创建带构建命令的项目、触发构建、列表与详情、SSE 推送日志中出现进程输出与 build succeeded、viewer 只读且触发 403；项目可见性与成员覆盖 UI 创建私有项目与徽章、成员页邀请查看者、非成员深链得到「未找到」、查看者成员无管理控件且触发构建 403、提升维护者后可触发；部署与审批覆盖部署目标、发起部署、审批、取消与回滚主链路；审查中心覆盖 UI 发起审查（列表对话框）、批准（带理由）与状态/项目筛选、拒绝理由必填与详情展示、viewer 只读（无发起入口且发起 API 403）、非项目成员详情 404，以及部署表单关联已批准审查并在部署详情展示审查链接。外部结果回写与审查通知（P5-A E4）由后端集成测试验证签名、幂等与投递，前端外部结果展示与 E2E 留待 E4B。剩余能力（多 worker 并行吞吐、构建阶段与产物、构建缓存、私有仓库凭据、部署多级会签与通知管理 API、多租户与单点登录）与生产备份演练见 PR 记录与本地维护的开发文档（不入库）。
+验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出；构建闭环覆盖 UI 创建带构建命令的项目、触发构建、列表与详情、SSE 推送日志中出现进程输出与 build succeeded、viewer 只读且触发 403；项目可见性与成员覆盖 UI 创建私有项目与徽章、成员页邀请查看者、非成员深链得到「未找到」、查看者成员无管理控件且触发构建 403、提升维护者后可触发；部署与审批覆盖部署目标、发起部署、审批、取消与回滚主链路；审查中心覆盖 UI 发起审查（列表对话框）、批准（带理由）与状态/项目筛选、拒绝理由必填与详情展示、viewer 只读（无发起入口且发起 API 403）、非项目成员详情 404，以及部署表单关联已批准审查并在部署详情展示审查链接。审查详情页回显外部工具签名回写的只读结果（来源、中文「通过/失败/警告」徽章、保留换行的摘要、报告外链），E2E 覆盖签名回写后回显与重复 delivery 幂等。外部结果回写与审查通知（P5-A E4）的后端契约由后端集成测试验证签名、幂等与投递，前端外部结果回显与 E2E 由 E4B 补齐。剩余能力（多 worker 并行吞吐、构建阶段与产物、构建缓存、私有仓库凭据、部署多级会签与通知管理 API、多租户与单点登录）与生产备份演练见 PR 记录与本地维护的开发文档（不入库）。
