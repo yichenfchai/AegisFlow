@@ -13,8 +13,9 @@ export interface NavGroup {
 }
 
 /**
- * 侧边栏导航。项目、构建、部署、审查、安全扫描、审批（管理员）、攻击防御（管理员）、
- * 账号安全与用户管理（管理员）为真实接口；知识库等其余业务页面为明确的未实现占位。
+ * 侧边栏导航。项目、构建、部署、审查、安全扫描、知识库、审批（管理员）、攻击防御（管理员）、
+ * 密钥管理（管理员）、账号安全与用户管理（管理员）为真实接口；自动化审计/策略等其余业务
+ * 页面为明确的未实现占位。
  */
 export const NAV_GROUPS: NavGroup[] = [
   {
@@ -41,7 +42,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { label: '攻击防御', to: '/defense', icon: 'security', adminOnly: true },
       { label: '自动化审计', to: '/audit', icon: 'policy' },
       { label: '自动化策略', to: '/policies', icon: 'rule' },
-      { label: '密钥管理', to: '/secrets', icon: 'key' },
+      { label: '密钥管理', to: '/keys', icon: 'key', adminOnly: true },
     ],
   },
 ]

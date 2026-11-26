@@ -21,11 +21,13 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/builds"
 	"github.com/yichenfchai/AegisFlow/backend/internal/deployments"
+	"github.com/yichenfchai/AegisFlow/backend/internal/knowledge"
 	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 	"github.com/yichenfchai/AegisFlow/backend/internal/reviews"
 	"github.com/yichenfchai/AegisFlow/backend/internal/scans"
+	"github.com/yichenfchai/AegisFlow/backend/internal/secrets"
 	"github.com/yichenfchai/AegisFlow/backend/internal/securityevents"
 )
 
@@ -55,11 +57,17 @@ type Server struct {
 	scans       *scans.Service
 	// securityEvents is the admin-only defense-event store.
 	securityEvents *securityevents.Service
-	logger         *slog.Logger
-	ready          func(context.Context) error
-	origins        map[string]bool
-	limiter        ratelimit.Limiter
-	cookieSecure   bool
+	// knowledge is the knowledge-base registry: reads for every authenticated
+	// role, writes admin-only.
+	knowledge *knowledge.Service
+	// secrets is the admin-only write-only secret store; values are never
+	// returned by any handler.
+	secrets      *secrets.Service
+	logger       *slog.Logger
+	ready        func(context.Context) error
+	origins      map[string]bool
+	limiter      ratelimit.Limiter
+	cookieSecure bool
 	// reviewWebhookSecret authenticates inbound external-result deliveries with
 	// HMAC-SHA256; empty keeps that endpoint closed (503).
 	reviewWebhookSecret []byte
@@ -111,6 +119,12 @@ type Options struct {
 	// SecurityEvents enables the admin-only defense-event routes; nil fails
 	// closed with 503.
 	SecurityEvents *securityevents.Service
+	// Knowledge enables the knowledge-base routes; nil fails closed with 503.
+	Knowledge *knowledge.Service
+	// Secrets enables the admin-only secret-store routes; nil fails closed with
+	// 503. A non-nil store without an encryption key still serves metadata and
+	// answers 503 secrets_not_configured on create/rotate.
+	Secrets *secrets.Service
 	// ReviewWebhookSecret verifies signed inbound external review results
 	// (AEGIS_REVIEW_WEBHOOK_SECRET). Empty keeps the external-results endpoint
 	// closed with 503; the read route stays available to authenticated viewers.
@@ -140,7 +154,8 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 		shutdownCtx = context.Background()
 	}
 	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, reviews: opts.Reviews,
-		scans: opts.Scans, securityEvents: opts.SecurityEvents, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure,
+		scans: opts.Scans, securityEvents: opts.SecurityEvents, knowledge: opts.Knowledge, secrets: opts.Secrets,
+		logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure,
 		reviewWebhookSecret: append([]byte(nil), opts.ReviewWebhookSecret...),
 		ingestWebhookSecret: append([]byte(nil), opts.IngestWebhookSecret...),
 		metrics:             opts.Metrics, shutdownCtx: shutdownCtx}
@@ -269,6 +284,23 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	securityEventRoutes.GET("/:id", s.getSecurityEvent)
 	securityEventRoutes.POST("/:id/ack", s.ackSecurityEvent)
 	api.POST("/security-events", s.ingestSecurityEvent)
+	// Knowledge base: every authenticated role may read documents, while
+	// create/update/delete require the admin role and are audited in the same
+	// transaction. The stored body is plain text/Markdown the server never
+	// renders, so the client is responsible for safe rendering.
+	knowledgeRoutes := api.Group("/knowledge", s.authenticate())
+	knowledgeRoutes.GET("", s.listKnowledge)
+	knowledgeRoutes.GET("/:id", s.getKnowledge)
+	knowledgeRoutes.POST("", s.requireRole("admin"), s.createKnowledge)
+	knowledgeRoutes.PUT("/:id", s.requireRole("admin"), s.updateKnowledge)
+	knowledgeRoutes.DELETE("/:id", s.requireRole("admin"), s.deleteKnowledge)
+	// Independent secret store: admin-only metadata reads plus write-only
+	// create/rotate/delete. No route ever returns a secret value.
+	secretRoutes := api.Group("/secrets", s.authenticate(), s.requireAdmin())
+	secretRoutes.GET("", s.listSecrets)
+	secretRoutes.POST("", s.createSecret)
+	secretRoutes.PUT("/:id", s.rotateSecret)
+	secretRoutes.DELETE("/:id", s.deleteSecret)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }
@@ -1681,20 +1713,32 @@ func (s *Server) revokeOtherSessions(c *gin.Context) {
 	s.respond(c, 200, gin.H{"revoked": revoked})
 }
 
+// decodeBodyLimit is the shared request-body bound of most JSON endpoints.
+const decodeBodyLimit = 16 << 10
+
 // Keep strict per-request decoding rather than changing Gin's global binding settings.
 func (s *Server) decode(c *gin.Context, v any) bool {
+	return s.decodeWithLimit(c, v, decodeBodyLimit, "16 KiB")
+}
+
+// decodeWithLimit applies the shared strict JSON rules with an explicit
+// transport bound. Endpoints that legitimately accept a larger document (the
+// knowledge base stores bodies up to 100 KiB, whose JSON escaping can exceed
+// the default) use it; the label appears in the shared error messages. The
+// service layer still enforces the business bound on the decoded value.
+func (s *Server) decodeWithLimit(c *gin.Context, v any, limit int64, label string) bool {
 	media, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
 	if err != nil || media != "application/json" {
 		s.fail(c, 415, "unsupported_media_type", "Content-Type must be application/json")
 		return false
 	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 	raw, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		s.fail(c, 400, "invalid_request", "body must contain one JSON object of at most 16 KiB")
+		s.fail(c, 400, "invalid_request", "body must contain one JSON object of at most "+label)
 		return false
 	}
-	return s.decodeRawJSON(c, raw, v)
+	return s.decodeJSON(c, raw, v, label)
 }
 
 // decodeRawJSON applies the shared strict JSON rules to an already-read body.
@@ -1702,16 +1746,22 @@ func (s *Server) decode(c *gin.Context, v any) bool {
 // before decoding, so both entry points share the exact same acceptance rules:
 // one JSON object, no unknown or null fields, and no second document.
 func (s *Server) decodeRawJSON(c *gin.Context, raw []byte, v any) bool {
+	return s.decodeJSON(c, raw, v, "16 KiB")
+}
+
+// decodeJSON is decodeRawJSON with the transport label used in its error
+// messages, so a larger-body endpoint can report its real bound.
+func (s *Server) decodeJSON(c *gin.Context, raw []byte, v any, label string) bool {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		s.fail(c, 400, "invalid_request", "body must contain one JSON object of at most 16 KiB")
+		s.fail(c, 400, "invalid_request", "body must contain one JSON object of at most "+label)
 		return false
 	}
 	// Decode via RawMessage first so null/arrays/scalars cannot masquerade as objects.
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	var document json.RawMessage
 	if err := decoder.Decode(&document); err != nil {
-		s.fail(c, 400, "invalid_request", "body must contain one JSON object of at most 16 KiB")
+		s.fail(c, 400, "invalid_request", "body must contain one JSON object of at most "+label)
 		return false
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
@@ -1732,7 +1782,7 @@ func (s *Server) decodeRawJSON(c *gin.Context, raw []byte, v any) bool {
 	strict := json.NewDecoder(bytes.NewReader(raw))
 	strict.DisallowUnknownFields()
 	if err := strict.Decode(v); err != nil {
-		s.fail(c, 400, "invalid_request", "invalid JSON body or body exceeds 16 KiB")
+		s.fail(c, 400, "invalid_request", "invalid JSON body or body exceeds "+label)
 		return false
 	}
 	if err := strict.Decode(new(any)); err != io.EOF {

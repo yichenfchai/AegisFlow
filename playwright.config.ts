@@ -27,9 +27,11 @@ export default defineConfig({
         AEGIS_REDIS_URL: process.env.AEGIS_E2E_REDIS_URL!,
         AEGIS_REDIS_NAMESPACE: `e2e-${randomBytes(8).toString('hex')}`,
         AEGIS_JWT_SECRET: randomBytes(48).toString('base64'),
-        // Deployment-target credentials are sealed with this key (base64 of
-        // exactly 32 bytes); a per-run random key keeps stored secrets readable
-        // for this run only, matching the disposable E2E database.
+        // Deployment-target credentials and the independent secret store
+        // (/keys, write-only AES-256-GCM values) are sealed with this key
+        // (base64 of exactly 32 bytes); a per-run random key keeps stored
+        // secrets readable for this run only, matching the disposable E2E
+        // database. The secrets E2E spec needs it for create/rotate.
         AEGIS_SECRET_KEY: randomBytes(32).toString('base64'),
         AEGIS_BOOTSTRAP_USERNAME: 'e2e-admin',
         AEGIS_BOOTSTRAP_PASSWORD: 'E2e-admin-password-2026',
