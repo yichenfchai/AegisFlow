@@ -54,6 +54,9 @@ export const API_ERROR_TEXT: Readonly<Record<string, string>> = {
   origin_denied: '当前请求来源不被允许，请从本站页面重试',
   not_ready: '服务尚未就绪，请稍后重试',
   dependencies_unavailable: '服务依赖暂不可用，请稍后重试',
+  // 独立密钥管理：服务端未配置 AEGIS_SECRET_KEY 时拒绝写入；页面用统一中文提示说明可操作项。
+  secrets_not_configured:
+    '密钥存储未配置：请在服务端设置 AEGIS_SECRET_KEY 后重启；列表与删除仍可使用。',
   internal_error: '服务器内部错误，请稍后重试',
   unsupported_media_type: '请求格式不受支持，请刷新页面后重试',
   // 客户端传输层 / 响应解析错误码

@@ -5,8 +5,8 @@ info:
   description: |
     Machine-readable contract for the AegisFlow backend: browser authentication,
     users and audit, the project registry, builds, deployment targets, deployment
-    tasks, approvals, the review center, the scan registry and defense events,
-    health and metrics.
+    tasks, approvals, the review center, the scan registry, defense events, the
+    knowledge base, the write-only secret store, health and metrics.
 
     Multi-instance PostgreSQL backend with Redis shared rate limiting behind a same-origin reverse proxy (recommended).
     All JSON responses use data/error plus requestId envelopes. All responses include
@@ -67,6 +67,10 @@ tags:
     description: Scan-result registry fed by signed inbound deliveries from external scanning tools; reads follow project visibility; AegisFlow never runs a scanner
   - name: SecurityEvents
     description: Admin-only defense-event registry fed by signed inbound deliveries from external detection tools; an administrator acknowledges events with an audited state change
+  - name: Knowledge
+    description: Knowledge-base documents stored as plain text or Markdown; every authenticated role reads, administrators create/update/delete. The server never renders the stored body, so clients must render it without raw HTML and with an allow-listed link protocol
+  - name: Secrets
+    description: Admin-only independent secret store; values are encrypted at rest with AES-256-GCM and are write-only (no route returns a value or ciphertext), while metadata and audited create/rotate/delete are available
   - name: Audit
     description: Persistent authentication and account-management audit trail
   - name: Health
@@ -2574,6 +2578,327 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/knowledge:
+    get:
+      tags: [Knowledge]
+      operationId: listKnowledge
+      summary: List knowledge-base documents (any authenticated role)
+      description: |
+        Documents are ordered by last update, newest first, with an optional
+        title substring search q (ILIKE with % and _ treated literally). Every
+        authenticated role may read. List items never include the body; the
+        detail endpoint returns it. Bodies are stored verbatim as plain text or
+        Markdown and the server never renders them.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: q
+          in: query
+          required: false
+          description: Optional title substring filter, at most 200 UTF-8 bytes after trimming; omit for all documents
+          schema: { type: string, maxLength: 200 }
+      responses:
+        '200':
+          description: Knowledge document page without bodies
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/KnowledgePage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Knowledge]
+      operationId: createKnowledge
+      summary: Create a knowledge-base document (admin-only)
+      description: |
+        The body is stored verbatim: it is validated as UTF-8 (at most 100 KiB,
+        no NUL) but never rendered, evaluated or sanitized server-side. The
+        knowledge.create audit row records only the id and title in the same
+        transaction, never the body. member/viewer callers receive 403.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/KnowledgeInput' }
+      responses:
+        '201':
+          description: Document created (with body)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/KnowledgeDocument' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/knowledge/{knowledgeId}:
+    get:
+      tags: [Knowledge]
+      operationId: getKnowledge
+      summary: Get one knowledge-base document with its body (any authenticated role)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: knowledgeId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Knowledge document with body
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/KnowledgeDocument' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    put:
+      tags: [Knowledge]
+      operationId: updateKnowledge
+      summary: Replace a knowledge-base document (admin-only)
+      description: |
+        Replaces title/body/tags and records knowledge.update (id and title only)
+        in the same transaction. An unknown id is 404; member/viewer callers
+        receive 403.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: knowledgeId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/KnowledgeInput' }
+      responses:
+        '200':
+          description: Updated document (with body)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/KnowledgeDocument' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Knowledge]
+      operationId: deleteKnowledge
+      summary: Delete a knowledge-base document (admin-only)
+      description: Records knowledge.delete (id and title only) in the same transaction. An unknown id is 404; member/viewer callers receive 403.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: knowledgeId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Document deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [deleted]
+                    properties:
+                      deleted: { type: boolean, enum: [true] }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/secrets:
+    get:
+      tags: [Secrets]
+      operationId: listSecrets
+      summary: List secret metadata (admin-only)
+      description: |
+        Returns identity and lifecycle metadata only, newest first. No response
+        field can carry the encrypted value or the ciphertext. member/viewer
+        callers receive 403.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+      responses:
+        '200':
+          description: Secret metadata page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/SecretPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Secrets]
+      operationId: createSecret
+      summary: Create a write-only secret (admin-only)
+      description: |
+        The value is sealed locally with AES-256-GCM (AEGIS_SECRET_KEY: base64 of
+        exactly 32 bytes; AAD aegisflow:secrets:<id>) before the insert, so
+        neither the database row nor any response ever contains the plaintext.
+        Only metadata is returned (201). A duplicate name is 409; without the
+        encryption key the endpoint answers 503 secrets_not_configured and
+        writes nothing. secret.create is audited in the same transaction with
+        the id and name only, never the value.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SecretInput' }
+      responses:
+        '201':
+          description: Secret metadata (the value is never returned)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/SecretMetadata' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503':
+          description: AEGIS_SECRET_KEY is not configured; error.code is secrets_not_configured
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+  /api/v1/secrets/{secretId}:
+    put:
+      tags: [Secrets]
+      operationId: rotateSecret
+      summary: Rotate a secret's value (admin-only)
+      description: |
+        Replaces the ciphertext, increments the row's key_version rotation
+        counter and records secret.update (id and name only) in the same
+        transaction. Only metadata is returned; the new value is never returned
+        or logged. An unknown id is 404 and a missing encryption key is 503
+        secrets_not_configured.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: secretId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SecretRotateInput' }
+      responses:
+        '200':
+          description: Secret metadata after rotation (the value is never returned)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/SecretMetadata' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503':
+          description: AEGIS_SECRET_KEY is not configured; error.code is secrets_not_configured
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    delete:
+      tags: [Secrets]
+      operationId: deleteSecret
+      summary: Delete a secret and discard its ciphertext (admin-only)
+      description: Records secret.delete (id and name only) in the same transaction. An unknown id is 404.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: secretId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Secret deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data:
+                    type: object
+                    additionalProperties: false
+                    required: [deleted]
+                    properties:
+                      deleted: { type: boolean, enum: [true] }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
 components:
   securitySchemes:
     bearerAuth:
@@ -3231,6 +3556,89 @@ components:
         summary: { type: string, minLength: 1, maxLength: 1000, description: 'Required; 1-1000 UTF-8 bytes; newlines preserved, other control characters removed' }
         occurredAt: { type: integer, format: int64, description: 'Optional Unix seconds; defaults to now, must not be more than 300 seconds in the future' }
         detailsUrl: { type: string, maxLength: 2048, description: 'Optional absolute http(s) URL without userinfo or fragment; display-only, never fetched' }
+    KnowledgeDoc:
+      type: object
+      additionalProperties: false
+      required: [id, title, tags, createdBy, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        title: { type: string, description: 'Document title: 1-200 UTF-8 bytes on one line, trimmed' }
+        tags: { type: string, description: 'Canonical comma-separated tag list without spaces after commas; empty when the document has no tags' }
+        createdBy: { type: string, description: Author actor id snapshot }
+        createdByName: { type: string, description: 'Author username resolved for display; absent when the account no longer resolves' }
+        updatedByName: { type: string, description: 'Last updater username resolved for display; absent when the account no longer resolves' }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+        updatedAt: { type: integer, format: int64, description: Unix seconds of the last create/update }
+    KnowledgeDocument:
+      type: object
+      additionalProperties: false
+      required: [id, title, body, tags, createdBy, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        title: { type: string, description: 'Document title: 1-200 UTF-8 bytes on one line, trimmed' }
+        body: { type: string, description: 'Stored plain text or Markdown, at most 102400 UTF-8 bytes; returned verbatim and never rendered server-side. Clients must render it without raw HTML and with an allow-listed link protocol' }
+        tags: { type: string, description: 'Canonical comma-separated tag list without spaces after commas; empty when the document has no tags' }
+        createdBy: { type: string, description: Author actor id snapshot }
+        createdByName: { type: string, description: 'Author username resolved for display; absent when the account no longer resolves' }
+        updatedByName: { type: string, description: 'Last updater username resolved for display; absent when the account no longer resolves' }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+        updatedAt: { type: integer, format: int64, description: Unix seconds of the last create/update }
+    KnowledgePage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          description: Newest update first; list items never carry the body
+          items: { $ref: '#/components/schemas/KnowledgeDoc' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
+    KnowledgeInput:
+      type: object
+      additionalProperties: false
+      required: [title, body]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200, description: 'Required; 1-200 UTF-8 bytes on one line, trimmed before validation' }
+        body: { type: string, maxLength: 102400, description: 'Required (may be empty up to 102400 UTF-8 bytes); stored verbatim as plain text or Markdown, no raw-HTML or script execution server-side' }
+        tags: { type: string, maxLength: 200, description: 'Optional comma-separated tags on one line, at most 200 UTF-8 bytes; whitespace around tags is trimmed and empty tags dropped' }
+    SecretMetadata:
+      type: object
+      additionalProperties: false
+      required: [id, name, createdBy, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        name: { type: string, description: 'Unique human reference: 1-128 UTF-8 bytes on one line, trimmed' }
+        createdBy: { type: string, description: Creator actor id snapshot }
+        createdByName: { type: string, description: 'Creator username resolved for display; absent when the account no longer resolves' }
+        createdAt: { type: integer, format: int64, description: Unix seconds }
+        updatedAt: { type: integer, format: int64, description: Unix seconds of the last value rotation; equal to createdAt until rotated }
+    SecretPage:
+      type: object
+      additionalProperties: false
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          description: Newest first; metadata only, never a value or ciphertext
+          items: { $ref: '#/components/schemas/SecretMetadata' }
+        total: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+        offset: { type: integer, minimum: 0 }
+    SecretInput:
+      type: object
+      additionalProperties: false
+      required: [name, value]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 128, description: 'Required unique name: 1-128 UTF-8 bytes on one line, trimmed; duplicates are 409' }
+        value: { type: string, minLength: 1, maxLength: 4096, description: 'Required write-only value: 1-4096 UTF-8 bytes; sealed with AES-256-GCM before storage and never returned, logged or audited' }
+    SecretRotateInput:
+      type: object
+      additionalProperties: false
+      required: [value]
+      properties:
+        value: { type: string, minLength: 1, maxLength: 4096, description: 'Required replacement value: 1-4096 UTF-8 bytes; sealed with AES-256-GCM and never returned, logged or audited' }
     AuditEntry:
       type: object
       additionalProperties: false
@@ -3240,8 +3648,8 @@ components:
         createdAt: { type: integer, format: int64, description: Unix seconds }
         actorId: { type: string, description: Empty for system rows }
         actorUsername: { type: string }
-        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check, deployment.create, deployment.cancel, deployment.rollback, approval.request, approval.approve, approval.reject, approval.expire, review.request, review.approve, review.reject, review.cancel, security_event.ack] }
-        objectType: { type: string, enum: [user, session, project, build, deployment_target, deployment, approval, review, security_event] }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check, deployment.create, deployment.cancel, deployment.rollback, approval.request, approval.approve, approval.reject, approval.expire, review.request, review.approve, review.reject, review.cancel, security_event.ack, knowledge.create, knowledge.update, knowledge.delete, secret.create, secret.update, secret.delete] }
+        objectType: { type: string, enum: [user, session, project, build, deployment_target, deployment, approval, review, security_event, knowledge_doc, secret] }
         objectId: { type: string }
         result: { type: string, enum: [success, failure] }
         detail: { type: string, description: Safe context such as role transitions or revoked counts; never secrets }
@@ -3269,7 +3677,7 @@ components:
           properties:
             code:
               type: string
-              enum: [invalid_request, validation_failed, unauthorized, forbidden, account_disabled, origin_denied, conflict, unsupported_media_type, rate_limited, not_found, not_ready, dependencies_unavailable, internal_error]
+              enum: [invalid_request, validation_failed, unauthorized, forbidden, account_disabled, origin_denied, conflict, unsupported_media_type, rate_limited, not_found, not_ready, dependencies_unavailable, secrets_not_configured, internal_error]
             message: { type: string, description: Human-readable safe detail; clients should branch on code/status }
         requestId: { $ref: '#/components/schemas/RequestID' }
   responses:

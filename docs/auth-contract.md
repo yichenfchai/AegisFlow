@@ -61,6 +61,15 @@
 | GET /api/v1/security-events | 管理员 Bearer，severity/status/source/limit/offset | 防御事件分页，按 occurredAt 倒序；非 admin 403 |
 | GET /api/v1/security-events/{id} | 管理员 Bearer | 事件详情；不存在 404；非 admin 403 |
 | POST /api/v1/security-events/{id}/ack | 管理员 Bearer，JSON {} | 200；open→acknowledged（记录确认人与时间），重复确认幂等不重复审计；不存在 404；非 admin 403 |
+| GET /api/v1/knowledge | Bearer（所有已登录角色），q/limit/offset | 知识库分页 `{items,total,limit,offset}`，按 updatedAt 倒序；q 为标题子串（ILIKE，`%`/`_` 按字面转义），limit 1–100 默认 20；列表项不含正文 |
+| POST /api/v1/knowledge | 管理员 Bearer，JSON `{title,body,tags?}` | 201；title 1–200B 单行、body ≤100KB（原样存储）、tags ≤200B 单行逗号分隔（清洗空白）；同事务写 `knowledge.create`（detail 只含 id/title） |
+| GET /api/v1/knowledge/{id} | Bearer（所有已登录角色） | 文档详情（含 body，原样返回）；不存在 404 |
+| PUT /api/v1/knowledge/{id} | 管理员 Bearer，JSON `{title,body,tags?}` | 200；字段规则同上；不存在 404；同事务写 `knowledge.update`（detail 只含 id/title） |
+| DELETE /api/v1/knowledge/{id} | 管理员 Bearer | 200 `{deleted:true}`；不存在 404；同事务写 `knowledge.delete` |
+| GET /api/v1/secrets | 管理员 Bearer，limit/offset | 密钥元数据分页 `{items,total,limit,offset}`，按 createdAt 倒序；**任何响应都不含值或密文**，非 admin 403 |
+| POST /api/v1/secrets | 管理员 Bearer，JSON `{name,value}` | 201 返回元数据（值以 AES-256-GCM 加密后入库，永不返回）；name 1–128B 单行唯一（冲突 409），value 1–4096B；未配置 `AEGIS_SECRET_KEY` 时 503 `secrets are not configured`；同事务写 `secret.create`（detail 只含 id/name） |
+| PUT /api/v1/secrets/{id} | 管理员 Bearer，JSON `{value}` | 200 返回元数据并递增 `key_version`；不存在 404；未配置密钥 503；同事务写 `secret.update`（detail 只含 id/name，绝不含值） |
+| DELETE /api/v1/secrets/{id} | 管理员 Bearer | 200 `{deleted:true}`；不存在 404；同事务写 `secret.delete` |
 
 accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh token 不返回 JSON，由 HttpOnly、SameSite=Strict、Path=/api/v1/auth 的 Cookie 保存，无 Domain。勾选保持登录时 Cookie 持久化到绝对会话期限，未勾选使用 session Cookie；浏览器恢复会话可能保留 session Cookie，因此不承诺关闭窗口立即退出。主动退出以服务端撤销为准。默认绝对期限 30 天，由后端配置决定，刷新不延长。
 
@@ -141,6 +150,17 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 - 防御事件（迁移 v14 `security_events`）：`source` 必填 1–64 字节单行；`severity ∈ low|medium|high|critical`；`eventType` 必填 1–64 字节单行；`summary` 必填 1–1000 字节；`occurredAt` 可选 Unix 秒（默认 now，不得晚于 now+300s，按 occurredAt 倒序）；`detailsUrl` 同 reportUrl 规则。事件为全局对象，**读取与确认仅全局 admin**（member/viewer 403）。确认：open→acknowledged，记录 `acknowledgedBy/acknowledgedAt`，与 `security_event.ack` 审计同事务（objectType `security_event`，detail 只写 id/severity/eventType，不含 summary 原文）；重复确认幂等 200 且不重复审计；不存在 404。
 - 前端：`/scans` 全局列表（项目/结论筛选、中文徽章、分页）与 `/scans/:id` 详情（来源、工具/版本、保留换行的摘要、报告外链 `target=_blank rel="noopener noreferrer"`）；`/defense` 仅管理员可见（导航隐藏 + 路由守卫 + 服务端 403），支持严重度/状态筛选、分页与开放事件二次确认。E2E 用 Node `crypto` 计算 HMAC 回写扫描与事件，验证筛选、详情、确认与幂等，并覆盖非 admin 的 403/无入口。
 
+### 知识库与独立密钥管理（P5 剩余模块批次 B）
+
+- 知识库定位：团队文档以**纯文本 / Markdown 原文**存储，服务端只做校验与持久化，**不自研富文本编辑器、不做服务端渲染**；安全渲染是客户端责任（禁用原始 HTML、链接协议白名单）。读取对所有已登录角色开放，写入仅全局 admin。
+- 知识库字段：`title` 必填 1–200 UTF-8 字节、单行（trim）；`body` ≤102400 字节（100 KiB）、合法 UTF-8、不含 NUL，原样保存（换行与缩进对 Markdown 有意义）；`tags` 可选 ≤200 字节单行逗号分隔，服务端清洗为规范形式（逐项 trim、内部空白折叠、丢弃空项、`a,b` 无空格连接）。列表 `q` 为标题 ILIKE 子串（`%`、`_`、`\` 按字面转义，`ESCAPE '\'`），按 `updated_at DESC, id DESC` 倒序并服务端分页（limit 1–100 默认 20，offset ≥0）；列表投影不含 body，详情返回 body。
+- 知识库迁移与审计：schema v15 新增 `knowledge_docs`（`(updated_at DESC, id)` 索引；`created_by`/`updated_by` 为操作者快照，非外键）。`knowledge.create` / `knowledge.update` / `knowledge.delete` 与数据变更**同事务**写入 `auth_audit`（objectType `knowledge_doc`），detail 只写 `id` 与 `title`，**正文永不进入审计**；删除为硬删除，无审计历史回放。
+- 独立密钥管理定位：与部署目标凭据共用 `AEGIS_SECRET_KEY`，但**值只写不读**——服务端没有返回明文或密文的读取路径，页面与 API 只暴露元数据。全部接口 admin-only，member/viewer 403。
+- 密钥加密方案：AES-256-GCM，密文布局 `[12 字节随机 nonce][ciphertext+tag]`，AAD 为 `aegisflow:secrets:<id>`（密文不能跨行复用），每次写入使用新随机 nonce（相同值不产生相同密文）。`secrets` 表保存 `ciphertext BYTEA`、`key_version INTEGER`（每次轮换 +1，仅记录轮换代次；本批不做多密钥迁移逻辑，更换 `AEGIS_SECRET_KEY` 后旧密文不可解——因为值本就不读回，只影响历史行的可解析性）与创建人/时间；`name` 唯一（区分大小写）。
+- 密钥字段与权限：`name` 1–128 UTF-8 字节单行（trim，重复 409）；`value` 1–4096 字节，仅出现在请求体中，不落日志/错误/审计。未配置 `AEGIS_SECRET_KEY`（base64 恰好 32 字节）时，创建与轮换返回 **503 `secrets are not configured`**（`error.code=secrets_not_configured`），列表与删除仍可用；配置非法时启动失败。
+- 密钥审计：`secret.create` / `secret.update` / `secret.delete`（objectType `secret`）与写入/轮换/删除同事务提交，detail 只写 `id` 与 `name`，**绝不含值或密文**。
+- 前端：`/knowledge` 列表（标题搜索、服务端分页、标签徽章、空态/加载/中文错误）与 `/knowledge/:id` 详情（安全 Markdown 渲染、标签、创建/更新时间），管理员可见新建/编辑/删除（复用 Dialog/ConfirmDialog，标题/正文/标签前端校验）；`/keys` 密钥管理仅管理员可见（导航隐藏 + 路由守卫 + 服务端 403），列表只显示名称/创建人/创建与轮换时间，新建为 name + 密码框值 + 二次确认，轮换值、删除均二次确认，保存后提示值不可再查看；未配置密钥时写入失败显示中文提示。Markdown 渲染使用 `marked` + `DOMPurify`：原始 HTML token 一律转义为文本（XSS payload 按文本显示）、链接仅允许绝对 http(s) 并强制 `target=_blank rel="noopener noreferrer"`、图片降级为 alt 文本，DOMPurify 按标签/属性白名单二次清洗。
+
 ## 客户端会话生命周期
 
 1. 启动通过 Cookie 刷新，随后 /auth/me 获取真实用户；等待恢复完成才进入业务布局。
@@ -155,14 +175,14 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 - 修改自己密码需验证当前密码，成功后仅保留当前会话；管理员重置密码会撤销目标用户全部会话。两者都要求新密码 12-72 字节。
 - 禁用账号立即撤销其全部会话并阻止登录；禁用状态只在密码正确时通过 403 account_disabled 透露，不会成为账号枚举信号。重新启用不恢复旧会话。
 - 角色为全局角色，每次鉴权实时读取数据库，角色变更对既有会话即时生效，无需撤销会话。禁用或降级最后一个可用管理员被拒绝（400），防止系统失去管理入口。
-- 持久化审计记录操作人（ID/用户名）、时间、动作、对象、结果、详情与请求 ID：登录成功、创建用户、修改密码（含当前密码错误的失败记录）、重置密码、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）、部署目标增删改与探测（deployment_target.create / deployment_target.update / deployment_target.remove / deployment_target.check）、部署创建/取消/回滚（deployment.create / deployment.cancel / deployment.rollback）、审批请求/批准/拒绝/过期（approval.request / approval.approve / approval.reject / approval.expire）、审查请求与批准/拒绝/取消（review.request / review.approve / review.reject / review.cancel，objectType `review`）、防御事件确认（security_event.ack，objectType `security_event`）。构建、成员、部署目标、部署任务、审批、审查与防御事件确认审计都和状态变更同事务提交；重复取消/重复审批/重复审查决策/重复确认防御事件幂等且不重复记账，detail 只写项目/成员与角色或目标名称与探测结果，不包含构建命令或凭据（重试写 `retry_of=<原构建号>`，拒绝写 `reason=<≤512>`，审查写 `number=<n>` 与 reason，不写审查正文；部署创建/回滚命中审查门禁时追加 `review=<id>`，只写审查 id；防御事件确认只写 `id/severity/eventType`，不写 summary 原文）。签名扫描回写是外部证据登记，不新增业务审计动作。失败登录受 Redis 限流约束，只进结构化日志不进审计表；审计查询仅管理员。
+- 持久化审计记录操作人（ID/用户名）、时间、动作、对象、结果、详情与请求 ID：登录成功、创建用户、修改密码（含当前密码错误的失败记录）、重置密码、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）、部署目标增删改与探测（deployment_target.create / deployment_target.update / deployment_target.remove / deployment_target.check）、部署创建/取消/回滚（deployment.create / deployment.cancel / deployment.rollback）、审批请求/批准/拒绝/过期（approval.request / approval.approve / approval.reject / approval.expire）、审查请求与批准/拒绝/取消（review.request / review.approve / review.reject / review.cancel，objectType `review`）、防御事件确认（security_event.ack，objectType `security_event`）、知识库文档新建/更新/删除（knowledge.create / knowledge.update / knowledge.delete，objectType `knowledge_doc`）、密钥新建/轮换/删除（secret.create / secret.update / secret.delete，objectType `secret`）。构建、成员、部署目标、部署任务、审批、审查、防御事件确认、知识库文档与密钥操作审计都和状态变更同事务提交；重复取消/重复审批/重复审查决策/重复确认防御事件幂等且不重复记账，detail 只写项目/成员与角色或目标名称与探测结果，不包含构建命令或凭据（重试写 `retry_of=<原构建号>`，拒绝写 `reason=<≤512>`，审查写 `number=<n>` 与 reason，不写审查正文；部署创建/回滚命中审查门禁时追加 `review=<id>`，只写审查 id；防御事件确认只写 `id/severity/eventType`，不写 summary 原文；知识库 detail 只写 `id/title`，不写正文；密钥 detail 只写 `id/name`，绝不写值或密文）。签名扫描回写是外部证据登记，不新增业务审计动作。失败登录受 Redis 限流约束，只进结构化日志不进审计表；审计查询仅管理员。
 - 审计查询支持服务端筛选：`action`、`objectType`、`result`（success/failure）、`actor`（id 或用户名，用户名大小写不敏感）、`from`/`to`（RFC3339 或 `YYYY-MM-DD`，只给日期时 `to` 覆盖该 UTC 全天）。筛选同时作用于分页结果与 total，多个条件按 AND 组合；非法时间或未知 result 返回 400。审计页提供动作/对象/结果/操作人/日期范围筛选与重置。
 - 审计保留策略：`AEGIS_AUDIT_RETENTION` 可选，未设置或为 `0` 时**永久保留**（默认，审计不应默认丢证据）；设置为 24h–8760h 之间的时长时，后台任务每小时删除早于该窗口的审计行（启动时先执行一次），与过期会话清理共用同一个循环。删除是运维显式选择，而不是按业务对象做归档。
 - 过期会话及其 refresh 令牌历史由后台任务每小时清理（启动时先执行一次）。重放检测只需保留到会话绝对期限，到期即删；清理不影响活跃会话。
 
 ## 角色矩阵
 
-下面是首版权限约定。除已提供的鉴权、账号管理、审计、项目、构建、部署目标、部署任务、审批、审查、安全扫描与攻击防御事件接口，其他服务尚未实现；页面守卫用于交互，不能代替后端对象级授权。角色是**全局的**；项目可见性（public/private）与项目成员（maintainer/viewer）已实现（P2；项目级权限设计文档本地维护，不入库）：成员身份既决定「能看哪个项目」，也决定「能改哪个项目」。
+下面是首版权限约定。除已提供的鉴权、账号管理、审计、项目、构建、部署目标、部署任务、审批、审查、安全扫描与攻击防御事件、知识库与独立密钥管理接口，其他服务尚未实现；页面守卫用于交互，不能代替后端对象级授权。角色是**全局的**；项目可见性（public/private）与项目成员（maintainer/viewer）已实现（P2；项目级权限设计文档本地维护，不入库）：成员身份既决定「能看哪个项目」，也决定「能改哪个项目」。
 
 **可见性规则**：全局 admin 永远可见；其他角色可见 public 项目，以及自己创建或被加入的 private 项目。不可见一律返回 **404**（不是 403），避免用私有 id 枚举项目。构建、部署、日志与 SSE 继承所属项目的可见性。
 
@@ -176,21 +196,23 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 | 读取其他 private 项目 | 允许 | 禁止（404） | 禁止（404） | 已实现（404 防枚举） |
 | 创建/修改项目、归档与恢复、修改可见性 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 已实现（可见性 + maintainer 叠加） |
 | 读取项目成员、增删改成员 | 允许 | public 允许；private 需项目 maintainer | 只读列表 | 已实现；创建者不可移除；成员变更写审计 |
-| 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 构建、部署、审查（含外部结果读取）与安全扫描已实现（按项目可见性过滤）；审批与防御事件仍 admin-only；知识库待业务接口落实 |
+| 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 构建、部署、审查（含外部结果读取）、安全扫描与知识库已实现（构建/部署/审查/扫描按项目可见性过滤；知识库对所有已登录角色开放）；审批与防御事件仍 admin-only |
+| 新建/编辑/删除知识库文档 | 允许 | 禁止 | 禁止 | 已实现（P5 批次 B，admin-only）：title/body/tags 校验，审计与写入同事务且 detail 不含正文 |
+| 管理独立密钥（新建/轮换/删除/元数据） | 允许 | 禁止 | 禁止 | 已实现（P5 批次 B，admin-only）：值 AES-256-GCM 加密且只写不读，列表只返回元数据；未配置 `AEGIS_SECRET_KEY` 时写入 503 |
 | 发起/取消/重试构建、发起审查 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 构建与审查发起已实现（重试仅限终态，不可见 404；审查发起走同一写权限叠加） |
 | 批准/拒绝审查、取消他人审查 | 允许 | 仅该项目的 maintainer；发起人可取消本人的 pending 审查 | 禁止 | 已实现（`projects.AuthorizeDecide`，比写权限更严；终态 409，重复决策/取消幂等 200） |
 | 外部系统回写审查结果、接收审查通知 | —（HMAC，无用户会话） | — | — | 已实现（P5-A E4）：`AEGIS_REVIEW_WEBHOOK_SECRET` HMAC-SHA256 + ≤300s 时间窗 + delivery 幂等；只追加只读证据，不改审查状态；审查事件复用审批 Webhook 通道出站 |
 | 读取/确认攻击防御事件 | 允许 | 禁止 | 禁止 | 已实现（P5 批次 A，admin-only）：列表/详情/确认；确认记录确认人与时间并写 `security_event.ack` 审计，重复确认幂等 |
 | 外部系统回写扫描结果、防御事件 | —（HMAC，无用户会话） | — | — | 已实现（P5 批次 A）：`AEGIS_INGEST_WEBHOOK_SECRET` HMAC-SHA256 + ≤300s 时间窗 + delivery 幂等；扫描结果按可见性只读，防御事件仅管理员确认；平台不自研扫描/检测引擎 |
 | 发起部署、回滚及执行审批 | 允许 | 允许（项目可写时）；审批仅 admin | 禁止 | 部署触发与回滚已实现（项目写权限叠加，P4.2）；P5-A E2 增加可配置审查门禁：目标环境命中 `AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS` 时要求已批准审查，默认关闭；审批仍 admin-only（P4.3） |
-| 管理部署目标、密钥、策略、设置及业务审计 | 允许 | 禁止 | 禁止 | 部署目标已实现（admin-only，凭据加密存储，P4.1）；防御事件确认已实现（admin-only，P5 批次 A）；独立密钥管理、策略、设置与其余 P5 业务模块（含其审计）待实现 |
+| 管理部署目标、密钥、策略、设置及业务审计 | 允许 | 禁止 | 禁止 | 部署目标（P4.1，凭据加密存储）与独立密钥管理（P5 批次 B，只写不读）已实现，均为 admin-only；防御事件确认已实现（admin-only，P5 批次 A）；策略、设置与其余 P5 业务模块（含其审计）待实现 |
 
 后续对象涉及具体项目时，需在服务端查询对象所属项目并校验访问权限。不要根据客户端提交的 role 或隐藏按钮决定授权。
 
 ## 开发模式和验收
 
-前端不再提供业务演示数据或演示开关：项目、构建、部署、审查、安全扫描、防御事件、账号与审计始终调用真实接口，未接入模块恒定显示未实现声明，不用演示数据冒充业务结果。登录与鉴权没有 mock 回退。
+前端不再提供业务演示数据或演示开关：项目、构建、部署、审查、安全扫描、防御事件、知识库、密钥管理、账号与审计始终调用真实接口，未接入模块恒定显示未实现声明，不用演示数据冒充业务结果。登录与鉴权没有 mock 回退。
 
-后端验证：go test ./...、go vet ./...。前端验证：npm run build、npm run lint、npm test（session store 单元测试）。浏览器验证：先 npx playwright install chromium，再 npm run test:e2e；先设置 AEGIS_TEST_DATABASE_URL/AEGIS_TEST_REDIS_URL 运行后端真实集成测试；浏览器测试需另设置 AEGIS_E2E_DATABASE_URL/AEGIS_E2E_REDIS_URL 指向专用可丢弃服务，测试启动本地前后端，要求 8080、5173 端口空闲。E2E 后端显式设置 AEGIS_LOGIN_RATE_LIMIT=100，因为同一地址在一分钟内驱动多个账号登录；生产默认配额仍是 10。测试账号仅存在测试临时库；端到端配置使用随机 JWT 密钥，不使用生产数据。E2E 的 webServer 还会注入固定的一次性测试密钥 `AEGIS_REVIEW_WEBHOOK_SECRET`（外部结果用例）与 `AEGIS_INGEST_WEBHOOK_SECRET`（扫描/防御事件用例），仅供用例计算 HMAC 签名回写，不进入生产配置。
+后端验证：go test ./...、go vet ./...。前端验证：npm run build、npm run lint、npm test（session store 单元测试）。浏览器验证：先 npx playwright install chromium，再 npm run test:e2e；先设置 AEGIS_TEST_DATABASE_URL/AEGIS_TEST_REDIS_URL 运行后端真实集成测试；浏览器测试需另设置 AEGIS_E2E_DATABASE_URL/AEGIS_E2E_REDIS_URL 指向专用可丢弃服务，测试启动本地前后端，要求 8080、5173 端口空闲。E2E 后端显式设置 AEGIS_LOGIN_RATE_LIMIT=100，因为同一地址在一分钟内驱动多个账号登录；生产默认配额仍是 10。测试账号仅存在测试临时库；端到端配置使用随机 JWT 密钥，不使用生产数据。E2E 的 webServer 还会注入固定的一次性测试密钥 `AEGIS_REVIEW_WEBHOOK_SECRET`（外部结果用例）与 `AEGIS_INGEST_WEBHOOK_SECRET`（扫描/防御事件用例），仅供用例计算 HMAC 签名回写；同时每次运行随机生成 `AEGIS_SECRET_KEY`（base64 恰好 32 字节），供部署目标凭据与独立密钥管理的加密写入使用，随一次性测试库一起丢弃，不进入生产配置。
 
-验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出；构建闭环覆盖 UI 创建带构建命令的项目、触发构建、列表与详情、SSE 推送日志中出现进程输出与 build succeeded、viewer 只读且触发 403；项目可见性与成员覆盖 UI 创建私有项目与徽章、成员页邀请查看者、非成员深链得到「未找到」、查看者成员无管理控件且触发构建 403、提升维护者后可触发；部署与审批覆盖部署目标、发起部署、审批、取消与回滚主链路；审查中心覆盖 UI 发起审查（列表对话框）、批准（带理由）与状态/项目筛选、拒绝理由必填与详情展示、viewer 只读（无发起入口且发起 API 403）、非项目成员详情 404，以及部署表单关联已批准审查并在部署详情展示审查链接。审查详情页回显外部工具签名回写的只读结果（来源、中文「通过/失败/警告」徽章、保留换行的摘要、报告外链），E2E 覆盖签名回写后回显与重复 delivery 幂等。安全扫描与攻击防御事件（P5 批次 A）覆盖：外部工具签名回写扫描（passed/failed）后在 `/scans` 列表按项目/结论筛选命中、详情展示来源/工具/保留换行的摘要与报告外链、重复 delivery 幂等 200；签名回写高危防御事件后在 `/defense` 出现、admin 二次确认后状态变为已确认且重复确认幂等，非 admin 无导航入口、访问 `/defense` 被守卫拒绝且接口 403，而扫描读取仍按项目可见性开放。剩余能力（多 worker 并行吞吐、构建阶段与产物、构建缓存、私有仓库凭据、部署多级会签与通知管理 API、多租户与单点登录）与生产备份演练见 PR 记录与本地维护的开发文档（不入库）。
+验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出；构建闭环覆盖 UI 创建带构建命令的项目、触发构建、列表与详情、SSE 推送日志中出现进程输出与 build succeeded、viewer 只读且触发 403；项目可见性与成员覆盖 UI 创建私有项目与徽章、成员页邀请查看者、非成员深链得到「未找到」、查看者成员无管理控件且触发构建 403、提升维护者后可触发；部署与审批覆盖部署目标、发起部署、审批、取消与回滚主链路；审查中心覆盖 UI 发起审查（列表对话框）、批准（带理由）与状态/项目筛选、拒绝理由必填与详情展示、viewer 只读（无发起入口且发起 API 403）、非项目成员详情 404，以及部署表单关联已批准审查并在部署详情展示审查链接。审查详情页回显外部工具签名回写的只读结果（来源、中文「通过/失败/警告」徽章、保留换行的摘要、报告外链），E2E 覆盖签名回写后回显与重复 delivery 幂等。安全扫描与攻击防御事件（P5 批次 A）覆盖：外部工具签名回写扫描（passed/failed）后在 `/scans` 列表按项目/结论筛选命中、详情展示来源/工具/保留换行的摘要与报告外链、重复 delivery 幂等 200；签名回写高危防御事件后在 `/defense` 出现、admin 二次确认后状态变为已确认且重复确认幂等，非 admin 无导航入口、访问 `/defense` 被守卫拒绝且接口 403，而扫描读取仍按项目可见性开放。知识库与独立密钥管理（P5 批次 B）覆盖：管理员新建含 Markdown 粗体/行内代码与 `<script>` XSS payload 的文档后列表搜索命中、详情中粗体/代码生效且脚本按文本显示（不弹窗、无 script 元素）、编辑标题与正文后详情更新、删除后列表消失；密钥管理新建（值二次确认）后列表只显示名称/创建人/时间，页面与列表/创建/轮换/删除接口响应均不含该值，「最近轮换」随轮换更新，删除后行消失；非 admin 无密钥管理导航入口、访问 `/keys` 被守卫拒绝、`GET /api/v1/secrets` 403，而知识库列表/详情可读、无新建/编辑/删除按钮且写接口 403。剩余能力（多 worker 并行吞吐、构建阶段与产物、构建缓存、私有仓库凭据、部署多级会签与通知管理 API、多租户与单点登录）与生产备份演练见 PR 记录与本地维护的开发文档（不入库）。

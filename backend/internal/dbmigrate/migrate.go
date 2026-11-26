@@ -334,6 +334,43 @@ var Migrations = [][]string{{
 	 acknowledged_at BIGINT)`,
 	`CREATE INDEX security_events_status_occurred_idx ON security_events(status, occurred_at DESC, id)`,
 	`CREATE INDEX security_events_severity_occurred_idx ON security_events(severity, occurred_at DESC)`,
+}, {
+	// Knowledge base and the independent write-only secret store (P5 remaining
+	// modules, batch B). knowledge_docs stores plain-text/Markdown documents:
+	// the server never renders or executes the body, it only validates and
+	// stores it; safe rendering is a client responsibility. The
+	// (updated_at DESC, id) index serves the "recently updated first" page
+	// without a second sort, and title search uses ILIKE with escaped wildcards
+	// (a btree index would not accelerate a leading-wildcard match, so none is
+	// created for that). created_by/updated_by are denormalized actor snapshots
+	// like every other module, not foreign keys.
+	//
+	// secrets is the write-only secret store: the plaintext value is encrypted
+	// with AES-256-GCM before it ever reaches the database (ciphertext layout
+	// [12-byte random nonce][ciphertext+tag], AAD aegisflow:secrets:<id>), so no
+	// read path can return it. key_version records the rotation counter of the
+	// row (bumped on every value rotation); it is informational, and this batch
+	// implements no multi-key migration: a changed AEGIS_SECRET_KEY makes old
+	// ciphertexts unreadable, which is acceptable because values are never read
+	// back out. name is unique (case-sensitive) and is the human reference.
+	`CREATE TABLE knowledge_docs (
+	 id TEXT PRIMARY KEY,
+	 title TEXT NOT NULL,
+	 body TEXT NOT NULL,
+	 tags TEXT NOT NULL DEFAULT '',
+	 created_by TEXT NOT NULL,
+	 updated_by TEXT NOT NULL,
+	 created_at BIGINT NOT NULL,
+	 updated_at BIGINT NOT NULL)`,
+	`CREATE INDEX knowledge_docs_updated_idx ON knowledge_docs(updated_at DESC, id)`,
+	`CREATE TABLE secrets (
+	 id TEXT PRIMARY KEY,
+	 name TEXT NOT NULL UNIQUE,
+	 ciphertext BYTEA NOT NULL,
+	 key_version INTEGER NOT NULL DEFAULT 1,
+	 created_by TEXT NOT NULL,
+	 created_at BIGINT NOT NULL,
+	 updated_at BIGINT NOT NULL)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped

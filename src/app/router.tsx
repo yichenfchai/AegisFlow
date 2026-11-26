@@ -20,13 +20,16 @@ import { ReviewDetailPage } from '@/features/reviews/ReviewDetailPage'
 import { ScanListPage } from '@/features/scans/ScanListPage'
 import { ScanDetailPage } from '@/features/scans/ScanDetailPage'
 import { DefenseListPage } from '@/features/defense/DefenseListPage'
+import { KnowledgeListPage } from '@/features/knowledge/KnowledgeListPage'
+import { KnowledgeDetailPage } from '@/features/knowledge/KnowledgeDetailPage'
+import { SecretsPage } from '@/features/secrets/SecretsPage'
 import { DeploymentTargetsPage } from '@/features/deployments/DeploymentTargetsPage'
 import { DeploymentTargetWizardPage } from '@/features/deployments/DeploymentTargetWizardPage'
 import { DeploymentTargetDetailPage } from '@/features/deployments/DeploymentTargetDetailPage'
 
 /**
- * 真实页面（项目、构建、部署、审批、审查、安全扫描、攻击防御、账号、用户与审计）不进
- * Gate；非主线页面恒定显示 UnimplementedPage，不提供演示数据。
+ * 真实页面（项目、构建、部署、审批、审查、安全扫描、攻击防御、知识库、密钥管理、账号、
+ * 用户与审计）不进 Gate；非主线页面恒定显示 UnimplementedPage，不提供演示数据。
  */
 export const router = createBrowserRouter([
   { path: '/login', element: <LoginPage /> },
@@ -60,10 +63,11 @@ export const router = createBrowserRouter([
       { path: '/scans', element: <ScanListPage /> },
       { path: '/scans/:id', element: <ScanDetailPage /> },
 
-      // 非主线业务：恒定未实现
-      { path: '/knowledge', element: <UnimplementedPage title="知识库" /> },
+      // 知识库：所有已登录角色可读，管理员可写；正文以纯文本/Markdown 存储并安全渲染
+      { path: '/knowledge', element: <KnowledgeListPage /> },
+      { path: '/knowledge/:id', element: <KnowledgeDetailPage /> },
 
-      // 管理员入口：真实部署目标、审批、用户与审计；其余为未实现占位
+      // 管理员入口：真实部署目标、审批、防御事件、密钥管理与用户审计；其余为未实现占位
       {
         element: <SessionGate adminOnly />,
         children: [
@@ -72,10 +76,11 @@ export const router = createBrowserRouter([
           { path: '/deploy-targets/:id', element: <DeploymentTargetDetailPage /> },
           { path: '/approvals', element: <ApprovalListPage /> },
           { path: '/defense', element: <DefenseListPage /> },
+          // 独立密钥管理：值只写不读，页面只展示元数据
+          { path: '/keys', element: <SecretsPage /> },
           { path: '/audit', element: <UnimplementedPage title="自动化审计" /> },
           { path: '/audit/report', element: <UnimplementedPage title="昨夜托管报告" /> },
           { path: '/policies', element: <UnimplementedPage title="自动化策略" /> },
-          { path: '/secrets', element: <UnimplementedPage title="密钥管理" /> },
           { path: '/settings', element: <SettingsPage /> },
         ],
       },

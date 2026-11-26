@@ -61,6 +61,10 @@ export function CommandPalette() {
       { group: '页面', label: '部署记录', to: '/deploys' },
       { group: '页面', label: '审批中心 · 管理员', to: '/approvals', adminOnly: true },
       { group: '页面', label: '部署目标 · 管理员', to: '/deploy-targets', adminOnly: true },
+      { group: '页面', label: '审查中心', to: '/reviews' },
+      { group: '页面', label: '安全扫描', to: '/scans' },
+      { group: '页面', label: '知识库', to: '/knowledge' },
+      { group: '页面', label: '密钥管理 · 管理员', to: '/keys', adminOnly: true },
     ],
     [],
   )
