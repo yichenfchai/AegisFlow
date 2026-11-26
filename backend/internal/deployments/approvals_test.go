@@ -150,7 +150,7 @@ func TestCreateDeploymentRequiresApproval(t *testing.T) {
 	seedDeployment(t, db, project.ID, production.ID, 3, DeploySucceeded, "v3", base-30)
 	seedDeployment(t, db, project.ID, production.ID, 4, DeploySucceeded, "v4", base-20)
 	source := seedDeployment(t, db, project.ID, production.ID, 5, DeployFailed, "v5", base-10)
-	rollback, err := s.RollbackDeployment(ctx, testActor, source)
+	rollback, err := s.RollbackDeployment(ctx, testActor, source, "")
 	if err != nil {
 		t.Fatal(err)
 	}

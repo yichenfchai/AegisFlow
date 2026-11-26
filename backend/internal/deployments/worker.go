@@ -94,7 +94,7 @@ func (s *Service) claimNext(ctx context.Context) (Deployment, error) {
 	deployment, err := scanDeployment(s.db.QueryRowContext(ctx, `
 	WITH next AS (SELECT id FROM deployments WHERE status=$1 ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED)
 	UPDATE deployments d SET status=$2, started_at=$3 FROM next WHERE d.id=next.id
-	RETURNING d.id,d.project_id,d.target_id,d.target_name,d.target_endpoint,d.target_environment,d.deployment_number,d.status,d.version,d.build_id,d.rollback_of,d.approval_id,d.triggered_by,d.detail,d.created_at,d.started_at,d.finished_at`,
+	RETURNING `+deploymentColumnsQualified,
 		DeployQueued, DeployRunning, time.Now().Unix()))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, sql.ErrNoRows

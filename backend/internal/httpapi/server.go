@@ -207,8 +207,11 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	approvalRoutes.POST("/:id/approve", s.approveApproval)
 	approvalRoutes.POST("/:id/reject", s.rejectApproval)
 	// Review decisions are authorized per project by the service (global admin
-	// or maintainer), so the route only requires authentication.
+	// or maintainer), so the route only requires authentication. The global
+	// list mirrors /api/v1/deployments: optional projectId/status filters,
+	// restricted to the projects the caller can see.
 	reviewRoutes := api.Group("/reviews", s.authenticate())
+	reviewRoutes.GET("", s.listReviewsGlobal)
 	reviewRoutes.GET("/:id", s.getReview)
 	reviewRoutes.POST("/:id/approve", s.approveReview)
 	reviewRoutes.POST("/:id/reject", s.rejectReview)
@@ -1217,7 +1220,7 @@ func (s *Server) checkDeploymentTarget(c *gin.Context) {
 func (s *Server) deploymentError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, deployments.ErrValidation):
-		s.fail(c, 400, "validation_failed", "project, target, version, buildId or approval reason is invalid, the target is disabled, no earlier succeeded version can be rolled back to, or the request is not acceptable")
+		s.fail(c, 400, "validation_failed", "project, target, version, buildId, reviewId or approval reason is invalid, the target is disabled, an approved review of this project is required for the target environment, no earlier succeeded version can be rolled back to, or the request is not acceptable")
 	case errors.Is(err, deployments.ErrConflict):
 		s.fail(c, 409, "conflict", "deployment or approval is already terminal, is not in the expected state for this operation, or the deployment is no longer awaiting approval")
 	case errors.Is(err, deployments.ErrNotFound):
@@ -1239,12 +1242,13 @@ func (s *Server) createDeployment(c *gin.Context) {
 		TargetID string `json:"targetId"`
 		Version  string `json:"version"`
 		BuildID  string `json:"buildId"`
+		ReviewID string `json:"reviewId"`
 	}
 	if !s.decode(c, &input) {
 		return
 	}
 	deployment, err := s.deployments.CreateDeployment(c.Request.Context(), actorFrom(c), c.Param("id"), deployments.DeployInput{
-		TargetID: input.TargetID, Version: input.Version, BuildID: input.BuildID,
+		TargetID: input.TargetID, Version: input.Version, BuildID: input.BuildID, ReviewID: input.ReviewID,
 	})
 	if err != nil {
 		s.deploymentError(c, err)
@@ -1355,10 +1359,15 @@ func (s *Server) rollbackDeployment(c *gin.Context) {
 		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
 		return
 	}
-	if !s.decode(c, &struct{}{}) {
+	// reviewId is optional here for the same reason as on create: environments
+	// without the review gate keep the previous empty-body rollback behavior.
+	var input struct {
+		ReviewID string `json:"reviewId"`
+	}
+	if !s.decode(c, &input) {
 		return
 	}
-	deployment, err := s.deployments.RollbackDeployment(c.Request.Context(), actorFrom(c), c.Param("id"))
+	deployment, err := s.deployments.RollbackDeployment(c.Request.Context(), actorFrom(c), c.Param("id"), input.ReviewID)
 	if err != nil {
 		s.deploymentError(c, err)
 		return
@@ -1473,6 +1482,29 @@ func (s *Server) listReviews(c *gin.Context) {
 		return
 	}
 	list, total, err := s.reviews.List(c.Request.Context(), actorFrom(c), c.Param("id"), c.Query("status"), limit, offset)
+	if err != nil {
+		s.reviewError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": list, "total": total, "limit": limit, "offset": offset})
+}
+
+// listReviewsGlobal pages every review the caller may see, newest first, with
+// optional status and projectId filters. It mirrors the global deployment list:
+// the visibility predicate lives in the service, so an invisible project filter
+// yields an empty page instead of an error and review ids stay non-enumerable.
+func (s *Server) listReviewsGlobal(c *gin.Context) {
+	if s.reviews == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	limit, offset, ok := s.page(c)
+	if !ok {
+		return
+	}
+	list, total, err := s.reviews.ListVisible(c.Request.Context(), actorFrom(c), reviews.ListFilter{
+		ProjectID: c.Query("projectId"), Status: c.Query("status"), Limit: limit, Offset: offset,
+	})
 	if err != nil {
 		s.reviewError(c, err)
 		return

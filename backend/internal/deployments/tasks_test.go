@@ -504,7 +504,7 @@ func TestRollbackSelectsEarlierVersionAndAudits(t *testing.T) {
 	seedDeployment(t, db, project.ID, target.ID, 2, DeploySucceeded, "v2", base-20)
 	source := seedDeployment(t, db, project.ID, target.ID, 3, DeployFailed, "v3", base-10)
 
-	rollback, err := s.RollbackDeployment(ctx, testActor, source)
+	rollback, err := s.RollbackDeployment(ctx, testActor, source, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,23 +517,23 @@ func TestRollbackSelectsEarlierVersionAndAudits(t *testing.T) {
 		t.Fatalf("rollback audit = %v", rows)
 	}
 	// A second rollback from the same source creates another row (not idempotent).
-	second, err := s.RollbackDeployment(ctx, testActor, source)
+	second, err := s.RollbackDeployment(ctx, testActor, source, "")
 	if err != nil || second.ID == rollback.ID || second.DeploymentNumber != 5 || second.Version != "v2" {
 		t.Fatalf("second rollback = %+v err=%v", second, err)
 	}
 	// The earliest succeeded deployment has no earlier success.
-	if _, err = s.RollbackDeployment(ctx, testActor, first); !errors.Is(err, ErrValidation) {
+	if _, err = s.RollbackDeployment(ctx, testActor, first, ""); !errors.Is(err, ErrValidation) {
 		t.Fatalf("no earlier success error = %v", err)
 	}
 	// A queued source is not terminal.
 	queued := seedDeployment(t, db, project.ID, target.ID, 6, DeployQueued, "v4", base)
-	if _, err = s.RollbackDeployment(ctx, testActor, queued); !errors.Is(err, ErrConflict) {
+	if _, err = s.RollbackDeployment(ctx, testActor, queued, ""); !errors.Is(err, ErrConflict) {
 		t.Fatalf("queued rollback error = %v", err)
 	}
-	if _, err = s.RollbackDeployment(ctx, testActor, "missing-0000000000000001"); !errors.Is(err, ErrNotFound) {
+	if _, err = s.RollbackDeployment(ctx, testActor, "missing-0000000000000001", ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown rollback error = %v", err)
 	}
-	if _, err = s.RollbackDeployment(ctx, testActor, "short"); !errors.Is(err, ErrValidation) {
+	if _, err = s.RollbackDeployment(ctx, testActor, "short", ""); !errors.Is(err, ErrValidation) {
 		t.Fatalf("malformed rollback error = %v", err)
 	}
 }
@@ -560,7 +560,7 @@ func TestRollbackExecutesWithRollbackPayload(t *testing.T) {
 	source := seedDeployment(t, db, project.ID, target.ID, 2, DeploySucceeded, "v2", base-20)
 	startDeployWorker(t, s)
 
-	rollback, err := s.RollbackDeployment(ctx, testActor, source)
+	rollback, err := s.RollbackDeployment(ctx, testActor, source, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -654,7 +654,7 @@ func TestArchivedProjectRejectsDeploymentWrites(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "archived project is read-only until restored") {
 		t.Fatalf("archived create deployment message = %q", err)
 	}
-	if _, err = s.RollbackDeployment(ctx, testActor, source); !errors.Is(err, ErrConflict) {
+	if _, err = s.RollbackDeployment(ctx, testActor, source, ""); !errors.Is(err, ErrConflict) {
 		t.Fatalf("archived rollback error = %v, want ErrConflict", err)
 	}
 	if _, err = s.CancelDeployment(ctx, testActor, queued.ID); !errors.Is(err, ErrConflict) {
@@ -681,7 +681,7 @@ func TestArchivedProjectRejectsDeploymentWrites(t *testing.T) {
 	if _, err = s.CancelDeployment(ctx, testActor, queued.ID); err != nil {
 		t.Fatalf("cancel after restore = %v", err)
 	}
-	if _, err = s.RollbackDeployment(ctx, testActor, source); err != nil {
+	if _, err = s.RollbackDeployment(ctx, testActor, source, ""); err != nil {
 		t.Fatalf("rollback after restore = %v", err)
 	}
 }

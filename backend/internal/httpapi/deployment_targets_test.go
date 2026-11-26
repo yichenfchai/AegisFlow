@@ -16,6 +16,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/deployments"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
+	"github.com/yichenfchai/AegisFlow/backend/internal/reviews"
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
@@ -60,12 +61,16 @@ func deploymentTestServerWith(t *testing.T, client *http.Client, opts deployment
 		// The write overlay needs the registry, exactly like the server wiring.
 		opts.Projects = projects.New(db)
 	}
+	projectRegistry := opts.Projects
 	registry := deployments.New(db, opts)
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	return New(s, logger, db.PingContext, []string{"http://localhost:5173"}, Options{
 		Limiter:     newTestLimiter(),
-		Projects:    projects.New(db),
+		Projects:    projectRegistry,
 		Deployments: registry,
+		// The review center is wired like cmd/server so the deployment review
+		// gate can use real review ids created through the HTTP API.
+		Reviews: reviews.New(db, projectRegistry),
 	}), s, registry
 }
 

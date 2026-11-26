@@ -81,6 +81,7 @@ nginx -t && nginx -s reload
 - PostgreSQL/Redis/Nginx 在示例中各只有一个副本；扩容应用不等于消除依赖单点。生产需按可用性目标配置托管服务、主备或集群及告警。
 - 构建 worker 由 PostgreSQL 会话锁保证每个部署只有一个副本执行与恢复（不提供并行吞吐）；停止持锁副本时，其正在运行的构建会被标记为 `interrupted`，由下一个持锁副本接管恢复。
 - 审批 Webhook 通知（可选）使用 PostgreSQL outbox 与独立 notifier；生产必须使用 HTTPS（仅回环测试允许 HTTP），配置 `AEGIS_APPROVAL_WEBHOOK_SECRET` 时接收方应校验 `X-AegisFlow-Signature`，并按 `X-AegisFlow-Delivery` 幂等处理。投递失败不会改变审批状态，失败行保留在 `approval_notifications` 供排查。
+- 部署审查门禁（可选，P5-A E2）：`AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS` 未设置或为空（默认）时不启用，部署创建/回滚行为与之前完全一致。用逗号分隔填写 `development`/`staging`/`production` 后，这些环境的部署创建与回滚必须引用**同一项目**已批准审查的 `reviewId`；缺失、跨项目或未批准统一返回 400 `validation_failed`，请求不会进入审批队列。审查门禁与 `AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS` **叠加**：先校验审查，再走审批状态机。部署行会快照 `deployments.review_id`（schema v12，可空），审计 detail 追加 `review=<id>`。启用前先确认全部副本都升级到包含 v12 的版本：迁移账本不允许数据库版本高于代码支持范围，因此**升级后不能直接回退到旧二进制**，回退需同时恢复数据库备份（见「滚动升级」）。
 - 多人使用不等于已支持多租户隔离；其余业务对象级权限按 TODO 推进。
 - 部署目标 endpoint 由 admin 配置，admin 是可信配置者，目标 endpoint 属于受信配置面：允许私网/回环（自托管内网场景），拒绝 link-local 与云元数据地址（169.254.0.0/16、fe80::/10、100.100.100.200、fd00:ec2::254）；创建/更新返回 400，运行时在连接建立前按解析后的 IP 再校验一次（防 DNS rebinding）。
 
@@ -90,14 +91,14 @@ nginx -t && nginx -s reload
 
 | 对象 | 说明 | 丢失的后果 |
 | --- | --- | --- |
-| PostgreSQL 数据 | 用户、密码哈希、会话/refresh 哈希、项目、构建与构建日志、部署目标（含密文 `secret_cipher`）、部署任务与部署事件、审批、审批通知 outbox、审计 | 无法恢复账号、历史与待处理审批；未投递的通知事件丢失（审批状态本身在审批表） |
+| PostgreSQL 数据 | 用户、密码哈希、会话/refresh 哈希、项目、构建与构建日志、部署目标（含密文 `secret_cipher`）、部署任务与部署事件、审批、审批通知 outbox、审查记录与部署的审查引用（`deployments.review_id`）、审计 | 无法恢复账号、历史、审查记录与待处理审批；未投递的通知事件丢失（审批状态本身在审批表） |
 | `AEGIS_SECRET_KEY` | 部署目标凭据的 AES-256-GCM 当前密钥（base64 恰好 32 字节） | `deployment_targets.secret_cipher` 永久不可解密；受影响目标无法鉴权调用，只能重新录入凭据 |
 | `AEGIS_SECRET_KEY_PREVIOUS` | 密钥轮换期间只用于解密旧密文的退役密钥 | 轮换未完成时旧密文同样不可解密，`rekey` 无法迁移；轮换完成并移除后可不备份 |
 | `AEGIS_JWT_SECRET` | 签发 access/refresh 的密钥 | 全部会话失效，用户需重新登录（数据不丢） |
 | 入口 TLS 私钥 | 证书私钥 | 需重新签发证书 |
 | 部署配置 | 环境变量清单（只写密钥存放位置，不含明文）、编排文件、外部依赖连接信息 | 灾难恢复时需要重建 |
 
-`AEGIS_SECRET_KEY`（及轮换期的 `AEGIS_SECRET_KEY_PREVIOUS`）必须与数据库备份**分开**保存：只有数据库备份而没有密钥，部署目标凭据永久不可解密；两者同时泄漏则等价于凭据泄漏。备份里同时包含 `deployment_targets`、`deployments`、`deployment_events`、`approvals`、`approval_notifications` 等部署治理数据，恢复时整库恢复，不要单独重建这些表。
+`AEGIS_SECRET_KEY`（及轮换期的 `AEGIS_SECRET_KEY_PREVIOUS`）必须与数据库备份**分开**保存：只有数据库备份而没有密钥，部署目标凭据永久不可解密；两者同时泄漏则等价于凭据泄漏。备份里同时包含 `deployment_targets`、`deployments`、`deployment_events`、`approvals`、`approval_notifications`、`reviews` 等部署治理数据，恢复时整库恢复，不要单独重建这些表。
 
 Redis **不需要备份**：它只保存登录限流计数与 namespace，丢失只会重置配额；重启后 readyz 短暂返回 503、新登录被拒，连接恢复即恢复。不要把 Redis 当作会话或业务存储。
 
@@ -128,6 +129,8 @@ psql "$RESTORE_URL" -c "SELECT max(created_at) FROM auth_audit"
 psql "$RESTORE_URL" -c "SELECT count(*) FROM deployment_targets WHERE secret_cipher IS NOT NULL"
 psql "$RESTORE_URL" -c "SELECT count(*) FROM approvals WHERE status = 'pending'"
 psql "$RESTORE_URL" -c "SELECT count(*) FROM approval_notifications WHERE status <> 'delivered'"
+psql "$RESTORE_URL" -c "SELECT count(*) FROM reviews"
+psql "$RESTORE_URL" -c "SELECT count(*) FROM deployments WHERE review_id IS NOT NULL"
 
 # 4) 凭据可解密性：rekey 默认只读 dry run，不会改写恢复库。
 #    必须在 backend 模块目录执行（仓库根目录没有 go.mod）。

@@ -102,6 +102,15 @@ type Input struct {
 	ExternalURL string
 }
 
+// ListFilter is the global review-list filter. ProjectID and Status are
+// optional; Limit/Offset use the shared 1-100/non-negative pagination bounds.
+type ListFilter struct {
+	ProjectID string
+	Status    string
+	Limit     int
+	Offset    int
+}
+
 type Service struct {
 	db *sql.DB
 	// projects decides project visibility and the write/maintainer overlays.
@@ -479,6 +488,52 @@ func (s *Service) List(ctx context.Context, actor auth.Actor, projectID, status 
 	 LEFT JOIN auth_users du ON du.id=r.decided_by
 	 WHERE r.project_id=$1 AND ($2='' OR r.status=$2)
 	 ORDER BY r.created_at DESC,r.number DESC,r.id DESC LIMIT $3 OFFSET $4`, projectID, status, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	list := make([]Review, 0)
+	for rows.Next() {
+		review, err := scanReviewWithNames(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		list = append(list, *review)
+	}
+	return list, total, rows.Err()
+}
+
+// ListVisible pages every review whose project the actor may see, newest first,
+// filtered by the optional status and project. It reuses the single project
+// visibility predicate, so a global admin sees all reviews while every other
+// role sees only public projects, projects it created and projects it belongs
+// to. A projectId filter cannot widen that set: an invisible project simply
+// contributes no rows, matching GET /api/v1/deployments, so the filter cannot be
+// used to probe private project ids.
+func (s *Service) ListVisible(ctx context.Context, actor auth.Actor, filter ListFilter) ([]Review, int, error) {
+	if filter.ProjectID != "" && !auth.ValidID(filter.ProjectID) {
+		return nil, 0, fmt.Errorf("%w: invalid project id", ErrValidation)
+	}
+	if filter.Status != "" && !validStatus(filter.Status) {
+		return nil, 0, fmt.Errorf("%w: status filter must be pending, approved, rejected or cancelled", ErrValidation)
+	}
+	if err := paginate(filter.Limit, filter.Offset); err != nil {
+		return nil, 0, err
+	}
+	isAdmin, userID := projects.VisibilityArgs(actor)
+	from := ` FROM reviews r JOIN projects p ON p.id=r.project_id
+		WHERE ($1='' OR r.project_id=$1) AND ($2='' OR r.status=$2) AND ` + projects.VisiblePredicate("p", 3, 4)
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+from, filter.ProjectID, filter.Status, isAdmin, userID).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+reviewSelectColumns+` FROM reviews r
+	 JOIN projects p ON p.id=r.project_id
+	 LEFT JOIN auth_users ru ON ru.id=r.requested_by
+	 LEFT JOIN auth_users du ON du.id=r.decided_by
+	 WHERE ($1='' OR r.project_id=$1) AND ($2='' OR r.status=$2) AND `+projects.VisiblePredicate("p", 3, 4)+`
+	 ORDER BY r.created_at DESC,r.number DESC,r.id DESC LIMIT $5 OFFSET $6`,
+		filter.ProjectID, filter.Status, isAdmin, userID, filter.Limit, filter.Offset)
 	if err != nil {
 		return nil, 0, err
 	}

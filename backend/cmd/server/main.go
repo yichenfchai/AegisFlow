@@ -133,6 +133,9 @@ func run(logger *slog.Logger) error {
 		ApprovalWebhookURL:     cfg.ApprovalWebhookURL,
 		ApprovalWebhookSecret:  cfg.ApprovalWebhookSecret,
 		ApprovalWebhookTimeout: cfg.ApprovalWebhookTimeout,
+		// The review gate is opt-in: an empty slice keeps deployment creation
+		// unchanged, and its list is independent of the approval policy.
+		RequireReviewEnvironments: cfg.RequireReviewEnvironments,
 	})
 	// Metrics are opt-in and live on their own listener: the public API origin
 	// must not expose deployment-wide counters, and scraping needs no session.
