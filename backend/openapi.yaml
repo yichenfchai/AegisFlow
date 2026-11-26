@@ -1470,6 +1470,13 @@ paths:
         semantic version (1-64 chars of A-Z a-z 0-9 . _ + -). buildId is
         optional and must reference a succeeded build of the same project.
         deploymentNumber is allocated per project under the project row lock.
+        reviewId is optional and records an approved review of the same project
+        as the deployment's review snapshot. When the target environment is
+        listed in AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS (empty by default,
+        which disables the gate) reviewId is required; a review that is
+        unknown, belongs to another project or is not approved is 400
+        validation_failed. The review gate is checked before the approval state
+        machine, so the two gates compose.
         A single leased worker executes queued deployments. When the target
         environment is listed in AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS (default
         production) the new deployment starts in awaiting_approval instead of
@@ -1659,8 +1666,12 @@ paths:
         otherwise). A new deployment is created (queued, or awaiting_approval
         when the target environment requires approval) with rollbackOf set to
         the source id and version set to the version being restored; the source
-        row is unchanged. Repeated rollbacks create multiple rows: deployment is
-        not idempotent, and the audit trail records each attempt.
+        row is unchanged. reviewId follows the same review gate as a fresh
+        deployment: it is required when the target environment is in
+        AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS and must always reference an
+        approved review of the same project (400 validation_failed otherwise).
+        Repeated rollbacks create multiple rows: deployment is not idempotent,
+        and the audit trail records each attempt.
       security:
         - bearerAuth: []
       parameters:
@@ -1890,6 +1901,48 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/reviews:
+    get:
+      tags: [Reviews]
+      operationId: listReviews
+      summary: List reviews across projects (visible projects)
+      description: |
+        Newest first, restricted to the projects the caller can see: a global
+        admin sees every review, while other roles see reviews of public
+        projects plus projects they created or belong to. projectId and status
+        are optional filters; filtering by an invisible project returns an empty
+        page instead of an error, matching the global deployment list, so the
+        filter cannot be used to enumerate private project ids.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Offset' }
+        - name: projectId
+          in: query
+          required: false
+          description: Filter by project id; omit for all visible projects
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - name: status
+          in: query
+          required: false
+          description: Filter by review status; omit for all
+          schema: { type: string, enum: [pending, approved, rejected, cancelled] }
+      responses:
+        '200':
+          description: Review page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ReviewPage' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/reviews/{reviewId}:
     get:
@@ -2409,7 +2462,7 @@ components:
     Deployment:
       type: object
       additionalProperties: false
-      required: [id, projectId, targetId, targetName, targetEndpoint, targetEnvironment, deploymentNumber, status, version, buildId, rollbackOf, approvalId, triggeredBy, detail, createdAt, startedAt, finishedAt]
+      required: [id, projectId, targetId, targetName, targetEndpoint, targetEnvironment, deploymentNumber, status, version, buildId, rollbackOf, approvalId, reviewId, triggeredBy, detail, createdAt, startedAt, finishedAt]
       properties:
         id: { type: string }
         projectId: { type: string }
@@ -2423,6 +2476,7 @@ components:
         buildId: { type: string, description: Optional succeeded build snapshot; empty when not linked }
         rollbackOf: { type: string, description: Source deployment id when this is a rollback; empty otherwise }
         approvalId: { type: string, description: Approval request id when the target environment required approval; empty otherwise }
+        reviewId: { type: string, description: Approved review snapshot when the deployment was gated on a review; empty when the review gate was disabled and no review was supplied }
         triggeredBy: { type: string, description: Actor id snapshot }
         detail: { type: string, description: "Terminal outcome such as http <code>, timeout or a sanitized network error; never a secret" }
         createdAt: { type: integer, format: int64, description: Unix seconds }
@@ -2465,11 +2519,13 @@ components:
         targetId: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
         version: { type: string, pattern: '^[A-Za-z0-9._+-]{1,64}$' }
         buildId: { type: string, description: Optional; must be a succeeded build of the same project }
+        reviewId: { type: string, description: 'Optional unless the target environment is in AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS; must reference an approved review of the same project. Recorded as the deployment review snapshot.' }
     RollbackDeploymentInput:
       type: object
       additionalProperties: false
-      maxProperties: 0
-      description: Empty object; the version to restore is the most recent earlier succeeded version of the same project and target.
+      description: Optional reviewId; the version to restore is the most recent earlier succeeded version of the same project and target.
+      properties:
+        reviewId: { type: string, description: 'Optional unless the target environment is in AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS; must reference an approved review of the same project. Recorded as the rollback deployment review snapshot.' }
     Approval:
       type: object
       additionalProperties: false
@@ -2621,7 +2677,7 @@ components:
               data: { $ref: '#/components/schemas/User' }
               requestId: { $ref: '#/components/schemas/RequestID' }
     BadRequest:
-      description: Invalid JSON, unknown field, non-object or >16 KiB (invalid_request), or invalid user fields (validation_failed)
+      description: Invalid JSON, unknown field, non-object or >16 KiB (invalid_request), or invalid user fields or a deployment review gate rejection (validation_failed)
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorEnvelope' }

@@ -35,6 +35,10 @@ x-api: &api
     # Unset defaults to production; an explicitly empty value disables approvals
     # (that is why this uses the `-` form instead of `:-`).
     AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS: ${AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS-production}
+    # Environments that require an approved review before a deployment is
+    # created; empty (the default) disables the review gate. It composes with
+    # the approval list above (review first, then the approval state machine).
+    AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS: ${AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS:-}
     AEGIS_APPROVAL_WEBHOOK_URL: ${AEGIS_APPROVAL_WEBHOOK_URL:-}
     AEGIS_APPROVAL_WEBHOOK_SECRET: ${AEGIS_APPROVAL_WEBHOOK_SECRET:-}
     AEGIS_APPROVAL_WEBHOOK_TIMEOUT: ${AEGIS_APPROVAL_WEBHOOK_TIMEOUT:-5s}

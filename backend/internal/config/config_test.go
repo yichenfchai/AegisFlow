@@ -33,6 +33,7 @@ func setup(t *testing.T) {
 		t.Setenv(key, "")
 	}
 	unsetEnv(t, "AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
+	t.Setenv("AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS", "")
 	t.Setenv("AEGIS_JWT_SECRET", strings.Repeat("s", 32))
 	t.Setenv("AEGIS_DATABASE_URL", "postgres://test:test@localhost:5432/aegis_test?sslmode=disable")
 	t.Setenv("AEGIS_REDIS_URL", "redis://localhost:6379/0")
@@ -505,6 +506,70 @@ func TestApprovalConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRequireReviewEnvironmentsConfig(t *testing.T) {
+	// The review gate is opt-in: both an unset variable and an explicitly
+	// empty value must leave it disabled, unlike the approval default.
+	t.Run("unset disables the gate", func(t *testing.T) {
+		setup(t)
+		unsetEnv(t, "AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS")
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(c.RequireReviewEnvironments) != 0 {
+			t.Fatalf("review environments = %v, want none", c.RequireReviewEnvironments)
+		}
+	})
+	for _, tc := range []struct {
+		name    string
+		value   string
+		want    []string
+		invalid bool
+	}{
+		{"explicit empty disables the gate", "", []string{}, false},
+		{"comma only disables the gate", ",", []string{}, false},
+		{"spaces and commas disable the gate", "  ,  ", []string{}, false},
+		{"single production", "production", []string{"production"}, false},
+		{"all three", "production,staging,development", []string{"production", "staging", "development"}, false},
+		{"trim and dedupe", " development , production ,production", []string{"development", "production"}, false},
+		{"unknown environment", "qa", nil, true},
+		{"wrong case", "Production", nil, true},
+		{"one unknown among valid", "staging,qa", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS", tc.value)
+			c, err := Load()
+			if (err != nil) != tc.invalid {
+				t.Fatalf("environments=%v err=%v", c.RequireReviewEnvironments, err)
+			}
+			if tc.invalid {
+				return
+			}
+			if !slices.Equal(c.RequireReviewEnvironments, tc.want) {
+				t.Fatalf("environments=%v want=%v", c.RequireReviewEnvironments, tc.want)
+			}
+			if c.RequireReviewEnvironments == nil {
+				t.Fatalf("explicit AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS=%q produced nil; want non-nil empty slice", tc.value)
+			}
+		})
+	}
+	// The gate is independent of the approval policy: enabling one must not
+	// change the other's parsed value.
+	t.Run("independent of approval environments", func(t *testing.T) {
+		setup(t)
+		t.Setenv("AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS", "")
+		t.Setenv("AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS", "production")
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(c.ApprovalEnvironments) != 0 || !slices.Equal(c.RequireReviewEnvironments, []string{"production"}) {
+			t.Fatalf("approval=%v review=%v", c.ApprovalEnvironments, c.RequireReviewEnvironments)
+		}
+	})
 }
 
 func TestApprovalWebhookConfig(t *testing.T) {

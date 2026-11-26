@@ -72,6 +72,12 @@ type Config struct {
 	ApprovalWebhookSecret []byte
 	// ApprovalWebhookTimeout bounds one webhook delivery (default 5s, max 30s).
 	ApprovalWebhookTimeout time.Duration
+	// RequireReviewEnvironments lists target environments whose deployments
+	// must reference an approved review. Empty (the default, including an
+	// explicitly empty value or only commas/whitespace) disables the gate: the
+	// review gate is opt-in so an upgrade keeps the previous deployment
+	// behavior, and only the three documented environments are valid.
+	RequireReviewEnvironments []string
 }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
@@ -274,6 +280,26 @@ func Load() (Config, error) {
 		}
 		if !slices.Contains(c.ApprovalEnvironments, entry) {
 			c.ApprovalEnvironments = append(c.ApprovalEnvironments, entry)
+		}
+	}
+	// Deployment review gate (P5-A E2). Unlike the approval default there is no
+	// environment fallback: an unset or explicitly empty value keeps the gate
+	// disabled, and only the three documented environments are accepted. The
+	// slice is always non-nil, so an empty value can never be mistaken for an
+	// unset default by a future caller.
+	c.RequireReviewEnvironments = []string{}
+	for _, entry := range strings.Split(os.Getenv("AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS"), ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		switch entry {
+		case "development", "staging", "production":
+		default:
+			return c, errors.New("AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS must contain only development, staging or production")
+		}
+		if !slices.Contains(c.RequireReviewEnvironments, entry) {
+			c.RequireReviewEnvironments = append(c.RequireReviewEnvironments, entry)
 		}
 	}
 	c.ApprovalTTL, err = duration("AEGIS_APPROVAL_TTL", "24h")

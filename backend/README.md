@@ -95,17 +95,18 @@ server: {
 | DELETE | /api/v1/deployment-targets/{id} | Bearer + admin | `{removed:true}`；被部署历史引用 409 |
 | POST | /api/v1/deployment-targets/{id}/check | Bearer + admin；**`{}`** | DeploymentTargetCheck（探测结果同时落库并写审计） |
 | GET | /api/v1/projects/{id}/deployments | Bearer（可见者）；`?limit=&offset=&status=` | 部署分页，最新在前；不可见项目 404 |
-| POST | /api/v1/projects/{id}/deployments | Bearer + 项目写权限（admin，或可写项目的 member）；`{targetId,version,buildId?}` | Deployment，201；`queued`，命中审批环境为 `awaiting_approval`；不可见 404 |
+| POST | /api/v1/projects/{id}/deployments | Bearer + 项目写权限（admin，或可写项目的 member）；`{targetId,version,buildId?,reviewId?}` | Deployment，201；`queued`，命中审批环境为 `awaiting_approval`；命中审查门禁环境缺 `reviewId` 或审查未批准 400；不可见 404 |
 | GET | /api/v1/deployments | Bearer（所有角色）；`?limit=&offset=&projectId=&status=` | 部署分页，最新在前，仅含可见项目的部署 |
 | GET | /api/v1/deployments/{id} | Bearer（可见者） | Deployment；不可见 404 |
 | GET | /api/v1/deployments/{id}/events | Bearer（可见者）；`?after=&limit=`（after 为事件 id 游标，limit 1-1000，默认 200） | `{items}`，按事件 id 升序；不可见 404 |
 | POST | /api/v1/deployments/{id}/cancel | Bearer + 项目写权限；**`{}`** | Deployment；重复取消幂等 200，终态 409 |
-| POST | /api/v1/deployments/{id}/rollback | Bearer + 项目写权限；**`{}`** | 新 Deployment，201（queued；命中审批环境为 awaiting_approval）；无更早成功 400，源非终态 409 |
+| POST | /api/v1/deployments/{id}/rollback | Bearer + 项目写权限；**`{reviewId?}`** | 新 Deployment，201（queued；命中审批环境为 awaiting_approval）；无更早成功 400，源非终态 409；命中审查门禁环境缺 `reviewId` 或审查未批准 400 |
 | GET | /api/v1/approvals | Bearer + admin；`?limit=&offset=&status=` | `{items,total,limit,offset}`，最新在前 |
 | POST | /api/v1/approvals/{id}/approve | Bearer + admin；**`{}`** | Approval；重复批准幂等 200，冲突 409 |
 | POST | /api/v1/approvals/{id}/reject | Bearer + admin；`{reason?}`（可选、trim、单行、≤512 字节） | Approval；重复拒绝幂等 200，冲突 409 |
 | GET | /api/v1/projects/{id}/reviews | Bearer（可见者）；`?status=&limit=&offset=` | `{items,total,limit,offset}`，最新在前；不可见项目 404 |
 | POST | /api/v1/projects/{id}/reviews | Bearer + 项目写权限（admin，或可写项目的 member）；`{subject,description?,version?,externalUrl?}` | Review，201（pending）；不可见 404 |
+| GET | /api/v1/reviews | Bearer（所有角色）；`?limit=&offset=&projectId=&status=` | `{items,total,limit,offset}`，最新在前，仅含可见项目的审查；不可见 `projectId` 过滤返回空列表（与全局部署列表一致，不可枚举） |
 | GET | /api/v1/reviews/{id} | Bearer（可见者） | Review；不可见 404 |
 | POST | /api/v1/reviews/{id}/approve | Bearer + 全局 admin 或项目 maintainer；**`{reason?}`**（可选、trim、单行、≤512 字节） | Review；重复批准幂等 200，终态 409 |
 | POST | /api/v1/reviews/{id}/reject | Bearer + 全局 admin 或项目 maintainer；**`{reason}`**（必填、trim、单行、≤512 字节） | Review；重复拒绝幂等 200，终态 409 |
@@ -155,7 +156,8 @@ server: {
 - 查询：项目内列表 `GET /api/v1/projects/{projectId}/deployments`，全局列表 `GET /api/v1/deployments?projectId&status&limit&offset`（与构建列表同形，任何已登录角色可用，按项目可见性过滤）；详情、事件游标（`after&limit`）与取消/回滚都在 `/api/v1/deployments/{id}` 下。
 - 目标快照：创建时固化 `target_name/target_endpoint/target_environment`，之后改名或改端点不影响历史；执行使用目标当前配置，目标在执行前被禁用/删除会置 `failed`。
 - 回滚：`POST /api/v1/deployments/{id}/rollback` 仅接受 `succeeded`/`failed` 源，取同项目+目标中比源部署更早的最近一次 `succeeded` 版本，新建一条部署（通常为 `queued`，命中审批环境时为 `awaiting_approval`；`rollbackOf` 指向源，payload `rollback=true`、`rollbackVersion` 为该版本）；无更早成功返回 400，源非终态 409；重复回滚会创建多条部署（非幂等，审计可追溯）。
-- 权限与审计：部署端点按项目写权限授权——admin 全量；member 对可写项目（public，或 private 且为 maintainer）可创建、取消与回滚；viewer 只读不可写。列表与详情按项目可见性过滤，不可见一律 404（防枚举）；审批接口仍 admin-only。`deployment.create`（detail `target=<name> version=<v> approval=none`）、`deployment.cancel`（`from=<status>`）、`deployment.rollback`（`rollback_of=<id> version=<v>`）与状态变更同事务，重复取消失败不重复记账。
+- 审查门禁（P5-A E2）：`AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS`（逗号分隔的 development/staging/production，默认空 = 不启用，显式空值同样关闭）列出必须引用**已批准**审查的环境。创建与回滚都接受可选 `reviewId`；提供时必须属于同一项目且 `status=approved`（不存在、不可见或未批准统一返回 400 `validation_failed`，不保留可用于枚举的差异），目标环境命中门禁列表时 `reviewId` 必填。部署行 `review_id` 记录创建时的审查快照（无审查为 NULL），接口响应含 `reviewId`；审计 detail 追加 `review=<id>`，不写审查正文。门禁在审批状态机之前校验，与 P4.3 审批叠加（先审后批）；门禁默认关闭，因此升级后的既有部署行为完全不变。
+- 权限与审计：部署端点按项目写权限授权——admin 全量；member 对可写项目（public，或 private 且为 maintainer）可创建、取消与回滚；viewer 只读不可写。列表与详情按项目可见性过滤，不可见一律 404（防枚举）；审批接口仍 admin-only。`deployment.create`（detail `target=<name> version=<v> approval=none|required`，命中审查门禁时追加 ` review=<id>`）、`deployment.cancel`（`from=<status>`）、`deployment.rollback`（`rollback_of=<id> version=<v>`，命中审查门禁时追加 ` review=<id>`）与状态变更同事务，重复取消失败不重复记账。
 - 本批边界：部署产物与构建强制关联（`buildId` 可选，提供时必须是同项目 `succeeded` 构建）、自定义 HTTP 方法与路径、自动重试均未做。
 
 
@@ -180,13 +182,13 @@ server: {
 
 ### 审查中心（P5-A，门禁式）
 
-- 定位：对项目的一次变更（版本标签或外部构建链接）发起审查，由项目 maintainer 批准或拒绝，全程审计，并允许发起人/维护者取消。后续批次再把审查接入部署门禁与外部检查结果；本批只交付 API、数据、审计、文档与测试，前端页面未接入。
-- 接口：`POST|GET /api/v1/projects/{projectId}/reviews`、`GET /api/v1/reviews/{id}`、`POST /api/v1/reviews/{id}/approve|reject|cancel`。发起复用项目写权限叠加（admin，或可写项目的 member）；批准/拒绝要求**全局 admin 或该项目 maintainer**（`projects.AuthorizeDecide`，比写权限更严：public 项目的普通 member 不能决策）；取消允许发起人本人，或 admin/maintainer。列表与详情按项目可见性过滤，不可见一律 404。
+- 定位：对项目的一次变更（版本标签或外部构建链接）发起审查，由项目 maintainer 批准或拒绝，全程审计，并允许发起人/维护者取消；E2 起审查可作为部署门禁（见上节与「审查门禁」）。外部检查结果回写与通知渠道仍未做。
+- 接口：`POST|GET /api/v1/projects/{projectId}/reviews`、`GET /api/v1/reviews`（全局列表，任何已登录角色，按项目可见性过滤，支持 `projectId`/`status`/分页）、`GET /api/v1/reviews/{id}`、`POST /api/v1/reviews/{id}/approve|reject|cancel`。发起复用项目写权限叠加（admin，或可写项目的 member）；批准/拒绝要求**全局 admin 或该项目 maintainer**（`projects.AuthorizeDecide`，比写权限更严：public 项目的普通 member 不能决策）；取消允许发起人本人，或 admin/maintainer。列表与详情按项目可见性过滤，不可见一律 404；全局列表按可见性过滤而非 404，`projectId` 过滤时不可见项目返回空列表（与 `GET /api/v1/deployments` 同语义，不可枚举）。
 - 字段：`subject` 必填、3–200 字节、单行（trim 后校验）、`description` ≤2000 字节、`version` ≤64 字节单行（trim）、`externalUrl` 可选、仅 http(s)、禁止 userinfo/fragment、≤2048 字节；`externalUrl` 只做展示与校验，服务端不抓取。`number` 是项目内自增序号，在 `projects` 行锁下从 `review_count` 分配（与构建/部署编号同一模式）；并发创建不会重号。
 - 状态机：`pending → approved | rejected | cancelled`，终态不可变。批准/拒绝/取消都只接受 pending，其余状态返回 409；重试已处于目标终态的请求幂等返回 200 与同一结果，且不重复写审计。`decidedBy/decidedByName/decidedAt` 记录决策（取消也记录取消人与时间），`reason` 保存批准的可选理由/拒绝的必填理由；取消不带理由，pending 时这些字段在 JSON 中省略。
 - 审计：`review.request`（detail `project=<id> number=<n>`）、`review.approve`/`review.reject`/`review.cancel`（objectType `review`，detail 只写 `number=<n>` 及 reason（如有）），四项审计与编号分配、状态变更在同一事务提交；subject/description/version/externalUrl 正文不进入审计。重复的幂等请求不重复记账。
-- 迁移：schema v11 新增 `reviews` 表、`projects.review_count`、`UNIQUE(project_id,number)` 与 `(project_id,status,created_at)`、`(status,created_at)` 索引；`project_id` 外键级联删除。
-- 本批边界：部署门禁自动放行/阻断、外部检查结果回写、通知渠道与前端审查页面均未做。
+- 迁移：schema v11 新增 `reviews` 表、`projects.review_count`、`UNIQUE(project_id,number)` 与 `(project_id,status,created_at)`、`(status,created_at)` 索引；`project_id` 外键级联删除。schema v12 为 `deployments` 增加可空 `review_id`（引用 `reviews(id)`，`ON DELETE SET NULL`）与部分索引，部署可快照其审查门禁来源。
+- 本批边界（P5-A E2）：部署门禁联动（创建/回滚的 `reviewId` 校验与快照）已实现且默认关闭；外部检查结果回写、审查通知渠道、前端审查列表/详情/门禁表单与 E2E 仍留待后续。
 
 ### 运行指标（P4）
 
@@ -249,7 +251,7 @@ User 字段为 `id/username/displayName/role/disabled/createdAt`，无密码或�
 - SQLite 开发库不会自动导入 PostgreSQL。现阶段开发数据可重新初始化；如有需要保留的用户，必须先备份并单独编写审核过的离线迁移，保留 bcrypt 哈希、校验用户名大小写唯一性并撤销旧会话，不能直接复制文件或将 SQLite 挂共享盘。
 - /readyz 同时检查 PostgreSQL 和 Redis；Redis 故障使就绪返回 503，登录也 503。探测结果在进程内缓存 1 秒（成功与失败都缓存，探测超时仍为 2 秒），因此无鉴权的 /readyz 轮询不会按请求数放大对依赖的负载。已存在 Bearer 会话在 PostgreSQL 正常时仍可鉴权；负载均衡是否摘除整个实例取决于运维策略。
 - 请求 ID、slog JSON 访问日志、鉴权操作日志、panic 恢复、安全响应头、HTTP 超时、信号触发优雅退出；日志不记录密码、Cookie、令牌、正文。
-- 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）、部署目标增删改查与探测（deployment_target.create / deployment_target.update / deployment_target.remove / deployment_target.check）、部署创建/取消/回滚（deployment.create / deployment.cancel / deployment.rollback）、审批请求/批准/拒绝/过期（approval.request / approval.approve / approval.reject / approval.expire）、审查请求与批准/拒绝/取消（review.request / review.approve / review.reject / review.cancel，objectType `review`）。构建、成员、部署目标、部署任务、审批与审查审计都和状态变更在同一事务提交；幂等重复取消不重复记账，detail 只写项目/成员与构建号或角色（重试额外写 `retry_of=<原构建号>`）、审查编号与理由，不写命令或凭据，也不写审查正文。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），支持 `action`/`objectType`/`result`/`actor`/`from`/`to` 服务端筛选（AND 组合，同时作用于分页与 total；`from`/`to` 接受 RFC3339 或 `YYYY-MM-DD`，只给日期时 `to` 覆盖该 UTC 全天）。
+- 持久化审计记录操作人、时间、动作、对象、结果与请求 ID：登录成功、创建用户、修改/重置密码（含当前密码错误失败）、禁用/启用、角色变更、会话撤销、项目成员增删改（project.member_add / project.member_update / project.member_remove）、构建触发（build.trigger）、取消（build.cancel）与重试（build.retry）、部署目标增删改查与探测（deployment_target.create / deployment_target.update / deployment_target.remove / deployment_target.check）、部署创建/取消/回滚（deployment.create / deployment.cancel / deployment.rollback）、审批请求/批准/拒绝/过期（approval.request / approval.approve / approval.reject / approval.expire）、审查请求与批准/拒绝/取消（review.request / review.approve / review.reject / review.cancel，objectType `review`）。构建、成员、部署目标、部署任务、审批与审查审计都和状态变更在同一事务提交；幂等重复取消不重复记账，detail 只写项目/成员与构建号或角色（重试额外写 `retry_of=<原构建号>`）、审查编号与理由，不写命令或凭据，也不写审查正文。部署创建/回滚命中审查门禁时 detail 追加 `review=<id>`（只写 id，不写审查正文）。失败登录因限流兜底仅进结构化日志，不写审计表。审计查询走 GET /api/v1/audit（admin），支持 `action`/`objectType`/`result`/`actor`/`from`/`to` 服务端筛选（AND 组合，同时作用于分页与 total；`from`/`to` 接受 RFC3339 或 `YYYY-MM-DD`，只给日期时 `to` 覆盖该 UTC 全天）。
 - 审计保留策略可选：`AEGIS_AUDIT_RETENTION` 未设置或为 `0` 时永久保留（默认）；设置 24h–8760h 后，与过期会话清理共用的小时任务会删除早于该窗口的审计行。删除是运维显式选择，默认不丢证据。
 - 过期会话与 refresh 历史由后台任务每小时清理（启动时先执行一次）：删除超过绝对期限的会话及其全部 refresh 令牌记录。重放检测只需保留到会话有效期，这与文档化的保留边界一致。
 

@@ -253,6 +253,15 @@ var Migrations = [][]string{{
 	`CREATE UNIQUE INDEX reviews_project_number_idx ON reviews(project_id, number)`,
 	`CREATE INDEX reviews_project_status_created_idx ON reviews(project_id, status, created_at)`,
 	`CREATE INDEX reviews_status_created_idx ON reviews(status, created_at)`,
+}, {
+	// Deployment review gate (P5-A E2): a deployment snapshots the approved
+	// review that gated it. review_id is nullable so the default-off gate and
+	// every historical row stay valid; ON DELETE SET NULL preserves deployment
+	// history if a review (or its cascading project) is ever removed, and the
+	// partial index serves that referential action plus "which deployments used
+	// this review" lookups without indexing the common NULL rows.
+	`ALTER TABLE deployments ADD COLUMN review_id TEXT REFERENCES reviews(id) ON DELETE SET NULL`,
+	`CREATE INDEX deployments_review_idx ON deployments(review_id) WHERE review_id IS NOT NULL`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped

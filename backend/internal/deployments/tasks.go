@@ -51,6 +51,7 @@ type Deployment struct {
 	BuildID           string `json:"buildId"`
 	RollbackOf        string `json:"rollbackOf"`
 	ApprovalID        string `json:"approvalId"`
+	ReviewID          string `json:"reviewId"`
 	TriggeredBy       string `json:"triggeredBy"`
 	Detail            string `json:"detail"`
 	CreatedAt         int64  `json:"createdAt"`
@@ -59,11 +60,15 @@ type Deployment struct {
 }
 
 // DeployInput creates a deployment. BuildID is optional; when present it must
-// reference a succeeded build of the same project.
+// reference a succeeded build of the same project. ReviewID is optional unless
+// the target environment is in the configured review-required set; when present
+// it must reference an approved review of the same project and is recorded on
+// the deployment as a snapshot.
 type DeployInput struct {
 	TargetID string
 	Version  string
 	BuildID  string
+	ReviewID string
 }
 
 // DeploymentEvent is one lifecycle (system) or upstream response line.
@@ -75,14 +80,18 @@ type DeploymentEvent struct {
 	CreatedAt    int64  `json:"createdAt"`
 }
 
-const deploymentColumns = `id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,build_id,rollback_of,approval_id,triggered_by,detail,created_at,started_at,finished_at`
+const deploymentColumns = `id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,build_id,rollback_of,approval_id,review_id,triggered_by,detail,created_at,started_at,finished_at`
 
 func scanDeployment(row rowScanner) (Deployment, error) {
 	var d Deployment
+	var reviewID sql.NullString
 	if err := row.Scan(&d.ID, &d.ProjectID, &d.TargetID, &d.TargetName, &d.TargetEndpoint, &d.TargetEnvironment,
-		&d.DeploymentNumber, &d.Status, &d.Version, &d.BuildID, &d.RollbackOf, &d.ApprovalID, &d.TriggeredBy,
+		&d.DeploymentNumber, &d.Status, &d.Version, &d.BuildID, &d.RollbackOf, &d.ApprovalID, &reviewID, &d.TriggeredBy,
 		&d.Detail, &d.CreatedAt, &d.StartedAt, &d.FinishedAt); err != nil {
 		return Deployment{}, err
+	}
+	if reviewID.Valid {
+		d.ReviewID = reviewID.String
 	}
 	return d, nil
 }
@@ -200,7 +209,13 @@ func (s *Service) CreateDeployment(ctx context.Context, actor auth.Actor, projec
 	if err = validateSecretTransport(target.Endpoint, target.HasSecret); err != nil {
 		return Deployment{}, err
 	}
-	deployment, err := s.enqueueDeployment(ctx, tx, actor, projectID, target, input.Version, input.BuildID, "", ActionDeployCreate)
+	// The review gate runs before the approval state machine: a required or
+	// supplied review must already be approved, so a deployment can never be
+	// enqueued (or await approval) without its change review.
+	if err = s.requireApprovedReview(ctx, tx, projectID, target.Environment, input.ReviewID); err != nil {
+		return Deployment{}, err
+	}
+	deployment, err := s.enqueueDeployment(ctx, tx, actor, projectID, target, input.Version, input.BuildID, input.ReviewID, "", ActionDeployCreate)
 	if err != nil {
 		return Deployment{}, err
 	}
@@ -216,10 +231,12 @@ func (s *Service) CreateDeployment(ctx context.Context, actor auth.Actor, projec
 // allocate distinct deployment numbers. When the target environment requires
 // approval, the row starts awaiting_approval, a pending approval is created in
 // the same transaction, approval_id is set, and both the deployment action and
-// approval.request are audited. Detail follows design §8: create records
-// approval=required|none, rollback records the source and version.
+// approval.request are audited. reviewID is the approved review that gated the
+// deployment (already validated by the caller) and is snapshotted on the row.
+// Detail follows design §8: create records approval=required|none, rollback
+// records the source and version; both append review=<id> when gated.
 func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.Actor, projectID string, target targetSnapshot,
-	version, buildID, rollbackOf, action string) (Deployment, error) {
+	version, buildID, reviewID, rollbackOf, action string) (Deployment, error) {
 	var count int64
 	var projectStatus string
 	err := tx.QueryRowContext(ctx, `SELECT deploy_count,status FROM projects WHERE id=$1 FOR UPDATE`, projectID).Scan(&count, &projectStatus)
@@ -263,12 +280,18 @@ func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.
 		ID: id, ProjectID: projectID, TargetID: target.ID, TargetName: target.Name,
 		TargetEndpoint: target.Endpoint, TargetEnvironment: target.Environment, DeploymentNumber: count + 1,
 		Status: status, Version: version, BuildID: buildID, RollbackOf: rollbackOf, ApprovalID: approvalID,
-		TriggeredBy: actor.ID, CreatedAt: now,
+		ReviewID: reviewID, TriggeredBy: actor.ID, CreatedAt: now,
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO deployments(id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,build_id,rollback_of,approval_id,triggered_by,detail,created_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'',$14)`,
+	// review_id is nullable: an ungated deployment stores NULL rather than an
+	// empty string, which would violate the review foreign key.
+	var reviewValue any
+	if reviewID != "" {
+		reviewValue = reviewID
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO deployments(id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,build_id,rollback_of,approval_id,review_id,triggered_by,detail,created_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'',$15)`,
 		deployment.ID, projectID, deployment.TargetID, deployment.TargetName, deployment.TargetEndpoint, deployment.TargetEnvironment,
-		deployment.DeploymentNumber, status, version, buildID, rollbackOf, approvalID, actor.ID, now); err != nil {
+		deployment.DeploymentNumber, status, version, buildID, rollbackOf, approvalID, reviewValue, actor.ID, now); err != nil {
 		return Deployment{}, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE projects SET deploy_count=$2 WHERE id=$1`, projectID, deployment.DeploymentNumber); err != nil {
@@ -284,6 +307,9 @@ func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.
 		detail = fmt.Sprintf("target=%s version=%s approval=%s", target.Name, version, approvalWord)
 	case ActionDeployRollback:
 		detail = fmt.Sprintf("rollback_of=%s version=%s", rollbackOf, version)
+	}
+	if reviewID != "" {
+		detail += " review=" + reviewID
 	}
 	if err = writeAuditObject(ctx, tx, actor, action, "deployment", deployment.ID, detail); err != nil {
 		return Deployment{}, err
@@ -467,8 +493,11 @@ func (s *Service) CancelDeployment(ctx context.Context, actor auth.Actor, id str
 // RollbackDeployment creates a new deployment for the most recent earlier
 // succeeded version of the same project and target (design §5). The source must
 // be terminal; repeated rollbacks create multiple rows on purpose, because a
-// deployment is not an idempotent operation.
-func (s *Service) RollbackDeployment(ctx context.Context, actor auth.Actor, id string) (Deployment, error) {
+// deployment is not an idempotent operation. reviewID follows the same gate as
+// a fresh deployment: it is required when the target environment is in the
+// configured review-required set and must always reference an approved review of
+// the same project.
+func (s *Service) RollbackDeployment(ctx context.Context, actor auth.Actor, id, reviewID string) (Deployment, error) {
 	if !auth.ValidID(id) {
 		return Deployment{}, fmt.Errorf("%w: invalid deployment id", ErrValidation)
 	}
@@ -517,7 +546,12 @@ func (s *Service) RollbackDeployment(ctx context.Context, actor auth.Actor, id s
 	if err = validateSecretTransport(target.Endpoint, target.HasSecret); err != nil {
 		return Deployment{}, err
 	}
-	deployment, err := s.enqueueDeployment(ctx, tx, actor, source.ProjectID, target, version, "", source.ID, ActionDeployRollback)
+	// A rollback is a second deploy attempt of the same project, so it passes
+	// the same review gate as a fresh deployment before the approval machine.
+	if err = s.requireApprovedReview(ctx, tx, source.ProjectID, target.Environment, reviewID); err != nil {
+		return Deployment{}, err
+	}
+	deployment, err := s.enqueueDeployment(ctx, tx, actor, source.ProjectID, target, version, "", reviewID, source.ID, ActionDeployRollback)
 	if err != nil {
 		return Deployment{}, err
 	}

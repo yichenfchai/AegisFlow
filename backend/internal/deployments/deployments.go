@@ -98,6 +98,13 @@ type Options struct {
 	ApprovalWebhookSecret []byte
 	// ApprovalWebhookTimeout bounds one webhook delivery; zero means 5s.
 	ApprovalWebhookTimeout time.Duration
+	// RequireReviewEnvironments lists target environments whose deployments must
+	// reference an approved review of the same project. Nil or an explicitly
+	// empty slice disables the gate (the default), so the review gate is opt-in
+	// and an upgrade keeps the pre-gate behavior. It composes with
+	// ApprovalEnvironments: the review is checked first, then the approval state
+	// machine decides whether execution still needs a release approval.
+	RequireReviewEnvironments []string
 	// HealthCheckAttempts is how many times the worker probes the target's
 	// health path after a 2xx deploy response; 0 disables the post-deploy
 	// check. cmd/server passes the configured value, whose default is 3.
@@ -176,7 +183,11 @@ type Service struct {
 	// approvalEnvironments is the set of target environments that need a
 	// pending approval before the worker may claim the deployment.
 	approvalEnvironments map[string]bool
-	approvalTTL          time.Duration
+	// reviewEnvironments is the set of target environments that require an
+	// approved review before a deployment row may even be created. Empty (the
+	// default) disables the review gate.
+	reviewEnvironments map[string]bool
+	approvalTTL        time.Duration
 	// Approval notifications use a transactional outbox stored in
 	// approval_notifications; an empty webhookURL disables enqueueing.
 	webhookURL    string
@@ -225,6 +236,12 @@ func New(db *sql.DB, opts Options) *Service {
 	for _, environment := range environments {
 		approvalSet[environment] = true
 	}
+	// The review gate has no default environment: nil/empty leaves the set
+	// empty, which keeps deployment creation unchanged for existing installs.
+	reviewEnvironments := make(map[string]bool, len(opts.RequireReviewEnvironments))
+	for _, environment := range opts.RequireReviewEnvironments {
+		reviewEnvironments[environment] = true
+	}
 	approvalTTL := opts.ApprovalTTL
 	if approvalTTL <= 0 {
 		approvalTTL = defaultApprovalTTL
@@ -266,6 +283,7 @@ func New(db *sql.DB, opts Options) *Service {
 		deployTimeout:          deployTimeout,
 		httpClient:             client,
 		approvalEnvironments:   approvalSet,
+		reviewEnvironments:     reviewEnvironments,
 		approvalTTL:            approvalTTL,
 		webhookURL:             opts.ApprovalWebhookURL,
 		webhookSecret:          append([]byte(nil), opts.ApprovalWebhookSecret...),

@@ -148,7 +148,7 @@ func TestDeploymentReadsFollowProjectVisibility(t *testing.T) {
 	if _, err := s.CancelDeployment(ctx, accessMember, maintainedDeployment.ID); err != nil {
 		t.Fatalf("maintainer cancel = %v, want ok", err)
 	}
-	if _, err := s.RollbackDeployment(ctx, accessMember, hidden.ID); !errors.Is(err, ErrNotFound) {
+	if _, err := s.RollbackDeployment(ctx, accessMember, hidden.ID, ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("member rollback hidden = %v, want not found", err)
 	}
 }
