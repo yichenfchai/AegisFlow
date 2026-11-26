@@ -10,6 +10,7 @@ import {
 } from '@/api/deployTasks'
 import { projectsAPI } from '@/api/projects'
 import { reviewsAPI, reviewOptionLabel, type Review } from '@/api/reviews'
+import { policiesAPI, policyGateHints } from '@/api/policies'
 import { ApiError } from '@/api/http'
 import { errorText } from '@/api/errors'
 
@@ -18,7 +19,7 @@ const VERSION_PATTERN = /^[A-Za-z0-9._+-]{1,64}$/
 function createError(cause: unknown): string {
   if (cause instanceof ApiError) {
     if (cause.status === 400) {
-      return '请求不合法：检查版本格式（1-64 位字母、数字、. _ + -）、目标是否启用、构建 ID 是否为本项目的成功构建；若目标环境启用了审查门禁，请先选择一条该项目已批准的审查（没有则先到审查中心发起并等待批准）'
+      return '请求不合法：检查版本格式（1-64 位字母、数字、. _ + -）、目标是否启用、构建 ID 是否为本项目的成功构建；若目标环境或项目策略启用了审查门禁，请先选择一条该项目已批准的审查（没有则先到审查中心发起并等待批准）；若项目策略要求最新扫描通过，请先由外部扫描工具回写一条通过的扫描'
     }
     if (cause.status === 403) return '你在该项目没有部署权限：需要项目维护者或被允许的成员角色'
     if (cause.status === 404) return '项目不存在、对你不可见，或你在该项目没有写权限'
@@ -52,15 +53,23 @@ export function DeploymentNewPage() {
     staleTime: 60_000,
   })
   // 可选「关联网关审查」：仅该项目已批准的审查；门禁环境要求必须关联，默认关闭时可选。
+  // 每次进入表单都重新拉取：刚刚批准的审查必须立即可选，不能被缓存挡住。
   const approvedReviewsQuery = useQuery({
     queryKey: ['project-reviews', projectId, 'approved'],
     queryFn: () => reviewsAPI.listByProject(projectId, { status: 'approved', limit: 100 }),
     enabled: projectId !== '',
-    staleTime: 30_000,
+  })
+  // 项目自动化策略：开启 requireReview 或 requiredScanVerdict=passed 时在表单给出中文提示。
+  // 门禁配置同样每次进入表单重新拉取，避免刚保存的策略在缓存里过期。
+  const policyQuery = useQuery({
+    queryKey: ['project-policy', projectId],
+    queryFn: () => policiesAPI.get(projectId),
+    enabled: projectId !== '',
   })
   const projects = projectsQuery.data?.items ?? []
   const targets = targetsQuery.data?.items ?? []
   const approvedReviews: Review[] = approvedReviewsQuery.data?.items ?? []
+  const policyHints = policyQuery.data ? policyGateHints(policyQuery.data) : []
 
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault()
@@ -123,9 +132,23 @@ export function DeploymentNewPage() {
             ))}
           </Select>
         </Field>
+        {policyHints.length > 0 && (
+          <div
+            role="status"
+            className="rounded border border-warning/40 bg-warning/10 px-space-lg py-space-md text-body-sm text-on-surface-variant space-y-space-xs"
+          >
+            {policyHints.map((hint) => (
+              <p key={hint}>{hint}</p>
+            ))}
+          </div>
+        )}
         <Field
           label="关联网关审查"
-          hint="选填；只列出该项目已批准的审查。目标环境启用审查门禁时必须关联"
+          hint={
+            policyQuery.data?.requireReview
+              ? '该项目策略要求关联已批准审查：创建与回滚部署必须选择一条本项目已批准的审查'
+              : '选填；只列出该项目已批准的审查。目标环境启用审查门禁时必须关联'
+          }
           htmlFor="deploy-review"
         >
           <Select

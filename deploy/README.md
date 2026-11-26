@@ -84,6 +84,7 @@ nginx -t && nginx -s reload
 - 审查外部结果回写（可选，P5-A E4）：设置 `AEGIS_REVIEW_WEBHOOK_SECRET`（16–256 字节）后启用 `POST /api/v1/reviews/{id}/external-results`，第三方工具以 `X-AegisFlow-Timestamp`（±300s）、`X-AegisFlow-Signature`（HMAC-SHA256）与 `X-AegisFlow-Delivery`（幂等键）回写只读结果；未设置时该接口返回 503，读取接口仍可用。外部结果不改变审查状态或部署门禁。密钥未设置/非法不会影响出站审批与审查通知通道。
 - 扫描结果与防御事件回写（可选，P5 剩余模块批次 A）：设置 `AEGIS_INGEST_WEBHOOK_SECRET`（16–256 字节，与审查回写密钥独立）后启用 `POST /api/v1/projects/{id}/scans` 与 `POST /api/v1/security-events`，外部扫描/检测工具使用相同的 `X-AegisFlow-Timestamp`/`X-AegisFlow-Signature`/`X-AegisFlow-Delivery` 约定回写（delivery 幂等，`Content-Type: application/json`）；未设置时两个入站接口返回 503，扫描读取接口与防御事件 admin 读取/确认接口仍可用。平台不自研扫描或检测引擎，扫描结果按项目可见性只读展示，防御事件仅管理员可确认（同事务写审计）。
 - 部署审查门禁（可选，P5-A E2）：`AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS` 未设置或为空（默认）时不启用，部署创建/回滚行为与之前完全一致。用逗号分隔填写 `development`/`staging`/`production` 后，这些环境的部署创建与回滚必须引用**同一项目**已批准审查的 `reviewId`；缺失、跨项目或未批准统一返回 400 `validation_failed`，请求不会进入审批队列。审查门禁与 `AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS` **叠加**：先校验审查，再走审批状态机。部署行会快照 `deployments.review_id`（schema v12，可空），审计 detail 追加 `review=<id>`。启用前先确认全部副本都升级到包含 v13 的版本：迁移账本不允许数据库版本高于代码支持范围，因此**升级后不能直接回退到旧二进制**，回退需同时恢复数据库备份（见「滚动升级」）。
+- 项目自动化策略（P5 剩余模块批次 C，schema v16）：策略是**数据库配置**，不新增环境变量；在项目「策略」页由全局 admin 或项目 maintainer 写入 `requireReview`/`requiredScanVerdict`。策略叠加在 `AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS` 之上，只会加严：`requireReview=true` 时任何目标环境都要求同项目已批准审查，`requiredScanVerdict=passed` 时项目最新一条扫描必须存在且结论为 passed；无策略行 = 默认关闭，既有部署行为不变。创建与回滚走同一套门禁（审查 → 最新扫描 → 审批），命中策略时审计 detail 追加 `policy=<projectId>`。与既有门禁一样，迁移账本不允许数据库版本高于代码支持范围：升级到包含 v16 的版本后**不能直接回退到旧二进制**，回退需同时恢复数据库备份（见「滚动升级」）。审计 CSV 导出（admin-only）只读 `auth_audit`，不改变任何部署状态，也不存在额外的数据面依赖。
 - 多人使用不等于已支持多租户隔离；其余业务对象级权限按 TODO 推进。
 - 部署目标 endpoint 由 admin 配置，admin 是可信配置者，目标 endpoint 属于受信配置面：允许私网/回环（自托管内网场景），拒绝 link-local 与云元数据地址（169.254.0.0/16、fe80::/10、100.100.100.200、fd00:ec2::254）；创建/更新返回 400，运行时在连接建立前按解析后的 IP 再校验一次（防 DNS rebinding）。
 
@@ -93,14 +94,14 @@ nginx -t && nginx -s reload
 
 | 对象 | 说明 | 丢失的后果 |
 | --- | --- | --- |
-| PostgreSQL 数据 | 用户、密码哈希、会话/refresh 哈希、项目、构建与构建日志、部署目标（含密文 `secret_cipher`）、部署任务与部署事件、审批、审批通知 outbox、审查记录与部署的审查引用（`deployments.review_id`）、审查外部结果与审查通知 outbox、审计 | 无法恢复账号、历史、审查记录与待处理审批；未投递的通知事件丢失（审批/审查状态本身在各自业务表） |
+| PostgreSQL 数据 | 用户、密码哈希、会话/refresh 哈希、项目、构建与构建日志、部署目标（含密文 `secret_cipher`）、部署任务与部署事件、审批、审批通知 outbox、审查记录与部署的审查引用（`deployments.review_id`）、审查外部结果与审查通知 outbox、项目自动化策略（`project_policies`）、审计 | 无法恢复账号、历史、审查记录与待处理审批；未投递的通知事件丢失（审批/审查状态本身在各自业务表）；项目策略丢失后该项目回到默认关闭门禁（部署不再被策略拦截） |
 | `AEGIS_SECRET_KEY` | 部署目标凭据的 AES-256-GCM 当前密钥（base64 恰好 32 字节） | `deployment_targets.secret_cipher` 永久不可解密；受影响目标无法鉴权调用，只能重新录入凭据 |
 | `AEGIS_SECRET_KEY_PREVIOUS` | 密钥轮换期间只用于解密旧密文的退役密钥 | 轮换未完成时旧密文同样不可解密，`rekey` 无法迁移；轮换完成并移除后可不备份 |
 | `AEGIS_JWT_SECRET` | 签发 access/refresh 的密钥 | 全部会话失效，用户需重新登录（数据不丢） |
 | 入口 TLS 私钥 | 证书私钥 | 需重新签发证书 |
 | 部署配置 | 环境变量清单（只写密钥存放位置，不含明文）、编排文件、外部依赖连接信息 | 灾难恢复时需要重建 |
 
-`AEGIS_SECRET_KEY`（及轮换期的 `AEGIS_SECRET_KEY_PREVIOUS`）必须与数据库备份**分开**保存：只有数据库备份而没有密钥，部署目标凭据永久不可解密；两者同时泄漏则等价于凭据泄漏。备份里同时包含 `deployment_targets`、`deployments`、`deployment_events`、`approvals`、`approval_notifications`、`reviews`、`review_external_results`、`review_notifications` 等部署治理数据，恢复时整库恢复，不要单独重建这些表。
+`AEGIS_SECRET_KEY`（及轮换期的 `AEGIS_SECRET_KEY_PREVIOUS`）必须与数据库备份**分开**保存：只有数据库备份而没有密钥，部署目标凭据永久不可解密；两者同时泄漏则等价于凭据泄漏。备份里同时包含 `deployment_targets`、`deployments`、`deployment_events`、`approvals`、`approval_notifications`、`reviews`、`review_external_results`、`review_notifications`、`project_policies` 等部署治理数据，恢复时整库恢复，不要单独重建这些表。
 
 Redis **不需要备份**：它只保存登录限流计数与 namespace，丢失只会重置配额；重启后 readyz 短暂返回 503、新登录被拒，连接恢复即恢复。不要把 Redis 当作会话或业务存储。
 

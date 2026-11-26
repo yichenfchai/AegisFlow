@@ -40,15 +40,14 @@ function parseRetryAfter(value: string | null): number | undefined {
   return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined
 }
 
-export async function httpRequest<T>(path: string, init: RequestInit = {}, token?: string): Promise<T> {
-  const headers = new Headers(init.headers)
-  headers.set('Accept', 'application/json')
-  if (init.body !== undefined) headers.set('Content-Type', 'application/json')
-  if (token) headers.set('Authorization', `Bearer ${token}`)
+/**
+ * 统一发起 fetch：超时、主动取消与网络故障都归一为客户端 ApiError，文案由
+ * errors.ts 提供。JSON 与 Blob 两类请求共用同一套网络错误语义。
+ */
+async function fetchApi(path: string, init: RequestInit, headers: Headers): Promise<Response> {
   const timeoutSignal = init.signal ? undefined : AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-  let response: Response
   try {
-    response = await fetch(`${baseURL}${path}`, {
+    return await fetch(`${baseURL}${path}`, {
       ...init,
       headers,
       credentials: 'include',
@@ -64,6 +63,41 @@ export async function httpRequest<T>(path: string, init: RequestInit = {}, token
     }
     throw new ApiError(0, 'network_error', NETWORK_ERROR_TEXT)
   }
+}
+
+interface ErrorPayload {
+  error?: { code: string; message: string }
+  requestId?: string
+}
+
+/** 把已解析的错误封套归一为 ApiError；只信任 code 与 requestId。 */
+function apiErrorFromPayload(response: Response, payload: ErrorPayload): ApiError {
+  const code = payload.error?.code ?? 'request_failed'
+  const retryAfter =
+    response.status === 429 ? parseRetryAfter(response.headers.get('Retry-After')) : undefined
+  return new ApiError(response.status, code, apiErrorText(code, retryAfter), payload.requestId, retryAfter)
+}
+
+/**
+ * 把失败响应归一为 ApiError。非 JSON 错误体（代理/网关页）退回通用
+ * request_failed 文案，绝不渲染响应正文。
+ */
+async function errorFromResponse(response: Response): Promise<ApiError> {
+  let payload: ErrorPayload = {}
+  try {
+    payload = await response.json()
+  } catch {
+    // A non-JSON error body (proxy/page) still maps to the shared fallback text.
+  }
+  return apiErrorFromPayload(response, payload)
+}
+
+export async function httpRequest<T>(path: string, init: RequestInit = {}, token?: string): Promise<T> {
+  const headers = new Headers(init.headers)
+  headers.set('Accept', 'application/json')
+  if (init.body !== undefined) headers.set('Content-Type', 'application/json')
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const response = await fetchApi(path, init, headers)
   let payload: { data?: T; error?: { code: string; message: string }; requestId?: string }
   try {
     payload = await response.json()
@@ -71,22 +105,37 @@ export async function httpRequest<T>(path: string, init: RequestInit = {}, token
     throw new ApiError(response.status, 'invalid_response', apiErrorText('invalid_response'))
   }
   if (!response.ok) {
-    // 只信任 code 与 requestId；后端 message 可能包含内部实现细节，一律不渲染。
-    const code = payload.error?.code ?? 'request_failed'
-    const retryAfter =
-      response.status === 429 ? parseRetryAfter(response.headers.get('Retry-After')) : undefined
-    throw new ApiError(
-      response.status,
-      code,
-      apiErrorText(code, retryAfter),
-      payload.requestId,
-      retryAfter,
-    )
+    throw apiErrorFromPayload(response, payload)
   }
   if (!('data' in payload)) {
     throw new ApiError(response.status, 'invalid_response', apiErrorText('invalid_response'), payload.requestId)
   }
   return payload.data as T
+}
+
+/** Blob 下载结果：响应头用于读取 X-Audit-Truncated 这类元信息。 */
+export interface BlobPayload {
+  blob: Blob
+  headers: Headers
+}
+
+/**
+ * 下载型请求（例如审计 CSV 导出）：成功时返回 Blob 与响应头，失败时与
+ * httpRequest 一样把统一 JSON 错误封套归一为 ApiError。鉴权 token 由会话层注入。
+ */
+export async function httpBlobRequest(
+  path: string,
+  init: RequestInit = {},
+  token?: string,
+): Promise<BlobPayload> {
+  const headers = new Headers(init.headers)
+  headers.set('Accept', 'text/csv')
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const response = await fetchApi(path, init, headers)
+  if (!response.ok) {
+    throw await errorFromResponse(response)
+  }
+  return { blob: await response.blob(), headers: response.headers }
 }
 export const authAPI = {
   login: (username: string, password: string, remember: boolean) => httpRequest<AuthSession>('/auth/login', { method: 'POST', body: JSON.stringify({ username, password, remember }) }),

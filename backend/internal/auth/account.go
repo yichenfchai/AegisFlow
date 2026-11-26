@@ -514,6 +514,54 @@ func (s *Service) ListAudit(ctx context.Context, filter AuditFilter, limit, offs
 	return entries, total, rows.Err()
 }
 
+// AuditExportMaxRows bounds one CSV audit export. The export endpoint reports
+// X-Audit-Truncated when more rows match, so the client can narrow the filters
+// instead of silently receiving a partial report.
+const AuditExportMaxRows = 10000
+
+// ExportAudit returns at most limit matching entries, newest first, and reports
+// whether more rows exist beyond the limit. Filtering and ordering match
+// ListAudit exactly, so the CSV export mirrors the audit page; the caller owns
+// the response format and the documented header cap. Raising the limit above
+// AuditExportMaxRows is refused: the endpoint must stay bounded.
+func (s *Service) ExportAudit(ctx context.Context, filter AuditFilter, limit int) ([]AuditEntry, bool, error) {
+	if err := s.valid(); err != nil {
+		return nil, false, err
+	}
+	if limit < 1 || limit > AuditExportMaxRows {
+		return nil, false, fmt.Errorf("%w: export limit must be 1-%d", ErrValidation, AuditExportMaxRows)
+	}
+	if err := filter.validate(); err != nil {
+		return nil, false, err
+	}
+	where, args := filter.where()
+	// Read one extra row: its presence is the truncation signal, and it is never
+	// returned to the caller.
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id
+	 FROM auth_audit`+where+fmt.Sprintf(` ORDER BY created_at DESC,id DESC LIMIT $%d`, len(args)), args...)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	entries := make([]AuditEntry, 0, limit)
+	for rows.Next() {
+		var e AuditEntry
+		if err = rows.Scan(&e.ID, &e.CreatedAt, &e.ActorID, &e.ActorUsername, &e.Action, &e.ObjectType, &e.ObjectID, &e.Result, &e.Detail, &e.RequestID); err != nil {
+			return nil, false, err
+		}
+		entries = append(entries, e)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, false, err
+	}
+	truncated := len(entries) > limit
+	if truncated {
+		entries = entries[:limit]
+	}
+	return entries, truncated, nil
+}
+
 // PurgeAudit deletes audit rows older than the cutoff (inclusive Unix seconds)
 // and returns how many were removed. The cleanup job only calls this when the
 // operator configures AEGIS_AUDIT_RETENTION; zero disables deletion entirely.

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, httpRequest } from './http'
+import { ApiError, httpBlobRequest, httpRequest } from './http'
 import { FALLBACK_ERROR_TEXT, NETWORK_ERROR_TEXT, TIMEOUT_ERROR_TEXT } from './errors'
 
 function jsonResponse(status: number, body: unknown, headers: Record<string, string> = {}) {
@@ -122,5 +122,51 @@ describe('httpRequest error localization', () => {
     const call = fetchMock.mock.calls[0]
     expect(call?.[0]).toBe('/api/v1/ping')
     expect(new Headers(call?.[1]?.headers).get('Authorization')).toBe('Bearer token-1')
+  })
+})
+
+describe('httpBlobRequest', () => {
+  it('returns the blob and response headers and sends the bearer token', async () => {
+    const fetchMock = stubFetch(
+      async () =>
+        new Response('id,createdAt,action\r\n', {
+          status: 200,
+          headers: { 'Content-Type': 'text/csv; charset=utf-8', 'X-Audit-Truncated': 'true' },
+        }),
+    )
+    const result = await httpBlobRequest('/audit/export.csv', {}, 'token-1')
+    expect(result.blob).toBeInstanceOf(Blob)
+    await expect(result.blob.text()).resolves.toBe('id,createdAt,action\r\n')
+    expect(result.headers.get('X-Audit-Truncated')).toBe('true')
+    const call = fetchMock.mock.calls[0]
+    expect(call?.[0]).toBe('/api/v1/audit/export.csv')
+    const headers = new Headers(call?.[1]?.headers)
+    expect(headers.get('Authorization')).toBe('Bearer token-1')
+    expect(headers.get('Accept')).toBe('text/csv')
+  })
+
+  it('localizes JSON error envelopes without leaking the backend message', async () => {
+    stubFetch(async () => jsonResponse(403, errorEnvelope('forbidden', 'internal detail')))
+    const error = await captureApiError(httpBlobRequest('/audit/export.csv', {}, 'token-1'))
+    expect(error.status).toBe(403)
+    expect(error.code).toBe('forbidden')
+    expect(error.message).toBe('当前账号没有执行该操作的权限')
+    expect(error.message).not.toContain('internal detail')
+  })
+
+  it('maps a non-JSON error body to the fallback text without exposing it', async () => {
+    stubFetch(async () => new Response('<html>proxy detail</html>', { status: 502 }))
+    const error = await captureApiError(httpBlobRequest('/audit/export.csv'))
+    expect(error.status).toBe(502)
+    expect(error.code).toBe('request_failed')
+    expect(error.message).toBe(FALLBACK_ERROR_TEXT)
+    expect(error.message).not.toContain('proxy detail')
+  })
+
+  it('localizes network failures like httpRequest', async () => {
+    stubFetch(() => Promise.reject(new TypeError('fetch failed')))
+    const error = await captureApiError(httpBlobRequest('/audit/export.csv'))
+    expect(error.code).toBe('network_error')
+    expect(error.message).toBe(NETWORK_ERROR_TEXT)
   })
 })

@@ -1,6 +1,6 @@
 import { create } from 'zustand'
-import { ApiError, authAPI, httpRequest } from '@/api/http'
-import type { AuthSession, SessionUser } from '@/api/http'
+import { ApiError, authAPI, httpBlobRequest, httpRequest } from '@/api/http'
+import type { AuthSession, BlobPayload, SessionUser } from '@/api/http'
 import { errorText } from '@/api/errors'
 
 export type { SessionUser }
@@ -138,18 +138,29 @@ export async function accessTokenForRequest(): Promise<string> {
   return useSession.getState().accessToken!
 }
 // One refresh and at most one retry per request. A late 401 reuses a token already refreshed by a peer request.
-export async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+// The send callback lets JSON and Blob calls share the same retry/session-expiry semantics.
+async function withAuthRetry<T>(send: (token: string) => Promise<T>): Promise<T> {
   const token = await accessTokenForRequest()
   const expected = revision
-  try { return await httpRequest<T>(path, init, token) } catch (error) {
+  try { return await send(token) } catch (error) {
     if (!isUnauthorized(error)) throw error
     if (expected !== revision) throw error
     if (useSession.getState().accessToken === token) await refreshSession()
-    try { return await httpRequest<T>(path, init, useSession.getState().accessToken!) } catch (retryError) {
+    try { return await send(useSession.getState().accessToken!) } catch (retryError) {
       if (expected === revision && isUnauthorized(retryError)) { revision++; clearSession(); channel?.postMessage({ type: 'logout' }) }
       throw retryError
     }
   }
+}
+export function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return withAuthRetry((token) => httpRequest<T>(path, init, token))
+}
+/**
+ * 下载型请求（审计 CSV 导出）：成功时返回 Blob 与响应头，失败时仍归一为
+ * ApiError，并复用同一刷新/过期语义。
+ */
+export function apiBlobRequest(path: string, init: RequestInit = {}): Promise<BlobPayload> {
+  return withAuthRetry((token) => httpBlobRequest(path, init, token))
 }
 channel?.addEventListener('message', (event: MessageEvent) => {
   if (event.data?.type !== 'logout' && event.data?.type !== 'changed') return

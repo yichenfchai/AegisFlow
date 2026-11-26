@@ -23,6 +23,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/deployments"
 	"github.com/yichenfchai/AegisFlow/backend/internal/knowledge"
 	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
+	"github.com/yichenfchai/AegisFlow/backend/internal/policies"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 	"github.com/yichenfchai/AegisFlow/backend/internal/reviews"
@@ -62,7 +63,10 @@ type Server struct {
 	knowledge *knowledge.Service
 	// secrets is the admin-only write-only secret store; values are never
 	// returned by any handler.
-	secrets      *secrets.Service
+	secrets *secrets.Service
+	// policies is the per-project automation policy store; deployment creation
+	// and rollback read it through the deployment service.
+	policies     *policies.Service
 	logger       *slog.Logger
 	ready        func(context.Context) error
 	origins      map[string]bool
@@ -125,6 +129,11 @@ type Options struct {
 	// 503. A non-nil store without an encryption key still serves metadata and
 	// answers 503 secrets_not_configured on create/rotate.
 	Secrets *secrets.Service
+	// Policies enables the per-project automation-policy routes; nil fails
+	// closed with 503. The deployment service reads the same rows through its
+	// own injected gate, so a deployment created without this wiring simply has
+	// the policy gate disabled (the pre-policy behavior).
+	Policies *policies.Service
 	// ReviewWebhookSecret verifies signed inbound external review results
 	// (AEGIS_REVIEW_WEBHOOK_SECRET). Empty keeps the external-results endpoint
 	// closed with 503; the read route stays available to authenticated viewers.
@@ -154,7 +163,7 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 		shutdownCtx = context.Background()
 	}
 	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, reviews: opts.Reviews,
-		scans: opts.Scans, securityEvents: opts.SecurityEvents, knowledge: opts.Knowledge, secrets: opts.Secrets,
+		scans: opts.Scans, securityEvents: opts.SecurityEvents, knowledge: opts.Knowledge, secrets: opts.Secrets, policies: opts.Policies,
 		logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure,
 		reviewWebhookSecret: append([]byte(nil), opts.ReviewWebhookSecret...),
 		ingestWebhookSecret: append([]byte(nil), opts.IngestWebhookSecret...),
@@ -197,6 +206,9 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	users.POST("/:id/password-reset", s.resetPassword)
 	audit := api.Group("/audit", s.authenticate(), s.requireAdmin())
 	audit.GET("", s.listAudit)
+	// CSV export reuses the list filters; it is bounded and reports truncation
+	// through X-Audit-Truncated instead of silently dropping rows.
+	audit.GET("/export.csv", s.exportAuditCSV)
 	projectRoutes := api.Group("/projects", s.authenticate())
 	projectRoutes.GET("", s.listProjects)
 	projectRoutes.POST("", s.requireRole("admin", "member"), s.createProject)
@@ -218,6 +230,11 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	// write/maintainer overlays, exactly like the deployment routes.
 	projectRoutes.GET("/:id/reviews", s.listReviews)
 	projectRoutes.POST("/:id/reviews", s.createReview)
+	// Per-project automation policy: readable by anyone who can see the project
+	// (it explains why a deployment was gated), writable by an admin or a
+	// project maintainer. The service owns both checks.
+	projectRoutes.GET("/:id/policy", s.getProjectPolicy)
+	projectRoutes.PUT("/:id/policy", s.putProjectPolicy)
 	buildRoutes := api.Group("/builds", s.authenticate())
 	buildRoutes.GET("", s.listBuilds)
 	buildRoutes.GET("/:id", s.getBuild)
@@ -1305,7 +1322,7 @@ func (s *Server) checkDeploymentTarget(c *gin.Context) {
 func (s *Server) deploymentError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, deployments.ErrValidation):
-		s.fail(c, 400, "validation_failed", "project, target, version, buildId, reviewId or approval reason is invalid, the target is disabled, an approved review of this project is required for the target environment, no earlier succeeded version can be rolled back to, or the request is not acceptable")
+		s.fail(c, 400, "validation_failed", "project, target, version, buildId, reviewId or approval reason is invalid, the target is disabled, an approved review of this project is required (environment or project policy), the project policy may require the latest scan verdict to be passed, no earlier succeeded version can be rolled back to, or the request is not acceptable")
 	case errors.Is(err, deployments.ErrConflict):
 		s.fail(c, 409, "conflict", "deployment or approval is already terminal, is not in the expected state for this operation, or the deployment is no longer awaiting approval")
 	case errors.Is(err, deployments.ErrNotFound):
@@ -1867,7 +1884,9 @@ func (s *Server) middleware() gin.HandlerFunc {
 			}
 			c.Header("Access-Control-Allow-Origin", origin)
 			c.Header("Access-Control-Allow-Credentials", "true")
-			c.Header("Access-Control-Expose-Headers", "X-Request-ID")
+			// X-Audit-Truncated must be readable by the audit page's blob download;
+			// Content-Disposition stays server-side because the client names the file.
+			c.Header("Access-Control-Expose-Headers", "X-Request-ID, X-Audit-Truncated")
 		}
 		if c.Request.Method == http.MethodOptions {
 			c.Writer.Header().Add("Vary", "Access-Control-Request-Method")

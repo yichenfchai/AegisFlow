@@ -371,6 +371,22 @@ var Migrations = [][]string{{
 	 created_by TEXT NOT NULL,
 	 created_at BIGINT NOT NULL,
 	 updated_at BIGINT NOT NULL)`,
+}, {
+	// Per-project automation policy (P5 remaining modules, batch C). One row per
+	// project; a project without a row uses the default policy (require_review
+	// false, required_scan_verdict 'none'), so an upgrade keeps every existing
+	// deployment path unchanged. The policy composes with the environment review
+	// gate (AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS) and the approval state
+	// machine: it can only add requirements, never remove them. updated_by is a
+	// denormalized actor id like every other module, not a foreign key. No
+	// secret, token or request body is stored here: the two gate values are the
+	// whole policy.
+	`CREATE TABLE project_policies (
+	 project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+	 require_review BOOLEAN NOT NULL DEFAULT false,
+	 required_scan_verdict TEXT NOT NULL DEFAULT 'none' CHECK(required_scan_verdict IN ('none','passed')),
+	 updated_by TEXT NOT NULL,
+	 updated_at BIGINT NOT NULL)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped
