@@ -262,6 +262,39 @@ var Migrations = [][]string{{
 	// this review" lookups without indexing the common NULL rows.
 	`ALTER TABLE deployments ADD COLUMN review_id TEXT REFERENCES reviews(id) ON DELETE SET NULL`,
 	`CREATE INDEX deployments_review_idx ON deployments(review_id) WHERE review_id IS NOT NULL`,
+}, {
+	// Review center external integration (P5-A E4). review_external_results stores
+	// one immutable result per signed inbound delivery: delivery_id is globally
+	// unique so a retried webhook is idempotent, and the review foreign key
+	// cascades on delete like the review itself. review_notifications is the
+	// transactional outbox for review events delivered over the shared approval
+	// webhook channel; UNIQUE(review_id,event) makes repeated idempotent
+	// transitions unable to enqueue duplicates. both tables only ever hold
+	// review-scoped data: subject/description/version/externalUrl and the actor
+	// ids, never credentials, request headers or webhook secrets.
+	`CREATE TABLE review_external_results (
+	 id TEXT PRIMARY KEY,
+	 review_id TEXT NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+	 delivery_id TEXT NOT NULL UNIQUE,
+	 source TEXT NOT NULL,
+	 verdict TEXT NOT NULL CHECK(verdict IN ('passed','failed','warning')),
+	 summary TEXT NOT NULL DEFAULT '',
+	 url TEXT,
+	 received_at BIGINT NOT NULL)`,
+	`CREATE INDEX review_external_results_review_idx ON review_external_results(review_id, received_at DESC, id)`,
+	`CREATE TABLE review_notifications (
+	 id TEXT PRIMARY KEY,
+	 review_id TEXT NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+	 event TEXT NOT NULL CHECK(event IN ('review.requested','review.approved','review.rejected','review.cancelled')),
+	 payload JSONB NOT NULL,
+	 status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','delivered','failed')),
+	 attempts INTEGER NOT NULL DEFAULT 0,
+	 next_attempt_at BIGINT NOT NULL,
+	 last_error TEXT NOT NULL DEFAULT '',
+	 delivered_at BIGINT,
+	 created_at BIGINT NOT NULL,
+	 UNIQUE (review_id, event))`,
+	`CREATE INDEX review_notifications_pending_idx ON review_notifications(status, next_attempt_at, id)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped

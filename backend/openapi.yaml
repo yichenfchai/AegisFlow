@@ -61,7 +61,7 @@ tags:
   - name: Approvals
     description: Admin-only deployment approval queue (approve, reject, expiry)
   - name: Reviews
-    description: Project review center (gate-style change reviews) with maintainer/admin decisions, cancellation and a per-project number sequence
+    description: Project review center (gate-style change reviews) with maintainer/admin decisions, cancellation, a per-project number sequence, signed inbound external results and review-event notifications over the shared approval webhook channel
   - name: Audit
     description: Persistent authentication and account-management audit trail
   - name: Health
@@ -2096,6 +2096,109 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/reviews/{reviewId}/external-results:
+    get:
+      tags: [Reviews]
+      operationId: listReviewExternalResults
+      summary: List external review results (visible projects)
+      description: |
+        Newest first, capped at the 50 most recent rows. The read follows the
+        same project visibility predicate as the review: an invisible project
+        answers 404 so private review ids stay non-enumerable. External results
+        are evidence only; they never change the review status.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: reviewId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: External result list, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ReviewExternalResultList' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Reviews]
+      operationId: ingestReviewExternalResult
+      summary: Append a signed external review result (HMAC webhook, no session)
+      description: |
+        Machine-to-machine webhook for external scanners or review tools. It is
+        not a browser session route and requires no Bearer token: the caller
+        proves possession of AEGIS_REVIEW_WEBHOOK_SECRET by signing the exact raw
+        body. Required headers: X-AegisFlow-Timestamp (Unix seconds, within 300s
+        of the server clock), X-AegisFlow-Signature
+        (sha256=<hex HMAC-SHA256(secret, timestamp + "." + rawBody)>) and
+        X-AegisFlow-Delivery (8-128 characters of A-Z a-z 0-9 . _ -, the
+        idempotency key). A missing, malformed, stale or future-dated signature
+        header is 401. The payload appends one immutable result to an existing
+        review and never changes the review state machine. A repeated delivery
+        id returns the stored result with 200 (no new row); a new delivery
+        returns 201. Unknown review ids are 404. When AEGIS_REVIEW_WEBHOOK_SECRET
+        is unset the whole endpoint answers 503 while the GET route stays
+        available to authenticated readers.
+      security: []
+      parameters:
+        - name: reviewId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+        - { $ref: '#/components/parameters/ExternalResultTimestamp' }
+        - { $ref: '#/components/parameters/ExternalResultSignature' }
+        - { $ref: '#/components/parameters/ExternalResultDelivery' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateReviewExternalResultInput' }
+      responses:
+        '201':
+          description: External result appended
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ReviewExternalResult' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '200':
+          description: Delivery id already stored; the original result is returned unchanged
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ReviewExternalResult' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Missing, invalid, stale or future-dated X-AegisFlow signature headers or delivery id; error.code is unauthorized
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503':
+          description: AEGIS_REVIEW_WEBHOOK_SECRET is not configured; error.code is dependencies_unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
 components:
   securitySchemes:
     bearerAuth:
@@ -2127,6 +2230,24 @@ components:
       required: false
       description: Zero-based page offset
       schema: { type: integer, minimum: 0, default: 0 }
+    ExternalResultTimestamp:
+      name: X-AegisFlow-Timestamp
+      in: header
+      required: true
+      description: Unix seconds; must be within 300s of the server clock (replay window)
+      schema: { type: integer, format: int64 }
+    ExternalResultSignature:
+      name: X-AegisFlow-Signature
+      in: header
+      required: true
+      description: 'sha256=<hex HMAC-SHA256(AEGIS_REVIEW_WEBHOOK_SECRET, timestamp + "." + rawBody)>'
+      schema: { type: string, pattern: '^sha256=[a-f0-9]{64}$' }
+    ExternalResultDelivery:
+      name: X-AegisFlow-Delivery
+      in: header
+      required: true
+      description: 8-128 characters of A-Z a-z 0-9 . _ -; the sender's idempotency key
+      schema: { type: string, pattern: '^[A-Za-z0-9._-]{8,128}$' }
   requestBodies:
     EmptyObject:
       required: true
@@ -2609,6 +2730,38 @@ components:
       required: [reason]
       properties:
         reason: { type: string, minLength: 1, maxLength: 512, description: 'Required; trimmed; at most 512 UTF-8 bytes on one line; no control characters; stored and included in the audit detail' }
+    ReviewExternalResult:
+      type: object
+      additionalProperties: false
+      required: [id, reviewId, deliveryId, source, verdict, summary, url, receivedAt]
+      properties:
+        id: { type: string }
+        reviewId: { type: string }
+        deliveryId: { type: string, description: Sender delivery id; globally unique and the idempotency key for retries }
+        source: { type: string, description: 'External tool name: 1-64 UTF-8 bytes on one line, trimmed' }
+        verdict: { type: string, enum: [passed, failed, warning] }
+        summary: { type: string, description: 'At most 500 UTF-8 bytes; newlines preserved, other control characters removed; empty when the delivery carried no note' }
+        url: { type: string, description: 'Empty when absent; otherwise an absolute http(s) URL without userinfo or fragment, at most 2048 UTF-8 bytes; display-only and never fetched' }
+        receivedAt: { type: integer, format: int64, description: Unix seconds when the server accepted the result }
+    ReviewExternalResultList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 50
+          description: Newest first (receivedAt descending)
+          items: { $ref: '#/components/schemas/ReviewExternalResult' }
+    CreateReviewExternalResultInput:
+      type: object
+      additionalProperties: false
+      required: [source, verdict]
+      properties:
+        source: { type: string, minLength: 1, maxLength: 64, description: Required external tool name; at most 64 UTF-8 bytes on one line, trimmed before validation }
+        verdict: { type: string, enum: [passed, failed, warning] }
+        summary: { type: string, maxLength: 500, description: Optional; at most 500 UTF-8 bytes; newlines preserved, other control characters removed }
+        url: { type: string, maxLength: 2048, description: 'Optional absolute http(s) URL without userinfo or fragment; display-only, never fetched' }
     AuditEntry:
       type: object
       additionalProperties: false

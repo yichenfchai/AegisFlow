@@ -51,6 +51,8 @@
 | POST /api/v1/reviews/{id}/approve | Bearer + 全局 admin 或项目 maintainer，JSON `{reason?}` | 200；重复批准幂等、终态 409 |
 | POST /api/v1/reviews/{id}/reject | Bearer + 全局 admin 或项目 maintainer，JSON `{reason}`（必填） | 200；重复拒绝幂等、终态 409 |
 | POST /api/v1/reviews/{id}/cancel | Bearer + 发起人或 admin/maintainer，JSON {} | 200；重复取消幂等、终态 409 |
+| POST /api/v1/reviews/{id}/external-results | **HMAC 签名（无用户会话）**：`X-AegisFlow-Timestamp`（±300s）+ `X-AegisFlow-Signature`（HMAC-SHA256）+ `X-AegisFlow-Delivery`（8–128 `[A-Za-z0-9._-]`），JSON `{source,verdict,summary?,url?}` | 201；重复 `deliveryId` 幂等 200 返回既有记录；签名/时间戳/头缺失 401；未知审查 404；未配置 `AEGIS_REVIEW_WEBHOOK_SECRET` 503 |
+| GET /api/v1/reviews/{id}/external-results | Bearer（可见者） | `{items}`，按 receivedAt 倒序最多 50 条；不可见 404 |
 
 accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh token 不返回 JSON，由 HttpOnly、SameSite=Strict、Path=/api/v1/auth 的 Cookie 保存，无 Domain。勾选保持登录时 Cookie 持久化到绝对会话期限，未勾选使用 session Cookie；浏览器恢复会话可能保留 session Cookie，因此不承诺关闭窗口立即退出。主动退出以服务端撤销为准。默认绝对期限 30 天，由后端配置决定，刷新不延长。
 
@@ -94,11 +96,11 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 - 过期：持租约的 worker 每 30s（接管时先跑一次）扫描 `pending AND expires_at<=now`，每批最多 100 条、`FOR UPDATE SKIP LOCKED`；审批 `expired`（reason `approval expired`），部署 `rejected`（detail `approval expired`），每行写 `approval.expire` 审计（actor 为空）。
 - 取消交互：取消 `awaiting_approval` 部署时同一事务把审批置 `expired`（reason `deployment cancelled`，decided_at=now）并写 `approval.expire`；审批状态机没有 cancelled，因此复用 expired，重复取消不重复记账。
 - 审计：`approval.request`（`deployment=<id>`）、`approval.approve`（`deployment=<id>`）、`approval.reject`（`deployment=<id> reason=<...>` 可选）、`approval.expire`（`deployment=<id> reason=approval expired|deployment cancelled`），objectType `approval`，与状态变更同事务。
-- 通知（可选，P4.4）：`AEGIS_APPROVAL_WEBHOOK_URL` 非空时，审批请求与批准/拒绝/过期事件在和状态变更同一事务写入 outbox，并由独立 notifier 以至少一次语义投递。请求体是事件快照，不含凭据；可配置 `AEGIS_APPROVAL_WEBHOOK_SECRET` 做 HMAC-SHA256 签名，接收方按 `X-AegisFlow-Delivery` 幂等去重。投递失败重试后置 `failed`，不影响审批状态，也不写新的业务审计动作。URL 除回环地址外必须 https，超时默认 5s（最大 30s）。
+- 通知（可选，P4.4）：`AEGIS_APPROVAL_WEBHOOK_URL` 非空时，审批请求与批准/拒绝/过期事件在和状态变更同一事务写入 outbox，并由独立 notifier 以至少一次语义投递。请求体是事件快照，不含凭据；可配置 `AEGIS_APPROVAL_WEBHOOK_SECRET` 做 HMAC-SHA256 签名，接收方按 `X-AegisFlow-Delivery` 幂等去重。投递失败重试后置 `failed`，不影响审批状态，也不写新的业务审计动作。URL 除回环地址外必须 https，超时默认 5s（最大 30s）。同一通道自 P5-A E4 起也投递 `review.*` 事件（`review_notifications` outbox），接收方按 `X-AegisFlow-Event` 前缀路由，签名与重试语义一致。
 
 ### 审查中心（P5-A，门禁式）
 
-- 定位：对项目的一次变更（版本标签或外部构建链接）发起审查，由项目 maintainer 批准或拒绝，全程审计，并允许发起人/维护者取消；E2 起审查可接入部署门禁（见「部署审查门禁」），外部检查结果回写留待后续。
+- 定位：对项目的一次变更（版本标签或外部构建链接）发起审查，由项目 maintainer 批准或拒绝，全程审计，并允许发起人/维护者取消；E2 起审查可接入部署门禁（见「部署审查门禁」），E4 起外部工具可通过签名接口回写只读结果并触发审查事件通知。
 - 接口：`POST|GET /api/v1/projects/{projectId}/reviews`、`GET /api/v1/reviews`（全局列表，任何已登录角色，按项目可见性过滤，支持 `projectId`/`status`/分页）、`GET /api/v1/reviews/{id}`、`POST /api/v1/reviews/{id}/approve|reject|cancel`。
 - 授权：发起复用项目写权限（`projects.AuthorizeWrite`：admin，或可写项目的 member；不可见 404、可见但无权 403）；批准/拒绝要求**全局 admin 或该项目 maintainer**（`projects.AuthorizeDecide`，比写权限更严，public 项目的普通 member 不能决策）；取消允许发起人本人或 admin/maintainer。项目内列表与详情按项目可见性过滤，不可见一律 404；全局列表同样按可见性过滤，但 `projectId` 过滤不可见项目时返回空列表（与 `GET /api/v1/deployments` 一致，不可枚举）。
 - 校验：`subject` 必填、3–200 字节、单行（trim）；`description` ≤2000 字节；`version` ≤64 字节单行（trim）；`externalUrl` 可选、仅 http(s)、禁止 userinfo/fragment、≤2048 字节，只展示不抓取；批准/拒绝的 `reason` trim、单行、≤512 字节，拒绝必填。
@@ -112,6 +114,15 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 - 校验：创建部署与回滚的请求体可带可选 `reviewId`。提供时必须引用**同一项目**的 `approved` 审查；不存在、不可见、跨项目或未批准统一返回 400 `validation_failed`，不保留可用于枚举的差异。目标环境命中门禁列表时 `reviewId` 必填，缺失同样 400。
 - 快照与审计：部署行的 `review_id` 记录创建时的审查，接口响应的 `reviewId` 为空表示未走门禁；`deployment.create` / `deployment.rollback` 的审计 detail 追加 ` review=<id>`，不写审查正文。
 - 与审批叠加：门禁在审批状态机之前校验；命中审批环境时仍按 P4.3 进入 `awaiting_approval`，批准后才执行。门禁默认关闭，升级后既有部署行为不变（历史行 `review_id` 为 NULL，响应 `reviewId` 为空串）。
+
+### 审查外部结果与通知（P5-A E4）
+
+- 外部结果回写（入站）：`POST /api/v1/reviews/{id}/external-results` 是**无会话的机器接口**，由独立的 `AEGIS_REVIEW_WEBHOOK_SECRET`（16–256 字节）保护；未配置时该接口返回 503 `dependencies_unavailable`（消息 `review results are not configured`），设置不合法则启动失败。出站审查通知**复用** `AEGIS_APPROVAL_WEBHOOK_URL`/`AEGIS_APPROVAL_WEBHOOK_SECRET`/`AEGIS_APPROVAL_WEBHOOK_TIMEOUT`，同一接收端同时收到 `approval.*` 与 `review.*` 事件，不新增出站配置。
+- 签名与防重放：请求头 `X-AegisFlow-Timestamp`（Unix 秒，与服务器时间差 ≤300s）、`X-AegisFlow-Signature: sha256=<hex HMAC-SHA256(secret, timestamp + "." + rawBody)>`（对原始请求体字节签名，不是对 JSON 重编码后的内容）、`X-AegisFlow-Delivery`（8–128 字符 `[A-Za-z0-9._-]`，全局幂等键）。缺头、签名错误、时间戳超出窗口或格式非法统一 401；时间窗 + 签名覆盖时间戳可阻止捕获重放，`deliveryId` 使合法重试幂等。
+- 载荷与校验：严格 JSON（≤16 KiB、未知/`null` 字段拒绝）`{source,verdict,summary?,url?}`；`source` 必填 1–64 字节单行，`verdict ∈ passed|failed|warning`，`summary` ≤500 字节（保留换行、去除其他控制字符），`url` 可选、仅 http(s)、无 userinfo/fragment、≤2048 字节。同一 `deliveryId` 重复回写返回 200 + 既有记录（不新增）；未知审查 404；非法字段 400。**外部结果不改变审查状态机，也不改变部署门禁判定**，只是只读证据。
+- 读取：`GET /api/v1/reviews/{id}/external-results`（Bearer，项目可见者）按 `receivedAt` 倒序最多 50 条；不可见/不存在 404。响应不含签名头或密钥。
+- 出站通知：`review.requested`（创建）、`review.approved`/`review.rejected`（决策）、`review.cancelled`（取消）在与状态变更/审计同一事务写入 `review_notifications` outbox（`UNIQUE(review_id,event)` 防重复），payload 含 `deliveryId/event/occurredAt/project{id,name}/review{...快照...}`，不含凭据、Cookie、令牌或请求头；由独立 notifier 以 1s 轮询、`FOR UPDATE SKIP LOCKED` + claim lease、10s 起指数退避（上限 1h、最多 8 次）投递，成功 `delivered`、失败 `last_error` + `pending`/`failed`。投递头 `X-AegisFlow-Event`/`X-AegisFlow-Delivery`/`X-AegisFlow-Signature`（对 payload JSON 本体签名），至少一次语义，接收方按 delivery id 去重。通知失败不回滚审查状态。
+- 审计与迁移：外部结果与通知投递**不新增**业务审计动作（外部结果不是本地状态变更；通知重试不写业务审计）。schema v13 新增 `review_external_results` 与 `review_notifications` 两表及索引；两表 `review_id` 外键级联删除。外部结果的前端展示与 E2E 留待 E4B。
 
 ## 客户端会话生命周期
 
@@ -148,9 +159,10 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 | 读取其他 private 项目 | 允许 | 禁止（404） | 禁止（404） | 已实现（404 防枚举） |
 | 创建/修改项目、归档与恢复、修改可见性 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 已实现（可见性 + maintainer 叠加） |
 | 读取项目成员、增删改成员 | 允许 | public 允许；private 需项目 maintainer | 只读列表 | 已实现；创建者不可移除；成员变更写审计 |
-| 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 构建、部署与审查已实现（按项目可见性过滤）；审批仍 admin-only；扫描、知识待业务接口落实 |
+| 读取构建/部署/审查/扫描/知识信息 | 允许 | 允许 | 允许 | 构建、部署与审查（含外部结果读取）已实现（按项目可见性过滤）；审批仍 admin-only；扫描、知识待业务接口落实 |
 | 发起/取消/重试构建、发起审查 | 允许 | public 允许；private 需项目 maintainer | 禁止 | 构建与审查发起已实现（重试仅限终态，不可见 404；审查发起走同一写权限叠加） |
 | 批准/拒绝审查、取消他人审查 | 允许 | 仅该项目的 maintainer；发起人可取消本人的 pending 审查 | 禁止 | 已实现（`projects.AuthorizeDecide`，比写权限更严；终态 409，重复决策/取消幂等 200） |
+| 外部系统回写审查结果、接收审查通知 | —（HMAC，无用户会话） | — | — | 已实现（P5-A E4）：`AEGIS_REVIEW_WEBHOOK_SECRET` HMAC-SHA256 + ≤300s 时间窗 + delivery 幂等；只追加只读证据，不改审查状态；审查事件复用审批 Webhook 通道出站 |
 | 发起部署、回滚及执行审批 | 允许 | 允许（项目可写时）；审批仅 admin | 禁止 | 部署触发与回滚已实现（项目写权限叠加，P4.2）；P5-A E2 增加可配置审查门禁：目标环境命中 `AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS` 时要求已批准审查，默认关闭；审批仍 admin-only（P4.3） |
 | 管理部署目标、密钥、策略、设置、防御及业务审计 | 允许 | 禁止 | 禁止 | 部署目标已实现（admin-only，凭据加密存储，P4.1）；独立密钥管理、策略、设置、防御与其余 P5 业务模块（含其审计）待实现 |
 
@@ -162,4 +174,4 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 后端验证：go test ./...、go vet ./...。前端验证：npm run build、npm run lint、npm test（session store 单元测试）。浏览器验证：先 npx playwright install chromium，再 npm run test:e2e；先设置 AEGIS_TEST_DATABASE_URL/AEGIS_TEST_REDIS_URL 运行后端真实集成测试；浏览器测试需另设置 AEGIS_E2E_DATABASE_URL/AEGIS_E2E_REDIS_URL 指向专用可丢弃服务，测试启动本地前后端，要求 8080、5173 端口空闲。E2E 后端显式设置 AEGIS_LOGIN_RATE_LIMIT=100，因为同一地址在一分钟内驱动多个账号登录；生产默认配额仍是 10。测试账号仅存在测试临时库；端到端配置使用随机 JWT 密钥，不使用生产数据。
 
-验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出；构建闭环覆盖 UI 创建带构建命令的项目、触发构建、列表与详情、SSE 推送日志中出现进程输出与 build succeeded、viewer 只读且触发 403；项目可见性与成员覆盖 UI 创建私有项目与徽章、成员页邀请查看者、非成员深链得到「未找到」、查看者成员无管理控件且触发构建 403、提升维护者后可触发；部署与审批覆盖部署目标、发起部署、审批、取消与回滚主链路；审查中心覆盖 UI 发起审查（列表对话框）、批准（带理由）与状态/项目筛选、拒绝理由必填与详情展示、viewer 只读（无发起入口且发起 API 403）、非项目成员详情 404，以及部署表单关联已批准审查并在部署详情展示审查链接。剩余能力（多 worker 并行吞吐、构建阶段与产物、构建缓存、私有仓库凭据、部署多级会签与通知管理 API、多租户与单点登录）与生产备份演练见 PR 记录与本地维护的开发文档（不入库）。
+验收覆盖：错误密码、正确登录、Cookie 属性、页面恢复、并发刷新、多个标签页、退出撤销、非管理员 403、刷新 Cookie 失效及管理员页面守卫；账号管理覆盖 UI 创建用户、角色变更、重置密码、禁用后 403 登录拒绝、审计查询、自助修改密码保留当前会话、双会话撤销其他全部并即时踢出；构建闭环覆盖 UI 创建带构建命令的项目、触发构建、列表与详情、SSE 推送日志中出现进程输出与 build succeeded、viewer 只读且触发 403；项目可见性与成员覆盖 UI 创建私有项目与徽章、成员页邀请查看者、非成员深链得到「未找到」、查看者成员无管理控件且触发构建 403、提升维护者后可触发；部署与审批覆盖部署目标、发起部署、审批、取消与回滚主链路；审查中心覆盖 UI 发起审查（列表对话框）、批准（带理由）与状态/项目筛选、拒绝理由必填与详情展示、viewer 只读（无发起入口且发起 API 403）、非项目成员详情 404，以及部署表单关联已批准审查并在部署详情展示审查链接。外部结果回写与审查通知（P5-A E4）由后端集成测试验证签名、幂等与投递，前端外部结果展示与 E2E 留待 E4B。剩余能力（多 worker 并行吞吐、构建阶段与产物、构建缓存、私有仓库凭据、部署多级会签与通知管理 API、多租户与单点登录）与生产备份演练见 PR 记录与本地维护的开发文档（不入库）。

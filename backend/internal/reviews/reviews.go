@@ -16,6 +16,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -111,15 +112,69 @@ type ListFilter struct {
 	Offset    int
 }
 
+// Options configures the optional review-event notification outbox. The
+// outbound webhook reuses the approval channel (AEGIS_APPROVAL_WEBHOOK_*): one
+// receiver is expected to handle both approval.* and review.* events, so this
+// slice adds no outbound configuration of its own.
+type Options struct {
+	// WebhookURL enables review notifications; empty disables enqueueing and
+	// the notifier poll loop.
+	WebhookURL string
+	// WebhookSecret signs the exact JSON payload with HMAC-SHA256 when set.
+	WebhookSecret []byte
+	// WebhookTimeout bounds one delivery; zero means 5s.
+	WebhookTimeout time.Duration
+}
+
 type Service struct {
 	db *sql.DB
 	// projects decides project visibility and the write/maintainer overlays.
 	// Nil fails closed: only global admins keep access.
 	projects *projects.Service
+	// Review notifications use a transactional outbox stored in
+	// review_notifications; an empty webhookURL disables enqueueing.
+	webhookURL    string
+	webhookSecret []byte
+	webhookClient *http.Client
+	// notificationClaimLease bounds how long a claimed outbox row is invisible
+	// to other replicas; it always exceeds the maximum allowed webhook delivery.
+	notificationClaimLease time.Duration
 }
 
-func New(db *sql.DB, registry *projects.Service) *Service {
-	return &Service{db: db, projects: registry}
+// New builds the review-center service. The optional notification options are a
+// variadic parameter so existing callers keep working; cmd/server passes the
+// shared approval webhook configuration.
+func New(db *sql.DB, registry *projects.Service, options ...Options) *Service {
+	var opts Options
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	webhookTimeout := opts.WebhookTimeout
+	if webhookTimeout <= 0 {
+		webhookTimeout = defaultNotificationWebhookTimeout
+	}
+	// A delivery that is still running must never be re-claimed by another
+	// replica; derive the lease from the configured timeout plus headroom.
+	claimLease := webhookTimeout + 30*time.Second
+	if claimLease < minNotificationClaimLease {
+		claimLease = minNotificationClaimLease
+	}
+	webhookClient := &http.Client{
+		Timeout: webhookTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			// A redirect could post the signed body to an unintended host;
+			// treat it as a delivery failure instead of following it.
+			return http.ErrUseLastResponse
+		},
+	}
+	return &Service{
+		db:                     db,
+		projects:               registry,
+		webhookURL:             opts.WebhookURL,
+		webhookSecret:          append([]byte(nil), opts.WebhookSecret...),
+		webhookClient:          webhookClient,
+		notificationClaimLease: claimLease,
+	}
 }
 
 const reviewColumns = `id,project_id,number,subject,description,version,external_url,status,requested_by,decided_by,decided_at,reason,created_at,updated_at`
@@ -244,24 +299,31 @@ func normalize(input Input) (subject, description, version, externalURL string, 
 // (they do not select a server resource). Queries stay allowed: external
 // integrations frequently link to a filtered view.
 func validateExternalURL(externalURL string) error {
-	if externalURL == "" {
+	return validateDisplayURL("externalUrl", externalURL)
+}
+
+// validateDisplayURL is the shared display-link rule for the review body
+// (externalUrl) and external results (url): optional, absolute http(s), no
+// userinfo and no fragment. field only names the rejected input in the error.
+func validateDisplayURL(field, value string) error {
+	if value == "" {
 		return nil
 	}
-	if !utf8.ValidString(externalURL) || len(externalURL) > maxExternalURLBytes {
-		return fmt.Errorf("%w: externalUrl must be valid UTF-8 of at most %d bytes", ErrValidation, maxExternalURLBytes)
+	if !utf8.ValidString(value) || len(value) > maxExternalURLBytes {
+		return fmt.Errorf("%w: %s must be valid UTF-8 of at most %d bytes", ErrValidation, field, maxExternalURLBytes)
 	}
-	if strings.ContainsFunc(externalURL, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) {
-		return fmt.Errorf("%w: externalUrl must not contain whitespace", ErrValidation)
+	if strings.ContainsFunc(value, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) {
+		return fmt.Errorf("%w: %s must not contain whitespace", ErrValidation, field)
 	}
-	parsed, err := url.Parse(externalURL)
+	parsed, err := url.Parse(value)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" {
-		return fmt.Errorf("%w: externalUrl must be an absolute http or https URL with a host", ErrValidation)
+		return fmt.Errorf("%w: %s must be an absolute http or https URL with a host", ErrValidation, field)
 	}
 	if parsed.User != nil {
-		return fmt.Errorf("%w: externalUrl must not contain userinfo", ErrValidation)
+		return fmt.Errorf("%w: %s must not contain userinfo", ErrValidation, field)
 	}
 	if parsed.Fragment != "" || parsed.RawFragment != "" {
-		return fmt.Errorf("%w: externalUrl must not contain a fragment", ErrValidation)
+		return fmt.Errorf("%w: %s must not contain a fragment", ErrValidation, field)
 	}
 	return nil
 }
@@ -433,6 +495,11 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, projectID string
 		return nil, err
 	}
 	if err = writeAudit(ctx, tx, actor, ActionRequest, review.ID, fmt.Sprintf("project=%s number=%d", projectID, review.Number)); err != nil {
+		return nil, err
+	}
+	// The notification row commits with the review, so a delivered
+	// review.requested always describes a review that exists.
+	if err = s.enqueueReviewNotification(ctx, tx, review, EventRequested); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {

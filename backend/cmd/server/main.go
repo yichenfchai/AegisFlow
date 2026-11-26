@@ -108,7 +108,14 @@ func run(logger *slog.Logger) error {
 	registry := projects.New(db)
 	// The review center is the gate record for change reviews: creation follows
 	// the project write overlay, decisions need a maintainer or a global admin.
-	reviewCenter := reviews.New(db, registry)
+	// Review notifications reuse the approval webhook channel: one receiver gets
+	// both approval.* and review.* events. The inbound external-result endpoint
+	// is authenticated by AEGIS_REVIEW_WEBHOOK_SECRET instead (HTTP layer).
+	reviewCenter := reviews.New(db, registry, reviews.Options{
+		WebhookURL:     cfg.ApprovalWebhookURL,
+		WebhookSecret:  cfg.ApprovalWebhookSecret,
+		WebhookTimeout: cfg.ApprovalWebhookTimeout,
+	})
 	pipeline := builds.New(db, registry).WithSandbox(builds.Sandbox{
 		Mode:   builds.SandboxMode(cfg.BuildSandbox),
 		Image:  cfg.BuildImage,
@@ -148,7 +155,7 @@ func run(logger *slog.Logger) error {
 	// alone would wait out its 10s drain whenever an SSE client is connected.
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Reviews: reviewCenter, Metrics: monitoring, ShutdownContext: signalCtx})
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Reviews: reviewCenter, ReviewWebhookSecret: cfg.ReviewWebhookSecret, Metrics: monitoring, ShutdownContext: signalCtx})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	if monitoring != nil {
 		mux := http.NewServeMux()
@@ -194,6 +201,9 @@ func run(logger *slog.Logger) error {
 	// The notifier is independent of the deployment lease: every replica may
 	// claim distinct outbox rows, and a slow webhook must not delay executions.
 	go deploymentsService.RunNotifier(workerCtx, logger)
+	// Review events share the same approval webhook receiver, so the review
+	// notifier is another independent outbox consumer on the same signal ctx.
+	go reviewCenter.RunNotifier(workerCtx, logger)
 	// Expired sessions and their refresh history are pruned hourly; replay
 	// detection never needs history beyond the session deadline.
 	cleanupCtx, stopCleanup := context.WithCancel(signalCtx)

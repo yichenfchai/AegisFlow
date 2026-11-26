@@ -55,7 +55,10 @@ type Server struct {
 	origins      map[string]bool
 	limiter      ratelimit.Limiter
 	cookieSecure bool
-	metrics      *metrics.Registry
+	// reviewWebhookSecret authenticates inbound external-result deliveries with
+	// HMAC-SHA256; empty keeps that endpoint closed (503).
+	reviewWebhookSecret []byte
+	metrics             *metrics.Registry
 	// shutdownCtx is never nil: New substitutes context.Background() when the
 	// embedder does not pass one, so streaming selects can always wait on it.
 	shutdownCtx context.Context
@@ -94,6 +97,10 @@ type Options struct {
 	// Reviews enables the review-gate routes; nil fails closed with 503 like any
 	// other missing shared dependency.
 	Reviews *reviews.Service
+	// ReviewWebhookSecret verifies signed inbound external review results
+	// (AEGIS_REVIEW_WEBHOOK_SECRET). Empty keeps the external-results endpoint
+	// closed with 503; the read route stays available to authenticated viewers.
+	ReviewWebhookSecret []byte
 	// Metrics, when set, records request counters and latency histograms keyed
 	// by the matched route template. Nil disables recording.
 	Metrics *metrics.Registry
@@ -114,7 +121,8 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
-	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, reviews: opts.Reviews, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure, metrics: opts.Metrics, shutdownCtx: shutdownCtx}
+	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, reviews: opts.Reviews, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure,
+		reviewWebhookSecret: append([]byte(nil), opts.ReviewWebhookSecret...), metrics: opts.Metrics, shutdownCtx: shutdownCtx}
 	for _, o := range origins {
 		s.origins[o] = true
 	}
@@ -216,6 +224,13 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	reviewRoutes.POST("/:id/approve", s.approveReview)
 	reviewRoutes.POST("/:id/reject", s.rejectReview)
 	reviewRoutes.POST("/:id/cancel", s.cancelReview)
+	// External results: the read side is a normal authenticated route, while the
+	// write side is a machine-to-machine webhook authenticated by its HMAC
+	// signature headers (no Bearer, no browser session). It is registered
+	// outside the authenticated group on purpose; the handler answers 503 when
+	// AEGIS_REVIEW_WEBHOOK_SECRET is not configured.
+	reviewRoutes.GET("/:id/external-results", s.listReviewExternalResults)
+	api.POST("/reviews/:id/external-results", s.ingestReviewExternalResult)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }
@@ -1636,19 +1651,37 @@ func (s *Server) decode(c *gin.Context, v any) bool {
 		return false
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
-	// Decode via RawMessage first so null/arrays/scalars cannot masquerade as objects.
-	var raw json.RawMessage
-	d := json.NewDecoder(c.Request.Body)
-	if err := d.Decode(&raw); err != nil || len(bytes.TrimSpace(raw)) == 0 || bytes.TrimSpace(raw)[0] != '{' {
+	raw, err := io.ReadAll(c.Request.Body)
+	if err != nil {
 		s.fail(c, 400, "invalid_request", "body must contain one JSON object of at most 16 KiB")
 		return false
 	}
-	if err := d.Decode(new(any)); err != io.EOF {
+	return s.decodeRawJSON(c, raw, v)
+}
+
+// decodeRawJSON applies the shared strict JSON rules to an already-read body.
+// The signed external-result endpoint must verify its HMAC over the raw bytes
+// before decoding, so both entry points share the exact same acceptance rules:
+// one JSON object, no unknown or null fields, and no second document.
+func (s *Server) decodeRawJSON(c *gin.Context, raw []byte, v any) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		s.fail(c, 400, "invalid_request", "body must contain one JSON object of at most 16 KiB")
+		return false
+	}
+	// Decode via RawMessage first so null/arrays/scalars cannot masquerade as objects.
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	var document json.RawMessage
+	if err := decoder.Decode(&document); err != nil {
+		s.fail(c, 400, "invalid_request", "body must contain one JSON object of at most 16 KiB")
+		return false
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
 		s.fail(c, 400, "invalid_request", "body must contain one JSON object")
 		return false
 	}
 	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
+	if err := json.Unmarshal(trimmed, &fields); err != nil {
 		s.fail(c, 400, "invalid_request", "invalid JSON object")
 		return false
 	}
@@ -1658,13 +1691,13 @@ func (s *Server) decode(c *gin.Context, v any) bool {
 			return false
 		}
 	}
-	d = json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields()
-	if err := d.Decode(v); err != nil {
+	strict := json.NewDecoder(bytes.NewReader(raw))
+	strict.DisallowUnknownFields()
+	if err := strict.Decode(v); err != nil {
 		s.fail(c, 400, "invalid_request", "invalid JSON body or body exceeds 16 KiB")
 		return false
 	}
-	if err := d.Decode(new(any)); err != io.EOF {
+	if err := strict.Decode(new(any)); err != io.EOF {
 		s.fail(c, 400, "invalid_request", "body must contain one JSON object")
 		return false
 	}

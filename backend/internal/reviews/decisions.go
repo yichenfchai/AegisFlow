@@ -14,6 +14,7 @@ type decision struct {
 	target         string
 	idempotent     string
 	action         string
+	event          string
 	verb           string
 	requiredReason bool
 }
@@ -25,7 +26,7 @@ type decision struct {
 // conflict.
 func (s *Service) Approve(ctx context.Context, actor auth.Actor, reviewID, reason string) (*Review, error) {
 	return s.decide(ctx, actor, reviewID, reason, decision{
-		target: StatusApproved, idempotent: StatusApproved, action: ActionApprove, verb: "approved",
+		target: StatusApproved, idempotent: StatusApproved, action: ActionApprove, event: EventApproved, verb: "approved",
 	})
 }
 
@@ -35,7 +36,7 @@ func (s *Service) Approve(ctx context.Context, actor auth.Actor, reviewID, reaso
 // non-pending status is a conflict.
 func (s *Service) Reject(ctx context.Context, actor auth.Actor, reviewID, reason string) (*Review, error) {
 	return s.decide(ctx, actor, reviewID, reason, decision{
-		target: StatusRejected, idempotent: StatusRejected, action: ActionReject, verb: "rejected", requiredReason: true,
+		target: StatusRejected, idempotent: StatusRejected, action: ActionReject, event: EventRejected, verb: "rejected", requiredReason: true,
 	})
 }
 
@@ -91,6 +92,11 @@ func (s *Service) decide(ctx context.Context, actor auth.Actor, reviewID, reason
 	if err = writeAudit(ctx, tx, actor, kind.action, reviewID, detail); err != nil {
 		return nil, err
 	}
+	// The event row is part of the same transaction as the decision, so the
+	// outbox can never announce a status that did not commit.
+	if err = s.enqueueReviewNotification(ctx, tx, review, kind.event); err != nil {
+		return nil, err
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -142,6 +148,9 @@ func (s *Service) Cancel(ctx context.Context, actor auth.Actor, reviewID string)
 		return nil, err
 	}
 	if err = writeAudit(ctx, tx, actor, ActionCancel, reviewID, fmt.Sprintf("number=%d", review.Number)); err != nil {
+		return nil, err
+	}
+	if err = s.enqueueReviewNotification(ctx, tx, review, EventCancelled); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {

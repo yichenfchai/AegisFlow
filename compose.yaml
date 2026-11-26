@@ -39,9 +39,13 @@ x-api: &api
     # created; empty (the default) disables the review gate. It composes with
     # the approval list above (review first, then the approval state machine).
     AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS: ${AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS:-}
+    # One receiver gets both approval.* and review.* events (shared channel).
     AEGIS_APPROVAL_WEBHOOK_URL: ${AEGIS_APPROVAL_WEBHOOK_URL:-}
     AEGIS_APPROVAL_WEBHOOK_SECRET: ${AEGIS_APPROVAL_WEBHOOK_SECRET:-}
     AEGIS_APPROVAL_WEBHOOK_TIMEOUT: ${AEGIS_APPROVAL_WEBHOOK_TIMEOUT:-5s}
+    # Inbound external review-result HMAC key (16-256 bytes). Empty keeps the
+    # signed result webhook closed (503); independent of the outbound URL above.
+    AEGIS_REVIEW_WEBHOOK_SECRET: ${AEGIS_REVIEW_WEBHOOK_SECRET:-}
     # Build execution. none is for local acceptance only (runs as the service
     # account); container needs the host Docker socket, see the override snippet.
     AEGIS_BUILD_SANDBOX: ${AEGIS_BUILD_SANDBOX:-none}
