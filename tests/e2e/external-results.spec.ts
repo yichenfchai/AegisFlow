@@ -109,7 +109,9 @@ test('审查详情：外部结果签名回写后回显来源/徽章/摘要/外�
   await expect(reportLink).toHaveAttribute('target', '_blank')
   await expect(reportLink).toHaveAttribute('rel', /noopener noreferrer/)
 
-  // 第二条不同 verdict：出现中文「警告」徽章，倒序把最新结果排在最前。
+  // 第二条不同 verdict：出现中文「警告」徽章与摘要。同一秒内到达的条目顺序
+  // 由后端按 received_at 排序并以 id 稳定，前端不承诺同秒的展示顺序，因此这里
+  // 不依赖「哪一条在第一位」。
   await postExternalResult(
     request,
     reviewId,
@@ -121,7 +123,9 @@ test('审查详情：外部结果签名回写后回显来源/徽章/摘要/外�
   await expect(external.getByText('警告', { exact: true })).toBeVisible()
   await expect(external.getByText('通过', { exact: true })).toHaveCount(1)
   await expect(external.getByText('e2e-scanner', { exact: true })).toHaveCount(2)
-  await expect(external.locator('li').first()).toContainText('警告')
+  const warningItem = external.locator('li').filter({ hasText: '警告' })
+  await expect(warningItem).toHaveCount(1)
+  await expect(warningItem).toContainText('覆盖率下降 5%')
 
   // 重复同一 delivery 再 POST：后端返回 200 + 既有记录，页面仍只显示一条。
   await postExternalResult(request, reviewId, passedInput, passedDelivery, 200)
