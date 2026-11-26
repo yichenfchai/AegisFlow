@@ -64,9 +64,14 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pin the latest patch of the 1.27 line instead of go-version-file: the
+      # go.mod `go` directive is the dependency minimum (1.26.0), so resolving
+      # it would keep the job on a stale 1.26.0 patch without the 1.27 standard
+      # library fixes. The Dockerfile's golang:1.27-alpine image tracks the same
+      # minor line. Keep cache-dependency-path: the key must still use go.sum.
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version-file: backend/go.mod
+          go-version: '1.27.x'
           cache-dependency-path: backend/go.sum
       - name: Verify formatting
         run: test -z "$(gofmt -l ./cmd ./internal)"
@@ -100,11 +105,14 @@ jobs:
 
   # Supply-chain gate. The Go module graph was upgraded together with the Go
   # toolchain (#81), so reachable module-level vulnerabilities are expected to be
-  # zero; a finding now blocks the PR. govulncheck@latest declares a newer Go
-  # toolchain than backend/go.mod's `go` directive, so the scanner is built with
-  # the latest stable toolchain while the module graph it scans is still
-  # backend/go.mod. Standard-library findings track the scanner toolchain: keep
-  # `go-version: stable` current instead of reintroducing continue-on-error.
+  # zero; a finding now blocks the PR. The build jobs (backend/windows/e2e) pin
+  # `1.27.x`, the latest patch of the 1.27 line that backend/Dockerfile's
+  # golang:1.27-alpine image also builds with. This job deliberately stays on
+  # `stable`: govulncheck@latest declares a newer Go toolchain than
+  # backend/go.mod's `go` directive, and standard-library findings track the
+  # toolchain that builds the scanner, so `stable` scans the newest released
+  # standard library (go1.27.4 at the time of writing) instead of the dependency
+  # minimum. Keep `go-version: stable`; do not reintroduce continue-on-error.
   security:
     name: security
     runs-on: ubuntu-latest
@@ -142,7 +150,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version-file: backend/go.mod
+          go-version: '1.27.x'
           cache-dependency-path: backend/go.sum
       - name: Verify formatting
         shell: pwsh
@@ -218,7 +226,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version-file: backend/go.mod
+          go-version: '1.27.x'
           cache-dependency-path: backend/go.sum
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:

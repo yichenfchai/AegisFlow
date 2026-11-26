@@ -47,11 +47,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # CodeQL's Go extractor requires a Go toolchain on the runner; pin the
-      # same version the backend module declares so extraction matches CI.
+      # same latest 1.27 patch line as the build jobs in ci.yml (go-version-file
+      # would resolve to the go.mod dependency minimum 1.26.0, missing fixes).
       - if: matrix.language == 'go'
         uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version-file: backend/go.mod
+          go-version: '1.27.x'
           cache-dependency-path: backend/go.sum
       - name: Initialize CodeQL
         uses: github/codeql-action/init@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
