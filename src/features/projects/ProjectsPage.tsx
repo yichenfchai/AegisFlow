@@ -7,6 +7,7 @@ import { projectsAPI, PROJECT_VISIBILITY_TEXT, type Project } from '@/api/projec
 import { buildsAPI } from '@/api/builds'
 import { useSession } from '@/stores/session'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 import { fmtRel } from '@/api/format'
 
 const PAGE_SIZE = 12
@@ -16,9 +17,8 @@ function triggerError(cause: unknown): string {
     if (cause.status === 400) return '该项目未配置构建命令，先补充构建命令再触发'
     if (cause.status === 409) return '项目已归档，不能触发构建'
     if (cause.status === 403) return '当前角色没有触发构建的权限'
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return cause instanceof Error ? cause.message : '触发构建失败，请稍后重试'
+  return errorText(cause, '触发构建失败，请稍后重试')
 }
 
 /** 项目列表（真实接口）：P2 主线页面，替代原仪表盘演示。 */
@@ -51,7 +51,11 @@ export function ProjectsPage() {
       setToggleTarget(null)
       await refresh()
     } catch (cause) {
-      setActionError(cause instanceof ApiError && cause.status === 409 ? '项目已归档，只能先恢复再修改' : cause instanceof Error ? cause.message : '操作失败，请稍后重试')
+      setActionError(
+        cause instanceof ApiError && cause.status === 409
+          ? '项目已归档，只能先恢复再修改'
+          : errorText(cause, '操作失败，请稍后重试'),
+      )
     } finally {
       setBusy(false)
     }
@@ -178,7 +182,7 @@ export function ProjectsPage() {
       )}
       {error ? (
         <p role="alert" className="text-body-md text-error py-space-lg">
-          {error instanceof Error ? error.message : '加载项目失败'}
+          {errorText(error, '加载项目失败')}
         </p>
       ) : isLoading ? (
         <p className="text-body-md text-outline py-space-lg">加载中...</p>

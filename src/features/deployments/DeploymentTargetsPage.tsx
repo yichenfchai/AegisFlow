@@ -13,6 +13,7 @@ import {
   type DeploymentTarget,
 } from '@/api/deployments'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 
 const PAGE_SIZE = 12
 
@@ -22,10 +23,8 @@ function targetError(cause: unknown, action: string): string {
     if (cause.status === 403) return '当前角色没有该操作权限'
     if (cause.status === 404) return '部署目标不存在或已被删除'
     if (cause.status === 409) return '同名部署目标已存在（不区分大小写）'
-    if (cause.status === 503) return '服务依赖不可用，请稍后重试'
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return cause instanceof Error ? cause.message : `${action}失败，请稍后重试`
+  return errorText(cause, `${action}失败，请稍后重试`)
 }
 
 /** 部署目标列表（真实接口）：管理员配置部署端点并做连通性检查。 */
@@ -201,7 +200,7 @@ export function DeploymentTargetsPage() {
       )}
       {error ? (
         <p role="alert" className="text-body-md text-error py-space-lg">
-          {error instanceof Error ? error.message : '加载部署目标失败'}
+          {errorText(error, '加载部署目标失败')}
         </p>
       ) : isLoading ? (
         <p className="text-body-md text-outline py-space-lg">加载中...</p>

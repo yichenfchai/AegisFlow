@@ -16,6 +16,7 @@ import {
   type DeploymentTargetStatus,
 } from '@/api/deployments'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 import { fmtRel } from '@/api/format'
 
 const ENVIRONMENTS: DeploymentEnvironment[] = ['development', 'staging', 'production']
@@ -33,10 +34,8 @@ function targetError(cause: unknown, action: string): string {
     if (cause.status === 403) return '当前角色没有该操作权限'
     if (cause.status === 404) return '部署目标不存在或已被删除'
     if (cause.status === 409) return '同名部署目标已存在（不区分大小写）'
-    if (cause.status === 503) return '服务依赖不可用，请稍后重试'
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return cause instanceof Error ? cause.message : `${action}失败，请稍后重试`
+  return errorText(cause, `${action}失败，请稍后重试`)
 }
 
 /** 部署目标详情（真实接口）：编辑、检查连通性、清除凭据与删除。 */

@@ -14,6 +14,7 @@ import {
 } from '@/api/deployTasks'
 import { projectsAPI } from '@/api/projects'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 import { fmtRel } from '@/api/format'
 import { useSession } from '@/stores/session'
 
@@ -33,10 +34,8 @@ function loadError(cause: unknown): string {
   if (cause instanceof ApiError) {
     if (cause.status === 400) return '筛选条件不合法，请重置后重试'
     if (cause.status === 403) return '当前角色没有查看部署记录的权限'
-    if (cause.status === 503) return '服务依赖不可用，请稍后重试'
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return cause instanceof Error ? cause.message : '加载部署记录失败'
+  return errorText(cause, '加载部署记录失败')
 }
 
 /**

@@ -15,6 +15,7 @@ import {
 } from '@/api/deployTasks'
 import { projectsAPI } from '@/api/projects'
 import { ApiError } from '@/api/http'
+import { errorText } from '@/api/errors'
 import { fmtRel } from '@/api/format'
 import { useSession } from '@/stores/session'
 
@@ -30,10 +31,8 @@ function deployError(cause: unknown, action: string): string {
     if (cause.status === 403) return '当前角色没有该操作权限'
     if (cause.status === 404) return '部署不存在或已被删除'
     if (cause.status === 409) return `无法${action}：部署当前状态不允许该操作`
-    if (cause.status === 503) return '服务依赖不可用，请稍后重试'
-    if (cause.status === 0) return '无法连接服务，请检查网络后重试'
   }
-  return cause instanceof Error ? cause.message : `${action}失败，请稍后重试`
+  return errorText(cause, `${action}失败，请稍后重试`)
 }
 
 interface EventState {
@@ -78,7 +77,7 @@ function useDeploymentEvents(
         setState((prev) => ({
           deploymentId,
           lines: prev.deploymentId === deploymentId ? prev.lines : [],
-          error: cause instanceof Error ? cause.message : '事件加载失败',
+          error: errorText(cause, '事件加载失败'),
         }))
       }
       if (cancelled) return
