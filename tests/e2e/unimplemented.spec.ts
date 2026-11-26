@@ -17,13 +17,13 @@ const UNIMPLEMENTED_TEXT = '此模块的真实业务接口尚未实现，当前�
 test('未实现模块恒定显示声明，不提供演示数据或伪造操作', async ({ page }) => {
   await login(page)
 
-  // 侧边栏入口真实存在：从项目列表可导航到审查中心。
-  await page.locator('aside').getByRole('link', { name: '审查中心' }).click()
-  await expect(page).toHaveURL('/reviews')
+  // 侧边栏入口真实存在：从项目列表可导航到仍未实现的安全扫描。
+  await page.locator('aside').getByRole('link', { name: '安全扫描' }).click()
+  await expect(page).toHaveURL('/scans')
 
   for (const [path, title] of [
-    ['/reviews', '审查中心'],
     ['/scans', '安全扫描'],
+    ['/knowledge', '知识库'],
   ] as const) {
     await page.goto(path)
     await expect(page).toHaveURL(path)
@@ -40,9 +40,4 @@ test('未实现模块恒定显示声明，不提供演示数据或伪造操作',
     await expect(page.getByRole('heading', { level: 1, name: title })).toBeVisible()
     await expect(section.getByText(/此模块的真实业务接口尚未实现/)).toBeVisible()
   }
-
-  // 详情路由同样恒定未实现，不会退化成带演示数据的详情页。
-  await page.goto('/reviews/example-review-id')
-  await expect(page.getByRole('heading', { level: 1, name: '审查详情' })).toBeVisible()
-  await expect(page.getByText(/此模块的真实业务接口尚未实现/)).toBeVisible()
 })
