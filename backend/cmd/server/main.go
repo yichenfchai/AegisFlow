@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/httpapi"
 	"github.com/yichenfchai/AegisFlow/backend/internal/knowledge"
 	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
+	"github.com/yichenfchai/AegisFlow/backend/internal/oidc"
 	"github.com/yichenfchai/AegisFlow/backend/internal/policies"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
@@ -144,6 +146,28 @@ func run(logger *slog.Logger) error {
 		Pids:   cfg.BuildPids,
 		User:   cfg.BuildUser,
 	}).WithSource(cfg.BuildClone, cfg.BuildAllowLocalRepo).WithDiskLimit(cfg.BuildDisk).WithTimeout(cfg.BuildTimeout)
+	// OIDC single sign-on is opt-in and fail-closed: when AEGIS_OIDC_ISSUER is
+	// configured, discovery runs before the listener opens, so a misconfigured
+	// or unreachable provider refuses startup instead of failing every login.
+	// Without the issuer the service stays nil and the feature has no effect.
+	var oidcService *oidc.Service
+	if cfg.OIDC.Enabled() {
+		oidcService, err = oidc.New(context.Background(), db, service, oidc.Options{
+			Issuer:           cfg.OIDC.Issuer,
+			ClientID:         cfg.OIDC.ClientID,
+			ClientSecret:     cfg.OIDC.ClientSecret,
+			RedirectURL:      cfg.OIDC.RedirectURL,
+			Scopes:           cfg.OIDC.Scopes,
+			AutoProvision:    cfg.OIDC.AutoProvision,
+			Label:            cfg.OIDC.Label,
+			DiscoveryTimeout: cfg.OIDC.DiscoveryTimeout,
+			Logger:           logger,
+		})
+		if err != nil {
+			return fmt.Errorf("OIDC single sign-on: %w", err)
+		}
+		logger.Info("OIDC single sign-on enabled", "issuer", cfg.OIDC.Issuer, "autoProvision", cfg.OIDC.AutoProvision)
+	}
 	// Deployment-target secrets are sealed with AEGIS_SECRET_KEY; when it is
 	// unset the registry still serves targets without credentials. The same
 	// service owns the deploy-task store, the approval queue and the worker.
@@ -178,7 +202,7 @@ func run(logger *slog.Logger) error {
 	// alone would wait out its 10s drain whenever an SSE client is connected.
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Reviews: reviewCenter, Scans: scanRegistry, SecurityEvents: defenseEvents, Knowledge: knowledgeBase, Secrets: secretStore, Policies: policyStore, ReviewWebhookSecret: cfg.ReviewWebhookSecret, IngestWebhookSecret: cfg.IngestWebhookSecret, Metrics: monitoring, ShutdownContext: signalCtx})
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Reviews: reviewCenter, Scans: scanRegistry, SecurityEvents: defenseEvents, Knowledge: knowledgeBase, Secrets: secretStore, Policies: policyStore, OIDC: oidcService, ReviewWebhookSecret: cfg.ReviewWebhookSecret, IngestWebhookSecret: cfg.IngestWebhookSecret, Metrics: monitoring, ShutdownContext: signalCtx})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	if monitoring != nil {
 		mux := http.NewServeMux()

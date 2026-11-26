@@ -11,9 +11,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/redis/go-redis/v9"
-	"time"
 )
 
 type Config struct {
@@ -85,6 +87,10 @@ type Config struct {
 	// read routes stay available; a configured value must be 16-256 bytes and is
 	// never echoed in an error.
 	IngestWebhookSecret []byte
+	// OIDC is the optional OIDC single sign-on configuration (P5 batch D). The
+	// zero value disables the feature completely: no route gains a working
+	// authorization flow and the login page keeps its password-only behavior.
+	OIDC OIDCConfig
 	// RequireReviewEnvironments lists target environments whose deployments
 	// must reference an approved review. Empty (the default, including an
 	// explicitly empty value or only commas/whitespace) disables the gate: the
@@ -92,6 +98,43 @@ type Config struct {
 	// behavior, and only the three documented environments are valid.
 	RequireReviewEnvironments []string
 }
+
+// OIDCConfig is the OIDC single sign-on configuration (P5 batch D). Issuer is
+// the master switch: an empty issuer disables the feature entirely, and every
+// other OIDC variable then fails startup instead of being silently ignored.
+// The startup only validates syntax and URL safety; the actual provider
+// discovery happens in cmd/server before the HTTP listener opens, and a
+// failed discovery refuses to start.
+type OIDCConfig struct {
+	// Issuer is the exact OIDC issuer identifier (https, or loopback http for
+	// local tests). It is the expected `iss` claim and the discovery base URL.
+	Issuer string
+	// ClientID and ClientSecret identify the registered OIDC client. An empty
+	// ClientSecret selects the public-client PKCE flow (client_secret_post is
+	// used only when a secret is configured).
+	ClientID     string
+	ClientSecret string
+	// RedirectURL is the absolute callback URL registered with the provider
+	// (GET /api/v1/auth/oidc/callback). It follows the same https/loopback
+	// rule as the issuer and must not contain userinfo, query or fragment.
+	RedirectURL string
+	// Scopes is the authorization request scope list; it always contains
+	// "openid" and defaults to openid profile email.
+	Scopes []string
+	// AutoProvision creates a member account on first login when the verified
+	// email matches no local account. It never creates an admin.
+	AutoProvision bool
+	// Label is the login-page button text; never an empty string.
+	Label string
+	// DiscoveryTimeout bounds the startup discovery fetch and every provider
+	// HTTP call (default 5s, at most 30s).
+	DiscoveryTimeout time.Duration
+}
+
+// Enabled reports whether the OIDC feature is configured. The zero OIDCConfig
+// is disabled, so a deployment that sets none of the AEGIS_OIDC_* variables
+// keeps exactly the previous password-only surface.
+func (c OIDCConfig) Enabled() bool { return c.Issuer != "" }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
 // the build execution design (maintained locally, not committed): "none" runs
@@ -377,6 +420,12 @@ func Load() (Config, error) {
 		}
 		c.IngestWebhookSecret = []byte(raw)
 	}
+	// OIDC single sign-on (P5 batch D) is opt-in: an unset issuer disables the
+	// feature completely, including route effects. Setting any other OIDC
+	// variable without the issuer is a configuration mistake and fails closed.
+	if err = loadOIDC(&c); err != nil {
+		return c, err
+	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {
 		origin = strings.TrimSpace(origin)
 		u, e := url.Parse(origin)
@@ -547,4 +596,124 @@ func parseBool(key string, fallback bool) (bool, error) {
 	default:
 		return false, fmt.Errorf("%s must be true or false", key)
 	}
+}
+
+// loadOIDC parses and validates the optional OIDC single sign-on settings. It
+// never reaches the network: provider discovery is a startup step in cmd/server
+// because only that layer can fail the process before the listener opens.
+func loadOIDC(c *Config) error {
+	rawIssuer := strings.TrimSpace(os.Getenv("AEGIS_OIDC_ISSUER"))
+	if rawIssuer == "" {
+		// Fail closed on partial configuration instead of silently starting a
+		// server whose operator believes SSO is enabled.
+		for _, key := range []string{"AEGIS_OIDC_CLIENT_ID", "AEGIS_OIDC_CLIENT_SECRET", "AEGIS_OIDC_REDIRECT_URL", "AEGIS_OIDC_SCOPES", "AEGIS_OIDC_AUTO_PROVISION", "AEGIS_OIDC_LABEL", "AEGIS_OIDC_DISCOVERY_TIMEOUT"} {
+			if os.Getenv(key) != "" {
+				return fmt.Errorf("%s requires AEGIS_OIDC_ISSUER; OIDC single sign-on is disabled when the issuer is unset", key)
+			}
+		}
+		return nil
+	}
+	// A trailing slash would produce "<issuer>//.well-known/...", so normalize
+	// before the syntax check; discovery later requires an exact issuer match.
+	issuer, err := validateOIDCEndpoint(strings.TrimRight(rawIssuer, "/"), "AEGIS_OIDC_ISSUER")
+	if err != nil {
+		return err
+	}
+	c.OIDC.Issuer = issuer
+	clientID := strings.TrimSpace(os.Getenv("AEGIS_OIDC_CLIENT_ID"))
+	if !validOIDCText(clientID, 1, 256) {
+		return errors.New("AEGIS_OIDC_CLIENT_ID must be a non-empty single line of at most 256 bytes when OIDC is enabled")
+	}
+	c.OIDC.ClientID = clientID
+	// Optional client secret: present selects a confidential client
+	// (client_secret_post); absent keeps the public-client PKCE flow.
+	if secret := os.Getenv("AEGIS_OIDC_CLIENT_SECRET"); secret != "" {
+		if len(secret) > 512 || strings.IndexFunc(secret, unicode.IsControl) >= 0 {
+			return errors.New("AEGIS_OIDC_CLIENT_SECRET must be a single line of at most 512 bytes")
+		}
+		c.OIDC.ClientSecret = secret
+	}
+	redirect, err := validateOIDCEndpoint(strings.TrimSpace(os.Getenv("AEGIS_OIDC_REDIRECT_URL")), "AEGIS_OIDC_REDIRECT_URL")
+	if err != nil {
+		return err
+	}
+	c.OIDC.RedirectURL = redirect
+	scopes := strings.Fields(os.Getenv("AEGIS_OIDC_SCOPES"))
+	if len(scopes) == 0 {
+		scopes = []string{"openid", "profile", "email"}
+	}
+	for _, scope := range scopes {
+		if !validOIDCScope(scope) {
+			return errors.New("AEGIS_OIDC_SCOPES must contain space-separated scopes of 1-64 printable ASCII bytes")
+		}
+		if !slices.Contains(c.OIDC.Scopes, scope) {
+			c.OIDC.Scopes = append(c.OIDC.Scopes, scope)
+		}
+	}
+	if !slices.Contains(c.OIDC.Scopes, "openid") {
+		return errors.New("AEGIS_OIDC_SCOPES must include the openid scope")
+	}
+	c.OIDC.AutoProvision, err = parseBool("AEGIS_OIDC_AUTO_PROVISION", false)
+	if err != nil {
+		return err
+	}
+	c.OIDC.Label = strings.TrimSpace(env("AEGIS_OIDC_LABEL", "企业单点登录"))
+	if !validOIDCText(c.OIDC.Label, 1, 128) {
+		return errors.New("AEGIS_OIDC_LABEL must be a non-empty single line of at most 128 bytes")
+	}
+	c.OIDC.DiscoveryTimeout, err = duration("AEGIS_OIDC_DISCOVERY_TIMEOUT", "5s")
+	if err != nil {
+		return err
+	}
+	if c.OIDC.DiscoveryTimeout > 30*time.Second {
+		return errors.New("AEGIS_OIDC_DISCOVERY_TIMEOUT must be at most 30s")
+	}
+	return nil
+}
+
+// validateOIDCEndpoint accepts an absolute http(s) URL without userinfo, query
+// or fragment. Plain HTTP is only allowed for loopback hosts, so local test
+// providers work without weakening a production configuration. The issuer and
+// redirect URL use exactly the same rule.
+func validateOIDCEndpoint(raw, key string) (string, error) {
+	if raw == "" {
+		return "", fmt.Errorf("%s is required when OIDC single sign-on is enabled", key)
+	}
+	if len(raw) > 2048 || !utf8.ValidString(raw) || strings.IndexFunc(raw, unicode.IsControl) >= 0 || strings.ContainsAny(raw, " \t") {
+		return "", fmt.Errorf("%s must be a single-line absolute URL of at most 2048 bytes", key)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawQuery != "" {
+		return "", fmt.Errorf("%s must be an absolute http(s) URL without userinfo, query or fragment", key)
+	}
+	switch parsed.Scheme {
+	case "https":
+	case "http":
+		if !isLoopbackHost(parsed.Hostname()) {
+			return "", fmt.Errorf("%s must use https unless the host is loopback", key)
+		}
+	default:
+		return "", fmt.Errorf("%s must be an http(s) URL", key)
+	}
+	return raw, nil
+}
+
+// validOIDCText accepts a non-empty UTF-8 single line inside the byte bounds.
+func validOIDCText(value string, min, max int) bool {
+	return utf8.ValidString(value) && len(value) >= min && len(value) <= max && strings.IndexFunc(value, unicode.IsControl) < 0
+}
+
+// validOIDCScope accepts the RFC 6749 scope-token shape: printable ASCII
+// without spaces, quotes or backslashes.
+func validOIDCScope(scope string) bool {
+	if len(scope) < 1 || len(scope) > 64 {
+		return false
+	}
+	for i := 0; i < len(scope); i++ {
+		ch := scope[i]
+		if ch < 0x21 || ch > 0x7e || ch == '"' || ch == '\\' {
+			return false
+		}
+	}
+	return true
 }

@@ -1,10 +1,12 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 import { Icon } from '@/components/ui/Icon'
 import { Button } from '@/components/ui/DataTable'
+import type { OIDCConfig } from '@/api/http'
 import { errorMessage, useSession } from '@/stores/session'
 import { SessionGate } from './SessionGate'
 import { safeReturnTo } from './returnTo'
+import { loadOIDCConfig, ssoButtonLabel, ssoErrorMessage, ssoStartURL } from './sso'
 
 export function LoginPage() {
   return <SessionGate publicOnly><LoginForm /></SessionGate>
@@ -18,8 +20,35 @@ function LoginForm() {
   const [password, setPassword] = useState('')
   const [remember, setRemember] = useState(true)
   const [showPwd, setShowPwd] = useState(false)
-  const [error, setError] = useState('')
+  // SSO callback failures arrive as ?sso_error=<固定错误码>；初始 error 直接取映射，
+  // 随后把该参数从地址栏清掉，避免刷新重复提示或把错误码留在历史记录里。
+  const [error, setError] = useState(() => ssoErrorMessage(new URLSearchParams(location.search).get('sso_error')) ?? '')
   const [loading, setLoading] = useState(false)
+  const [oidc, setOIDC] = useState<OIDCConfig | null>(null)
+  const ssoLabel = ssoButtonLabel(oidc)
+
+  // OIDC 是可选能力：探针失败在 loadOIDCConfig 内归一为未启用，页面保持纯密码登录。
+  useEffect(() => {
+    let active = true
+    void loadOIDCConfig().then((config) => {
+      if (active) setOIDC(config)
+    })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search)
+    if (!params.has('sso_error')) return
+    params.delete('sso_error')
+    const search = params.toString()
+    nav({ pathname: location.pathname, search: search ? `?${search}` : '' }, { replace: true })
+  }, [location.pathname, location.search, nav])
+
+  const startSSO = () => {
+    window.location.assign(ssoStartURL(new URLSearchParams(location.search).get('returnTo')))
+  }
 
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault()
@@ -69,8 +98,27 @@ function LoginForm() {
           <p className="text-body-md text-outline">轻量交付治理平台</p>
         </div>
 
-        {/* 登录卡片 */}
+        {/* 登录卡片：OIDC 已配置时在密码表单上方显示「{label}」入口，未配置时完全不渲染 */}
         <form onSubmit={submit} aria-busy={loading} className="bg-surface-container rounded-lg border border-surface-container-highest p-space-xl space-y-space-lg">
+          {ssoLabel && (
+            <>
+              <Button
+                type="button"
+                variant="secondary"
+                className="w-full justify-center"
+                disabled={loading}
+                onClick={startSSO}
+              >
+                <Icon name="domain" size={16} />
+                {ssoLabel}
+              </Button>
+              <div className="flex items-center gap-space-lg">
+                <span className="flex-1 h-px bg-surface-container-highest" />
+                <span className="text-label-sm text-outline">或使用密码登录</span>
+                <span className="flex-1 h-px bg-surface-container-highest" />
+              </div>
+            </>
+          )}
           <div>
             <label htmlFor="login-username" className="block text-label-md text-on-surface-variant mb-space-sm">用户名</label>
             <div className="relative">

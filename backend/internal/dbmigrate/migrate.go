@@ -387,6 +387,35 @@ var Migrations = [][]string{{
 	 required_scan_verdict TEXT NOT NULL DEFAULT 'none' CHECK(required_scan_verdict IN ('none','passed')),
 	 updated_by TEXT NOT NULL,
 	 updated_at BIGINT NOT NULL)`,
+}, {
+	// OIDC single sign-on (P5 remaining modules, batch D). oidc_login_states is
+	// the one-time authorization request record: state_hash is the SHA-256 of
+	// the browser-visible state (the raw state lives only in the state cookie),
+	// nonce is the id_token replay nonce, code_verifier is the PKCE verifier
+	// and redirect_to is the validated post-login relative path. A row is
+	// consumed atomically (UPDATE ... WHERE consumed_at IS NULL AND not
+	// expired), so a replayed callback can never mint a second session. The
+	// nonce/verifier are short-lived secrets that are deleted with the row; a
+	// deterministic cleanup removes expired rows opportunistically.
+	//
+	// auth_users.email links an OIDC identity to a local account by verified
+	// email (case-insensitive). Existing accounts keep the empty default and
+	// therefore never match: linking needs an explicit email value, and the
+	// empty string is excluded from the unique index so "no email" rows do not
+	// collide. The column is intentionally not part of the User JSON: email is
+	// identity-linkage data for SSO, not a profile field exposed by the account
+	// APIs in this batch.
+	`ALTER TABLE auth_users ADD COLUMN email TEXT NOT NULL DEFAULT ''`,
+	`CREATE UNIQUE INDEX auth_users_email_lower_idx ON auth_users(lower(email)) WHERE email <> ''`,
+	`CREATE TABLE oidc_login_states (
+	 state_hash TEXT PRIMARY KEY,
+	 nonce TEXT NOT NULL,
+	 code_verifier TEXT NOT NULL,
+	 redirect_to TEXT NOT NULL DEFAULT '',
+	 expires_at BIGINT NOT NULL,
+	 consumed_at BIGINT,
+	 created_at BIGINT NOT NULL)`,
+	`CREATE INDEX oidc_login_states_expires_idx ON oidc_login_states(expires_at)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped

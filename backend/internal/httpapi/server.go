@@ -23,6 +23,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/deployments"
 	"github.com/yichenfchai/AegisFlow/backend/internal/knowledge"
 	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
+	"github.com/yichenfchai/AegisFlow/backend/internal/oidc"
 	"github.com/yichenfchai/AegisFlow/backend/internal/policies"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
@@ -66,7 +67,10 @@ type Server struct {
 	secrets *secrets.Service
 	// policies is the per-project automation policy store; deployment creation
 	// and rollback read it through the deployment service.
-	policies     *policies.Service
+	policies *policies.Service
+	// oidc is the OIDC single sign-on relying-party flow; nil means the feature
+	// is not configured and its data routes stay closed (503).
+	oidc         *oidc.Service
 	logger       *slog.Logger
 	ready        func(context.Context) error
 	origins      map[string]bool
@@ -134,6 +138,10 @@ type Options struct {
 	// own injected gate, so a deployment created without this wiring simply has
 	// the policy gate disabled (the pre-policy behavior).
 	Policies *policies.Service
+	// OIDC enables the OIDC single sign-on routes when the provider discovery
+	// has already succeeded at startup. Nil keeps the routes registered but
+	// closed behind a 503, and the config probe answers enabled=false.
+	OIDC *oidc.Service
 	// ReviewWebhookSecret verifies signed inbound external review results
 	// (AEGIS_REVIEW_WEBHOOK_SECRET). Empty keeps the external-results endpoint
 	// closed with 503; the read route stays available to authenticated viewers.
@@ -164,6 +172,7 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	}
 	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, reviews: opts.Reviews,
 		scans: opts.Scans, securityEvents: opts.SecurityEvents, knowledge: opts.Knowledge, secrets: opts.Secrets, policies: opts.Policies,
+		oidc:   opts.OIDC,
 		logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure,
 		reviewWebhookSecret: append([]byte(nil), opts.ReviewWebhookSecret...),
 		ingestWebhookSecret: append([]byte(nil), opts.IngestWebhookSecret...),
@@ -194,6 +203,13 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	authRoutes.POST("/login", s.login)
 	authRoutes.POST("/refresh", s.refresh)
 	authRoutes.POST("/logout", s.logout)
+	// OIDC single sign-on (P5 batch D): the probe is always registered and
+	// answers enabled=false when the feature is unconfigured; start/callback
+	// stay registered too but answer 503 while disabled. All three are public
+	// browser navigations, so no Origin header applies (GET only).
+	authRoutes.GET("/oidc/config", s.oidcConfig)
+	authRoutes.GET("/oidc/start", s.oidcStart)
+	authRoutes.GET("/oidc/callback", s.oidcCallback)
 	authRoutes.GET("/me", s.authenticate(), s.me)
 	authRoutes.POST("/password", s.authenticate(), s.changePassword)
 	authRoutes.GET("/sessions", s.authenticate(), s.listSessions)
@@ -344,17 +360,22 @@ func (s *Server) readyError(ctx context.Context) error {
 	return err
 }
 
-func (s *Server) login(c *gin.Context) {
+// loginAttempt consumes one slot of the shared Redis login quota for this
+// client. Password login and the OIDC start/callback routes deliberately share
+// the same fail-closed limiter: no in-process fallback, one quota across
+// instances. It writes the 503/429 response and reports false when the request
+// must stop.
+func (s *Server) loginAttempt(c *gin.Context) bool {
 	// No in-process fallback: all instances must share the same quota.
 	if s.limiter == nil {
 		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
-		return
+		return false
 	}
 	allowed, retryAfter, err := s.limiter.Allow(c.Request.Context(), c.ClientIP())
 	if err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "login limiter unavailable", "requestId", c.Request.Context().Value(requestIDKey), "error", err)
 		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
-		return
+		return false
 	}
 	if !allowed {
 		seconds := int64(retryAfter / time.Second)
@@ -366,6 +387,13 @@ func (s *Server) login(c *gin.Context) {
 		}
 		c.Header("Retry-After", strconv.FormatInt(seconds, 10))
 		s.fail(c, 429, "rate_limited", "too many login attempts")
+		return false
+	}
+	return true
+}
+
+func (s *Server) login(c *gin.Context) {
+	if !s.loginAttempt(c) {
 		return
 	}
 	var input struct {
@@ -1868,7 +1896,13 @@ func (s *Server) middleware() gin.HandlerFunc {
 		// Vary also on denied/missing origins so intermediaries cannot reuse CORS decisions.
 		c.Writer.Header().Add("Vary", "Origin")
 		c.Writer.Header().Add("Vary", "Sec-Fetch-Site")
-		if strings.EqualFold(strings.TrimSpace(c.GetHeader("Sec-Fetch-Site")), "cross-site") {
+		// Cross-site requests are rejected globally, with one documented
+		// exception: the OIDC provider redirects the browser back with a
+		// top-level cross-site GET navigation, which is the normal SSO return
+		// path. The callback is protected by the one-time state cookie plus the
+		// atomically consumed state row instead, and it mutates nothing before
+		// both validate.
+		if strings.EqualFold(strings.TrimSpace(c.GetHeader("Sec-Fetch-Site")), "cross-site") && !isOIDCCallbackNavigation(c.Request) {
 			s.fail(c, 403, "origin_denied", "cross-site requests are not allowed")
 			return
 		}

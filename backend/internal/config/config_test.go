@@ -29,7 +29,7 @@ func unsetEnv(t *testing.T, key string) {
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_SECRET_KEY_PREVIOUS", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_DEPLOY_HEALTH_ATTEMPTS", "AEGIS_DEPLOY_HEALTH_INTERVAL", "AEGIS_APPROVAL_TTL", "AEGIS_APPROVAL_WEBHOOK_URL", "AEGIS_APPROVAL_WEBHOOK_SECRET", "AEGIS_APPROVAL_WEBHOOK_TIMEOUT", "AEGIS_REVIEW_WEBHOOK_SECRET", "AEGIS_INGEST_WEBHOOK_SECRET"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_SECRET_KEY_PREVIOUS", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_DEPLOY_HEALTH_ATTEMPTS", "AEGIS_DEPLOY_HEALTH_INTERVAL", "AEGIS_APPROVAL_TTL", "AEGIS_APPROVAL_WEBHOOK_URL", "AEGIS_APPROVAL_WEBHOOK_SECRET", "AEGIS_APPROVAL_WEBHOOK_TIMEOUT", "AEGIS_REVIEW_WEBHOOK_SECRET", "AEGIS_INGEST_WEBHOOK_SECRET", "AEGIS_OIDC_ISSUER", "AEGIS_OIDC_CLIENT_ID", "AEGIS_OIDC_CLIENT_SECRET", "AEGIS_OIDC_REDIRECT_URL", "AEGIS_OIDC_SCOPES", "AEGIS_OIDC_AUTO_PROVISION", "AEGIS_OIDC_LABEL", "AEGIS_OIDC_DISCOVERY_TIMEOUT"} {
 		t.Setenv(key, "")
 	}
 	unsetEnv(t, "AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
@@ -714,4 +714,131 @@ func TestIngestWebhookSecretConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestOIDCConfig covers the opt-in OIDC single sign-on configuration: unset
+// issuer keeps the feature fully disabled (and any other OIDC variable then
+// fails closed), while an enabled deployment gets validated URLs, scopes and
+// the documented defaults.
+func TestOIDCConfig(t *testing.T) {
+	t.Run("unset disables the feature", func(t *testing.T) {
+		setup(t)
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.OIDC.Enabled() || c.OIDC.Issuer != "" || len(c.OIDC.Scopes) != 0 {
+			t.Fatalf("disabled OIDC config = %+v", c.OIDC)
+		}
+	})
+	t.Run("enabled defaults", func(t *testing.T) {
+		setup(t)
+		t.Setenv("AEGIS_OIDC_ISSUER", "https://idp.example.com/tenant/")
+		t.Setenv("AEGIS_OIDC_CLIENT_ID", "aegisflow")
+		t.Setenv("AEGIS_OIDC_REDIRECT_URL", "https://aegis.example.com/api/v1/auth/oidc/callback")
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !c.OIDC.Enabled() || c.OIDC.Issuer != "https://idp.example.com/tenant" {
+			t.Fatalf("issuer = %q", c.OIDC.Issuer)
+		}
+		if c.OIDC.Label != "企业单点登录" || c.OIDC.AutoProvision || c.OIDC.DiscoveryTimeout != 5*time.Second {
+			t.Fatalf("defaults = %+v", c.OIDC)
+		}
+		if !slices.Equal(c.OIDC.Scopes, []string{"openid", "profile", "email"}) {
+			t.Fatalf("scopes = %v", c.OIDC.Scopes)
+		}
+	})
+	t.Run("loopback http and explicit options", func(t *testing.T) {
+		setup(t)
+		t.Setenv("AEGIS_OIDC_ISSUER", "http://127.0.0.1:9099")
+		t.Setenv("AEGIS_OIDC_CLIENT_ID", "aegisflow-e2e")
+		t.Setenv("AEGIS_OIDC_CLIENT_SECRET", "test-client-secret")
+		t.Setenv("AEGIS_OIDC_REDIRECT_URL", "http://localhost:5173/api/v1/auth/oidc/callback")
+		t.Setenv("AEGIS_OIDC_SCOPES", "openid profile email groups")
+		t.Setenv("AEGIS_OIDC_AUTO_PROVISION", "true")
+		t.Setenv("AEGIS_OIDC_LABEL", "公司 SSO")
+		t.Setenv("AEGIS_OIDC_DISCOVERY_TIMEOUT", "10s")
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.OIDC.ClientSecret != "test-client-secret" || !c.OIDC.AutoProvision || c.OIDC.Label != "公司 SSO" || c.OIDC.DiscoveryTimeout != 10*time.Second {
+			t.Fatalf("explicit options = %+v", c.OIDC)
+		}
+		if !slices.Contains(c.OIDC.Scopes, "groups") || len(c.OIDC.Scopes) != 4 {
+			t.Fatalf("scopes = %v", c.OIDC.Scopes)
+		}
+	})
+	t.Run("duplicate scopes are collapsed", func(t *testing.T) {
+		setup(t)
+		t.Setenv("AEGIS_OIDC_ISSUER", "https://idp.example.com")
+		t.Setenv("AEGIS_OIDC_CLIENT_ID", "aegisflow")
+		t.Setenv("AEGIS_OIDC_REDIRECT_URL", "https://aegis.example.com/api/v1/auth/oidc/callback")
+		t.Setenv("AEGIS_OIDC_SCOPES", "openid openid profile")
+		c, err := Load()
+		if err != nil || !slices.Equal(c.OIDC.Scopes, []string{"openid", "profile"}) {
+			t.Fatalf("scopes = %v err=%v", c.OIDC.Scopes, err)
+		}
+	})
+	// Partial configuration without the issuer must fail closed instead of
+	// silently starting a server the operator believes has SSO enabled.
+	for _, tc := range []struct{ name, key, value string }{
+		{"client id without issuer", "AEGIS_OIDC_CLIENT_ID", "aegisflow"},
+		{"secret without issuer", "AEGIS_OIDC_CLIENT_SECRET", "secret"},
+		{"redirect without issuer", "AEGIS_OIDC_REDIRECT_URL", "https://aegis.example.com/cb"},
+		{"label without issuer", "AEGIS_OIDC_LABEL", "SSO"},
+		{"scopes without issuer", "AEGIS_OIDC_SCOPES", "openid profile"},
+		{"auto provision without issuer", "AEGIS_OIDC_AUTO_PROVISION", "true"},
+		{"timeout without issuer", "AEGIS_OIDC_DISCOVERY_TIMEOUT", "5s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t)
+			t.Setenv(tc.key, tc.value)
+			if _, err := Load(); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+	// Enabled deployments with unsafe values must also fail startup.
+	for _, tc := range []struct{ name, key, value string }{
+		{"issuer plain http", "AEGIS_OIDC_ISSUER", "http://idp.example.com"},
+		{"issuer userinfo", "AEGIS_OIDC_ISSUER", "https://user:pass@idp.example.com"},
+		{"issuer fragment", "AEGIS_OIDC_ISSUER", "https://idp.example.com/#fragment"},
+		{"issuer query", "AEGIS_OIDC_ISSUER", "https://idp.example.com?x=1"},
+		{"issuer ftp", "AEGIS_OIDC_ISSUER", "ftp://idp.example.com"},
+		{"scopes missing openid", "AEGIS_OIDC_SCOPES", "profile email"},
+		{"invalid auto provision", "AEGIS_OIDC_AUTO_PROVISION", "yes"},
+		{"discovery timeout too large", "AEGIS_OIDC_DISCOVERY_TIMEOUT", "31s"},
+		{"client id too long", "AEGIS_OIDC_CLIENT_ID", strings.Repeat("a", 257)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_OIDC_ISSUER", "https://idp.example.com")
+			t.Setenv("AEGIS_OIDC_CLIENT_ID", "aegisflow")
+			t.Setenv("AEGIS_OIDC_REDIRECT_URL", "https://aegis.example.com/api/v1/auth/oidc/callback")
+			t.Setenv(tc.key, tc.value)
+			if _, err := Load(); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+	t.Run("redirect URL unsafe forms rejected", func(t *testing.T) {
+		for _, redirect := range []string{
+			"http://aegis.example.com/cb",
+			"https://user:pass@aegis.example.com/cb",
+			"https://aegis.example.com/cb#fragment",
+			"https://aegis.example.com/cb?query=1",
+			"relative/cb",
+		} {
+			setup(t)
+			t.Setenv("AEGIS_OIDC_ISSUER", "https://idp.example.com")
+			t.Setenv("AEGIS_OIDC_CLIENT_ID", "aegisflow")
+			t.Setenv("AEGIS_OIDC_REDIRECT_URL", redirect)
+			if _, err := Load(); err == nil {
+				t.Fatalf("redirect %q accepted", redirect)
+			}
+		}
+	})
 }

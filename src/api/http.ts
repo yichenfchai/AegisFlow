@@ -143,3 +143,17 @@ export const authAPI = {
   logout: () => httpRequest<{ loggedOut: boolean }>('/auth/logout', { method: 'POST', body: '{}' }),
   me: (token: string) => httpRequest<SessionUser>('/auth/me', {}, token),
 }
+
+/**
+ * OIDC 单点登录可用性探针（公开、GET）。未配置时后端返回
+ * `{enabled:false,label:''}`，不会泄露 issuer/client id；登录页据此决定是否
+ * 渲染 SSO 入口，未启用时页面保持纯密码登录，不显示任何 SSO 占位。
+ */
+export interface OIDCConfig {
+  enabled: boolean
+  label: string
+}
+
+export const oidcAPI = {
+  config: () => httpRequest<OIDCConfig>('/auth/oidc/config'),
+}
