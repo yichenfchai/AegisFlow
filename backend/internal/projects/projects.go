@@ -204,6 +204,29 @@ func (s *Service) AuthorizeWrite(ctx context.Context, q RowQuerier, actor auth.A
 	return nil
 }
 
+// AuthorizeDecide applies the reviewer overlay used by the review center: a
+// global admin may always decide, and a global member must additionally be a
+// maintainer of that project. It is deliberately stricter than AuthorizeWrite:
+// being allowed to write a public project does not imply being allowed to
+// approve or reject its reviews. Visibility stays the caller's responsibility,
+// so an invisible project is a 404 before this check runs.
+func (s *Service) AuthorizeDecide(ctx context.Context, q RowQuerier, actor auth.Actor, projectID string) error {
+	if actor.Role == globalAdminRole {
+		return nil
+	}
+	if actor.Role != globalMemberRole {
+		return fmt.Errorf("%w: read-only roles cannot decide reviews", ErrForbidden)
+	}
+	role, ok, err := memberRole(ctx, q, actor.ID, projectID)
+	if err != nil {
+		return err
+	}
+	if !ok || role != RoleMaintainer {
+		return fmt.Errorf("%w: only a project maintainer or a global admin can decide reviews", ErrForbidden)
+	}
+	return nil
+}
+
 // memberRole reads one membership row; ok is false when the user is not a member.
 func memberRole(ctx context.Context, q RowQuerier, userID, projectID string) (role string, ok bool, err error) {
 	err = q.QueryRowContext(ctx, `SELECT role FROM project_members WHERE project_id=$1 AND user_id=$2`, projectID, userID).Scan(&role)

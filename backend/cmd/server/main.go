@@ -22,6 +22,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
+	"github.com/yichenfchai/AegisFlow/backend/internal/reviews"
 )
 
 func main() {
@@ -105,6 +106,9 @@ func run(logger *slog.Logger) error {
 		}
 	}
 	registry := projects.New(db)
+	// The review center is the gate record for change reviews: creation follows
+	// the project write overlay, decisions need a maintainer or a global admin.
+	reviewCenter := reviews.New(db, registry)
 	pipeline := builds.New(db, registry).WithSandbox(builds.Sandbox{
 		Mode:   builds.SandboxMode(cfg.BuildSandbox),
 		Image:  cfg.BuildImage,
@@ -141,7 +145,7 @@ func run(logger *slog.Logger) error {
 	// alone would wait out its 10s drain whenever an SSE client is connected.
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Metrics: monitoring, ShutdownContext: signalCtx})
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Reviews: reviewCenter, Metrics: monitoring, ShutdownContext: signalCtx})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	if monitoring != nil {
 		mux := http.NewServeMux()

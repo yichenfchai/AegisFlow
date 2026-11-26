@@ -24,6 +24,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
+	"github.com/yichenfchai/AegisFlow/backend/internal/reviews"
 )
 
 type contextKey int
@@ -48,6 +49,7 @@ type Server struct {
 	projects     *projects.Service
 	builds       *builds.Service
 	deployments  *deployments.Service
+	reviews      *reviews.Service
 	logger       *slog.Logger
 	ready        func(context.Context) error
 	origins      map[string]bool
@@ -89,6 +91,9 @@ type Options struct {
 	// Deployments enables the admin-only deployment-target routes; nil fails
 	// closed with 503 like any other missing shared dependency.
 	Deployments *deployments.Service
+	// Reviews enables the review-gate routes; nil fails closed with 503 like any
+	// other missing shared dependency.
+	Reviews *reviews.Service
 	// Metrics, when set, records request counters and latency histograms keyed
 	// by the matched route template. Nil disables recording.
 	Metrics *metrics.Registry
@@ -109,7 +114,7 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
-	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure, metrics: opts.Metrics, shutdownCtx: shutdownCtx}
+	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, reviews: opts.Reviews, logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure, metrics: opts.Metrics, shutdownCtx: shutdownCtx}
 	for _, o := range origins {
 		s.origins[o] = true
 	}
@@ -164,6 +169,11 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	// service authorizes every action against the project write overlay.
 	projectRoutes.GET("/:id/deployments", s.listDeployments)
 	projectRoutes.POST("/:id/deployments", s.createDeployment)
+	// Review requests are created and listed under their project; decisions are
+	// on the review itself. The service applies the visibility predicate and the
+	// write/maintainer overlays, exactly like the deployment routes.
+	projectRoutes.GET("/:id/reviews", s.listReviews)
+	projectRoutes.POST("/:id/reviews", s.createReview)
 	buildRoutes := api.Group("/builds", s.authenticate())
 	buildRoutes.GET("", s.listBuilds)
 	buildRoutes.GET("/:id", s.getBuild)
@@ -196,6 +206,13 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	approvalRoutes.GET("", s.listApprovals)
 	approvalRoutes.POST("/:id/approve", s.approveApproval)
 	approvalRoutes.POST("/:id/reject", s.rejectApproval)
+	// Review decisions are authorized per project by the service (global admin
+	// or maintainer), so the route only requires authentication.
+	reviewRoutes := api.Group("/reviews", s.authenticate())
+	reviewRoutes.GET("/:id", s.getReview)
+	reviewRoutes.POST("/:id/approve", s.approveReview)
+	reviewRoutes.POST("/:id/reject", s.rejectReview)
+	reviewRoutes.POST("/:id/cancel", s.cancelReview)
 	router.NoRoute(func(c *gin.Context) { s.fail(c, 404, "not_found", "endpoint not found") })
 	return router
 }
@@ -1399,6 +1416,135 @@ func (s *Server) rejectApproval(c *gin.Context) {
 		return
 	}
 	s.respond(c, 200, approval)
+}
+
+// reviewError maps review-center errors to the shared error envelope. The
+// messages describe the contract (subject/reason bounds, reviewer matrix, state
+// machine) without echoing user content.
+func (s *Server) reviewError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, reviews.ErrValidation):
+		s.fail(c, 400, "validation_failed", "subject 3-200 bytes on one line, description at most 2000 bytes, version at most 64 bytes on one line, externalUrl an http(s) URL without userinfo or fragment, and reject requires a reason of at most 512 bytes on one line")
+	case errors.Is(err, reviews.ErrConflict):
+		s.fail(c, 409, "conflict", "review is already terminal or is not in the expected state for this operation")
+	case errors.Is(err, reviews.ErrForbidden):
+		s.fail(c, 403, "forbidden", "the caller may see this project but may not write it, or is not a project maintainer or global admin for review decisions")
+	case errors.Is(err, reviews.ErrNotFound):
+		s.fail(c, 404, "not_found", "resource not found")
+	default:
+		s.logger.ErrorContext(c.Request.Context(), "review request failed", "requestId", requestID(c), "error", err)
+		s.fail(c, 500, "internal_error", "internal server error")
+	}
+}
+
+func (s *Server) createReview(c *gin.Context) {
+	if s.reviews == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	var input struct {
+		Subject     string `json:"subject"`
+		Description string `json:"description"`
+		Version     string `json:"version"`
+		ExternalURL string `json:"externalUrl"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	review, err := s.reviews.Create(c.Request.Context(), actorFrom(c), c.Param("id"), reviews.Input{
+		Subject: input.Subject, Description: input.Description, Version: input.Version, ExternalURL: input.ExternalURL,
+	})
+	if err != nil {
+		s.reviewError(c, err)
+		return
+	}
+	s.respond(c, 201, review)
+}
+
+// listReviews pages the reviews of one visible project, newest first; status is
+// an optional filter.
+func (s *Server) listReviews(c *gin.Context) {
+	if s.reviews == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	limit, offset, ok := s.page(c)
+	if !ok {
+		return
+	}
+	list, total, err := s.reviews.List(c.Request.Context(), actorFrom(c), c.Param("id"), c.Query("status"), limit, offset)
+	if err != nil {
+		s.reviewError(c, err)
+		return
+	}
+	s.respond(c, 200, gin.H{"items": list, "total": total, "limit": limit, "offset": offset})
+}
+
+func (s *Server) getReview(c *gin.Context) {
+	if s.reviews == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	review, err := s.reviews.Get(c.Request.Context(), actorFrom(c), c.Param("id"))
+	if err != nil {
+		s.reviewError(c, err)
+		return
+	}
+	s.respond(c, 200, review)
+}
+
+func (s *Server) approveReview(c *gin.Context) {
+	if s.reviews == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	var input struct {
+		Reason string `json:"reason"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	review, err := s.reviews.Approve(c.Request.Context(), actorFrom(c), c.Param("id"), input.Reason)
+	if err != nil {
+		s.reviewError(c, err)
+		return
+	}
+	s.respond(c, 200, review)
+}
+
+func (s *Server) rejectReview(c *gin.Context) {
+	if s.reviews == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	var input struct {
+		Reason string `json:"reason"`
+	}
+	if !s.decode(c, &input) {
+		return
+	}
+	review, err := s.reviews.Reject(c.Request.Context(), actorFrom(c), c.Param("id"), input.Reason)
+	if err != nil {
+		s.reviewError(c, err)
+		return
+	}
+	s.respond(c, 200, review)
+}
+
+func (s *Server) cancelReview(c *gin.Context) {
+	if s.reviews == nil {
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
+		return
+	}
+	if !s.decode(c, &struct{}{}) {
+		return
+	}
+	review, err := s.reviews.Cancel(c.Request.Context(), actorFrom(c), c.Param("id"))
+	if err != nil {
+		s.reviewError(c, err)
+		return
+	}
+	s.respond(c, 200, review)
 }
 
 func (s *Server) changePassword(c *gin.Context) {
