@@ -393,6 +393,56 @@ func TestAuditFiltersAndRetention(t *testing.T) {
 	}
 }
 
+// TestExportAuditTruncationBoundsAndOrder pins the CSV export query contract: the
+// documented cap, newest-first ordering, the truncation signal read from one
+// extra row, and filter validation shared with ListAudit.
+func TestExportAuditTruncationBoundsAndOrder(t *testing.T) {
+	s, db := testService(t)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	seed := []struct {
+		action, objectType string
+		createdAt          int64
+	}{
+		{ActionLogin, "session", now - 30},
+		{ActionUserCreate, "user", now - 20},
+		{ActionUserDisable, "user", now - 10},
+	}
+	for i, row := range seed {
+		if _, err := db.ExecContext(ctx, `INSERT INTO auth_audit(id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
+		 VALUES($1,$2,'u1','alice',$3,$4,'obj','success','','req')`, fmt.Sprintf("export-audit-0000000000%d", i), row.createdAt, row.action, row.objectType); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entries, truncated, err := s.ExportAudit(ctx, AuditFilter{}, 2)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if len(entries) != 2 || !truncated {
+		t.Fatalf("export(2) = %d rows truncated=%v, want 2 and true", len(entries), truncated)
+	}
+	if entries[0].CreatedAt != now-10 || entries[1].CreatedAt != now-20 {
+		t.Fatalf("export order = %+v, want newest first", entries)
+	}
+	if entries, truncated, err = s.ExportAudit(ctx, AuditFilter{}, 3); err != nil || len(entries) != 3 || truncated {
+		t.Fatalf("export exactly at the count: %d rows truncated=%v err=%v", len(entries), truncated, err)
+	}
+	if entries, truncated, err = s.ExportAudit(ctx, AuditFilter{ObjectType: "user"}, AuditExportMaxRows); err != nil || len(entries) != 2 || truncated {
+		t.Fatalf("filtered export: %d rows truncated=%v err=%v", len(entries), truncated, err)
+	}
+	for _, bad := range []int{0, -1, AuditExportMaxRows + 1} {
+		if _, _, err = s.ExportAudit(ctx, AuditFilter{}, bad); !errors.Is(err, ErrValidation) {
+			t.Fatalf("export limit %d accepted: %v", bad, err)
+		}
+	}
+	for _, filter := range []AuditFilter{{Result: "maybe"}, {From: now, To: now - 10}} {
+		if _, _, err = s.ExportAudit(ctx, filter, 10); !errors.Is(err, ErrValidation) {
+			t.Fatalf("export filter %+v accepted: %v", filter, err)
+		}
+	}
+}
+
 func TestCleanupExpired(t *testing.T) {
 	s, db := testService(t)
 	ctx := context.Background()

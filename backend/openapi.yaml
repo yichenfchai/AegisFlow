@@ -600,6 +600,74 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/audit/export.csv:
+    get:
+      tags: [Audit]
+      operationId: exportAuditCSV
+      summary: Export the filtered audit trail as CSV (admin only)
+      description: |
+        Admin-only CSV export of the same filtered trail the list endpoint
+        returns: action, objectType, result, actor and from/to use identical
+        semantics and formats (from/to accept an RFC3339 timestamp or a
+        YYYY-MM-DD date; a date-only to includes that whole UTC day). The
+        response is RFC 4180 CSV whose header row is always
+        id,createdAt,action,objectType,objectId,result,actor,detail; a field
+        containing a comma, a double quote or a newline is quoted and embedded
+        quotes are doubled, records end with CRLF, and createdAt is RFC3339 in
+        UTC. At most 10000 rows are exported; when more match, the
+        X-Audit-Truncated response header is true and the client should narrow
+        the filters. The export never carries credentials, tokens, cookies or
+        request bodies: detail is the same redacted field the audit page shows.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: action
+          in: query
+          required: false
+          description: Exact action name, e.g. user.create or deployment.create
+          schema: { type: string, maxLength: 128 }
+        - name: objectType
+          in: query
+          required: false
+          description: Exact object type, e.g. user, project or deployment
+          schema: { type: string, maxLength: 128 }
+        - name: result
+          in: query
+          required: false
+          description: Filter by audit result
+          schema: { type: string, enum: [success, failure] }
+        - name: actor
+          in: query
+          required: false
+          description: Actor id or username; the username match is case-insensitive
+          schema: { type: string, maxLength: 128 }
+        - name: from
+          in: query
+          required: false
+          description: Inclusive lower bound (RFC3339 or YYYY-MM-DD)
+          schema: { type: string, maxLength: 40 }
+        - name: to
+          in: query
+          required: false
+          description: Inclusive upper bound (RFC3339 or YYYY-MM-DD, date-only means end of that UTC day)
+          schema: { type: string, maxLength: 40 }
+      responses:
+        '200':
+          description: CSV document; it contains the header row even when no row matches
+          headers:
+            X-Audit-Truncated:
+              description: Present and set to true when more than 10000 rows matched the filters
+              schema: { type: string }
+            Content-Disposition:
+              description: attachment with a filename that contains the UTC export date and time
+              schema: { type: string }
+          content:
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/projects:
     get:
       tags: [Projects]
@@ -1904,6 +1972,90 @@ paths:
                 required: [data, requestId]
                 properties:
                   data: { $ref: '#/components/schemas/Review' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/projects/{projectId}/policy:
+    get:
+      tags: [Policies]
+      operationId: getProjectPolicy
+      summary: Read a project's automation policy (visible projects)
+      description: |
+        Any role that can see the project may read its automation policy, and an
+        invisible project answers 404. A project without a stored row reports the
+        default policy: requireReview=false, requiredScanVerdict=none, updatedBy
+        empty and updatedAt 0. The policy explains why a deployment was gated:
+        requireReview requires an approved review of the same project regardless
+        of the target environment, and requiredScanVerdict=passed requires the
+        project's latest scan verdict to be passed.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      responses:
+        '200':
+          description: Project policy (the documented defaults when no row is stored)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ProjectPolicy' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    put:
+      tags: [Policies]
+      operationId: updateProjectPolicy
+      summary: Replace a project's automation policy (admin or project maintainer)
+      description: |
+        The policy lives in the database, not the environment. requireReview
+        forces an approved review of the same project for every deployment and
+        rollback of the project regardless of
+        AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS; requiredScanVerdict=passed
+        requires the project's latest scan verdict to be passed. Both are off by
+        default and a project without a row keeps the pre-policy behavior. The
+        upsert and its policy.update audit row commit in the same transaction;
+        the detail records only the project id and the two gate values. Both body
+        fields are mandatory (an omitted field is 400 invalid_request, not an
+        implicit default), unknown fields and null are rejected, and
+        requiredScanVerdict is limited to none or passed. Visibility is checked
+        first (invisible project = 404); the caller must then be a global admin
+        or a project maintainer (any other role that can see the project = 403).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{16,64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PolicyInput' }
+      responses:
+        '200':
+          description: Stored policy with the updater identity and timestamp
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/ProjectPolicy' }
                   requestId: { $ref: '#/components/schemas/RequestID' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -3639,6 +3791,24 @@ components:
       required: [value]
       properties:
         value: { type: string, minLength: 1, maxLength: 4096, description: 'Required replacement value: 1-4096 UTF-8 bytes; sealed with AES-256-GCM and never returned, logged or audited' }
+    ProjectPolicy:
+      type: object
+      additionalProperties: false
+      required: [projectId, requireReview, requiredScanVerdict, updatedBy, updatedAt]
+      properties:
+        projectId: { type: string }
+        requireReview: { type: boolean, description: When true every deployment and rollback of this project must reference an approved review of the same project regardless of the target environment }
+        requiredScanVerdict: { type: string, enum: [none, passed], description: "none disables the scan gate; passed requires the project's latest scan verdict to be passed before a deployment or rollback is created" }
+        updatedBy: { type: string, description: 'Last updater actor id snapshot; empty when no policy row is stored' }
+        updatedByName: { type: string, description: 'Last updater username resolved for display; absent when no row is stored or the account no longer resolves' }
+        updatedAt: { type: integer, format: int64, description: 'Unix seconds of the last update; 0 when no policy row is stored' }
+    PolicyInput:
+      type: object
+      additionalProperties: false
+      required: [requireReview, requiredScanVerdict]
+      properties:
+        requireReview: { type: boolean, description: 'Required; true forces an approved review of the same project for every deployment and rollback' }
+        requiredScanVerdict: { type: string, enum: [none, passed], description: 'Required; none disables the scan gate, passed requires the latest scan verdict to be passed' }
     AuditEntry:
       type: object
       additionalProperties: false
@@ -3648,8 +3818,8 @@ components:
         createdAt: { type: integer, format: int64, description: Unix seconds }
         actorId: { type: string, description: Empty for system rows }
         actorUsername: { type: string }
-        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check, deployment.create, deployment.cancel, deployment.rollback, approval.request, approval.approve, approval.reject, approval.expire, review.request, review.approve, review.reject, review.cancel, security_event.ack, knowledge.create, knowledge.update, knowledge.delete, secret.create, secret.update, secret.delete] }
-        objectType: { type: string, enum: [user, session, project, build, deployment_target, deployment, approval, review, security_event, knowledge_doc, secret] }
+        action: { type: string, enum: [auth.login, user.create, user.password_change, user.password_reset, user.disable, user.enable, user.role_change, session.revoke, session.revoke_all, project.create, project.update, project.archive, project.unarchive, project.member_add, project.member_update, project.member_remove, build.trigger, build.cancel, build.retry, deployment_target.create, deployment_target.update, deployment_target.remove, deployment_target.check, deployment.create, deployment.cancel, deployment.rollback, approval.request, approval.approve, approval.reject, approval.expire, review.request, review.approve, review.reject, review.cancel, security_event.ack, knowledge.create, knowledge.update, knowledge.delete, secret.create, secret.update, secret.delete, policy.update] }
+        objectType: { type: string, enum: [user, session, project, build, deployment_target, deployment, approval, review, security_event, knowledge_doc, secret, policy] }
         objectId: { type: string }
         result: { type: string, enum: [success, failure] }
         detail: { type: string, description: Safe context such as role transitions or revoked counts; never secrets }

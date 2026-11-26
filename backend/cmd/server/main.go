@@ -21,6 +21,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/httpapi"
 	"github.com/yichenfchai/AegisFlow/backend/internal/knowledge"
 	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
+	"github.com/yichenfchai/AegisFlow/backend/internal/policies"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
 	"github.com/yichenfchai/AegisFlow/backend/internal/ratelimit"
 	"github.com/yichenfchai/AegisFlow/backend/internal/reviews"
@@ -110,6 +111,10 @@ func run(logger *slog.Logger) error {
 		}
 	}
 	registry := projects.New(db)
+	// Per-project automation policy (P5 batch C): gate rules stored in the
+	// database, not the environment. The deployment service reads them through
+	// the injected gate interface; the review environment gate above stays.
+	policyStore := policies.New(db, registry)
 	// The review center is the gate record for change reviews: creation follows
 	// the project write overlay, decisions need a maintainer or a global admin.
 	// Review notifications reuse the approval webhook channel: one receiver gets
@@ -158,6 +163,9 @@ func run(logger *slog.Logger) error {
 		// The review gate is opt-in: an empty slice keeps deployment creation
 		// unchanged, and its list is independent of the approval policy.
 		RequireReviewEnvironments: cfg.RequireReviewEnvironments,
+		// The per-project automation policy composes on top of the environment
+		// gate; projects without a stored policy stay exactly as before.
+		PolicyGate: policyStore,
 	})
 	// Metrics are opt-in and live on their own listener: the public API origin
 	// must not expose deployment-wide counters, and scraping needs no session.
@@ -170,7 +178,7 @@ func run(logger *slog.Logger) error {
 	// alone would wait out its 10s drain whenever an SSE client is connected.
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Reviews: reviewCenter, Scans: scanRegistry, SecurityEvents: defenseEvents, Knowledge: knowledgeBase, Secrets: secretStore, ReviewWebhookSecret: cfg.ReviewWebhookSecret, IngestWebhookSecret: cfg.IngestWebhookSecret, Metrics: monitoring, ShutdownContext: signalCtx})
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Reviews: reviewCenter, Scans: scanRegistry, SecurityEvents: defenseEvents, Knowledge: knowledgeBase, Secrets: secretStore, Policies: policyStore, ReviewWebhookSecret: cfg.ReviewWebhookSecret, IngestWebhookSecret: cfg.IngestWebhookSecret, Metrics: monitoring, ShutdownContext: signalCtx})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	if monitoring != nil {
 		mux := http.NewServeMux()

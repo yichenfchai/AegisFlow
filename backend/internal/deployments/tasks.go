@@ -211,11 +211,13 @@ func (s *Service) CreateDeployment(ctx context.Context, actor auth.Actor, projec
 	}
 	// The review gate runs before the approval state machine: a required or
 	// supplied review must already be approved, so a deployment can never be
-	// enqueued (or await approval) without its change review.
-	if err = s.requireApprovedReview(ctx, tx, projectID, target.Environment, input.ReviewID); err != nil {
+	// enqueued (or await approval) without its change review. The project policy
+	// is part of the same check and can only add requirements.
+	policyApplied, err := s.applyDeploymentGates(ctx, tx, projectID, target.Environment, input.ReviewID)
+	if err != nil {
 		return Deployment{}, err
 	}
-	deployment, err := s.enqueueDeployment(ctx, tx, actor, projectID, target, input.Version, input.BuildID, input.ReviewID, "", ActionDeployCreate)
+	deployment, err := s.enqueueDeployment(ctx, tx, actor, projectID, target, input.Version, input.BuildID, input.ReviewID, "", policyApplied, ActionDeployCreate)
 	if err != nil {
 		return Deployment{}, err
 	}
@@ -233,10 +235,14 @@ func (s *Service) CreateDeployment(ctx context.Context, actor auth.Actor, projec
 // the same transaction, approval_id is set, and both the deployment action and
 // approval.request are audited. reviewID is the approved review that gated the
 // deployment (already validated by the caller) and is snapshotted on the row.
+// policyApplied reports that the project automation policy contributed a
+// requirement, which the detail records as policy=<projectId> so an audit reader
+// can tell why a deployment was gated even when the environment gate is off.
 // Detail follows design §8: create records approval=required|none, rollback
-// records the source and version; both append review=<id> when gated.
+// records the source and version; both append review=<id> when gated and
+// policy=<projectId> when the project policy applied.
 func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.Actor, projectID string, target targetSnapshot,
-	version, buildID, reviewID, rollbackOf, action string) (Deployment, error) {
+	version, buildID, reviewID, rollbackOf string, policyApplied bool, action string) (Deployment, error) {
 	var count int64
 	var projectStatus string
 	err := tx.QueryRowContext(ctx, `SELECT deploy_count,status FROM projects WHERE id=$1 FOR UPDATE`, projectID).Scan(&count, &projectStatus)
@@ -310,6 +316,9 @@ func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.
 	}
 	if reviewID != "" {
 		detail += " review=" + reviewID
+	}
+	if policyApplied {
+		detail += " policy=" + projectID
 	}
 	if err = writeAuditObject(ctx, tx, actor, action, "deployment", deployment.ID, detail); err != nil {
 		return Deployment{}, err
@@ -547,11 +556,13 @@ func (s *Service) RollbackDeployment(ctx context.Context, actor auth.Actor, id, 
 		return Deployment{}, err
 	}
 	// A rollback is a second deploy attempt of the same project, so it passes
-	// the same review gate as a fresh deployment before the approval machine.
-	if err = s.requireApprovedReview(ctx, tx, source.ProjectID, target.Environment, reviewID); err != nil {
+	// the same review and project-policy gates as a fresh deployment before the
+	// approval machine.
+	policyApplied, err := s.applyDeploymentGates(ctx, tx, source.ProjectID, target.Environment, reviewID)
+	if err != nil {
 		return Deployment{}, err
 	}
-	deployment, err := s.enqueueDeployment(ctx, tx, actor, source.ProjectID, target, version, "", reviewID, source.ID, ActionDeployRollback)
+	deployment, err := s.enqueueDeployment(ctx, tx, actor, source.ProjectID, target, version, "", reviewID, source.ID, policyApplied, ActionDeployRollback)
 	if err != nil {
 		return Deployment{}, err
 	}

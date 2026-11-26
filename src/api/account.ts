@@ -122,6 +122,7 @@ export const AUDIT_ACTION_TEXT: Record<string, string> = {
   'deployment_target.update': '更新部署目标',
   'deployment_target.remove': '删除部署目标',
   'deployment_target.check': '检查部署目标',
+  'policy.update': '更新自动化策略',
 }
 
 export const AUDIT_OBJECT_TEXT: Record<string, string> = {
@@ -132,4 +133,5 @@ export const AUDIT_OBJECT_TEXT: Record<string, string> = {
   build: '构建',
   deployment: '部署',
   approval: '审批',
+  policy: '策略',
 }

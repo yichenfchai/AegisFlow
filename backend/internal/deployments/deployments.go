@@ -105,6 +105,11 @@ type Options struct {
 	// ApprovalEnvironments: the review is checked first, then the approval state
 	// machine decides whether execution still needs a release approval.
 	RequireReviewEnvironments []string
+	// PolicyGate supplies the per-project automation policy inside the
+	// deployment transaction: internal/policies implements it. Nil disables the
+	// policy gate, which is exactly the behavior of every project without a
+	// stored policy row, so existing embedders and tests stay unchanged.
+	PolicyGate PolicyGate
 	// HealthCheckAttempts is how many times the worker probes the target's
 	// health path after a 2xx deploy response; 0 disables the post-deploy
 	// check. cmd/server passes the configured value, whose default is 3.
@@ -187,7 +192,10 @@ type Service struct {
 	// approved review before a deployment row may even be created. Empty (the
 	// default) disables the review gate.
 	reviewEnvironments map[string]bool
-	approvalTTL        time.Duration
+	// policyGate reads the per-project automation policy and the latest scan
+	// verdict inside the deployment transaction. Nil disables the gate.
+	policyGate  PolicyGate
+	approvalTTL time.Duration
 	// Approval notifications use a transactional outbox stored in
 	// approval_notifications; an empty webhookURL disables enqueueing.
 	webhookURL    string
@@ -284,6 +292,7 @@ func New(db *sql.DB, opts Options) *Service {
 		httpClient:             client,
 		approvalEnvironments:   approvalSet,
 		reviewEnvironments:     reviewEnvironments,
+		policyGate:             opts.PolicyGate,
 		approvalTTL:            approvalTTL,
 		webhookURL:             opts.ApprovalWebhookURL,
 		webhookSecret:          append([]byte(nil), opts.ApprovalWebhookSecret...),

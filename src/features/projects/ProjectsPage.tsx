@@ -126,6 +126,9 @@ export function ProjectsPage() {
           <Link to={`/projects/${p.id}/members`} className="text-label-sm text-primary hover:underline">
             成员
           </Link>
+          <Link to={`/projects/${p.id}/policy`} className="text-label-sm text-primary hover:underline">
+            策略
+          </Link>
           {canEdit &&
             (p.buildCommand ? (
               <Button

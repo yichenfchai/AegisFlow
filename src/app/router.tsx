@@ -10,6 +10,7 @@ import { ProjectWizardPage } from '@/features/projects/ProjectWizardPage'
 import { ProjectsPage } from '@/features/projects/ProjectsPage'
 import { ProjectEditPage } from '@/features/projects/ProjectEditPage'
 import { ProjectMembersPage } from '@/features/projects/ProjectMembersPage'
+import { ProjectPolicyPage } from '@/features/projects/ProjectPolicyPage'
 import { AccountSecurityPage } from '@/features/account/AccountSecurityPage'
 import { DeploymentListPage } from '@/features/deployments/DeploymentListPage'
 import { DeploymentNewPage } from '@/features/deployments/DeploymentNewPage'
@@ -29,7 +30,7 @@ import { DeploymentTargetDetailPage } from '@/features/deployments/DeploymentTar
 
 /**
  * 真实页面（项目、构建、部署、审批、审查、安全扫描、攻击防御、知识库、密钥管理、账号、
- * 用户与审计）不进 Gate；非主线页面恒定显示 UnimplementedPage，不提供演示数据。
+ * 用户、审计与自动化策略）不进 Gate；非主线页面恒定显示 UnimplementedPage，不提供演示数据。
  */
 export const router = createBrowserRouter([
   { path: '/login', element: <LoginPage /> },
@@ -41,6 +42,9 @@ export const router = createBrowserRouter([
       { path: '/projects/new', element: <ProjectWizardPage /> },
       { path: '/projects/:id/edit', element: <ProjectEditPage /> },
       { path: '/projects/:id/members', element: <ProjectMembersPage /> },
+      // Per-project automation policy: admin or project maintainer writes it;
+      // every role that can see the project reads it.
+      { path: '/projects/:id/policy', element: <ProjectPolicyPage /> },
 
       // 真实构建闭环：列表、详情、取消；AI 诊断尚未接入
       { path: '/builds', element: <BuildListPage /> },

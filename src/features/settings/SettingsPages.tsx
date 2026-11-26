@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/DataTable'
 import { Segmented, StatusBadge } from '@/components/ui/Badge'
 import { adminAPI, AUDIT_ACTION_TEXT, AUDIT_OBJECT_TEXT, type AccountUser, type AuditEntry, type AuditFilters } from '@/api/account'
+import { auditAPI, downloadBlob } from '@/api/audit'
 import { ApiError } from '@/api/http'
 import { errorText } from '@/api/errors'
 import { useSession } from '@/stores/session'
@@ -299,6 +300,9 @@ function AuditTab() {
   const [actor, setActor] = useState('')
   const [from, setFrom] = useState('')
   const [to, setTo] = useState('')
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState('')
+  const [exportNotice, setExportNotice] = useState('')
 
   const filters: AuditFilters = {
     action: action || undefined,
@@ -324,6 +328,27 @@ function AuditTab() {
     setFrom('')
     setTo('')
     setPage(1)
+  }
+  // 导出当前筛选（同一组 from/to/action/objectType/result/actor）：服务端最多
+  // 10000 条，超过时通过 X-Audit-Truncated 提示，下载由浏览器完成。
+  const exportCsv = async () => {
+    if (exporting) return
+    setExportError('')
+    setExportNotice('')
+    setExporting(true)
+    try {
+      const result = await auditAPI.exportCsv(filters)
+      downloadBlob(result.blob, result.filename)
+      setExportNotice(
+        result.truncated
+          ? '导出已截断：命中超过 10000 条，仅包含最新 10000 条；请缩小筛选范围后重新导出'
+          : '已开始下载当前筛选条件下的审计 CSV',
+      )
+    } catch (cause) {
+      setExportError(errorText(cause, '导出 CSV 失败，请稍后重试'))
+    } finally {
+      setExporting(false)
+    }
   }
 
   return (
@@ -415,8 +440,27 @@ function AuditTab() {
           <Button variant="secondary" onClick={reset}>
             重置筛选
           </Button>
+          <Button variant="secondary" disabled={exporting} onClick={() => void exportCsv()}>
+            {exporting ? '导出中...' : '导出 CSV'}
+          </Button>
         </div>
       </div>
+      {exportNotice && (
+        <p
+          role="status"
+          className="mb-space-md text-body-sm text-on-surface bg-surface-container border border-surface-container-highest rounded px-space-lg py-space-md"
+        >
+          {exportNotice}
+        </p>
+      )}
+      {exportError && (
+        <p
+          role="alert"
+          className="mb-space-md text-body-sm text-error bg-error/10 rounded px-space-lg py-space-md"
+        >
+          {exportError}
+        </p>
+      )}
       {error ? (
         <p role="alert" className="text-body-md text-error py-space-lg">
           {errorText(error, '加载审计失败')}
