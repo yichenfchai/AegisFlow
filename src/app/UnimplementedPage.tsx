@@ -19,7 +19,7 @@ export function UnimplementedPage({ title }: { title: string }) {
             此模块的真实业务接口尚未实现，当前不提供演示数据或操作按钮。
           </p>
           <p className="mt-space-md text-body-sm text-outline">
-            当前已上线：真实账号鉴权与管理、项目注册表、构建闭环，以及部署目标、部署任务与部署审批；本模块属于后续阶段。
+            当前已上线：真实账号鉴权与管理、项目注册表、构建闭环，以及部署目标、部署任务、部署审批与审查中心；本模块属于后续阶段。
           </p>
         </div>
       </div>

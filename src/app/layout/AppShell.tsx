@@ -27,8 +27,8 @@ export function AppShell() {
       <main className="pt-12 pb-7 pl-[200px] min-h-screen">
         <div className="p-6 max-w-[1440px]">
           <div role="status" className="mb-space-lg rounded border border-surface-container-highest bg-surface-container px-space-lg py-space-md text-body-sm text-on-surface-variant">
-            项目、构建、部署、审批、账号、审计与部署目标使用真实服务；其余业务模块尚未接入，页面显示未实现声明。
-            {' '}项目与构建写操作受角色限制（admin/member 可写，viewer 只读）；部署记录按项目可见性过滤，成员可对可写项目发起、取消与回滚部署；部署目标与审批仅管理员可用。
+            项目、构建、部署、审查、审批、账号、审计与部署目标使用真实服务；其余业务模块尚未接入，页面显示未实现声明。
+            {' '}项目与构建写操作受角色限制（admin/member 可写，viewer 只读）；部署记录按项目可见性过滤，成员可对可写项目发起、取消与回滚部署；审查由成员在可写项目发起、维护者或管理员批准/拒绝；部署目标与审批仅管理员可用。
           </div>
           <Outlet />
         </div>

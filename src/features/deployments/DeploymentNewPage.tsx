@@ -9,6 +9,7 @@ import {
   type DeploymentTargetOption,
 } from '@/api/deployTasks'
 import { projectsAPI } from '@/api/projects'
+import { reviewsAPI, reviewOptionLabel, type Review } from '@/api/reviews'
 import { ApiError } from '@/api/http'
 import { errorText } from '@/api/errors'
 
@@ -17,7 +18,7 @@ const VERSION_PATTERN = /^[A-Za-z0-9._+-]{1,64}$/
 function createError(cause: unknown): string {
   if (cause instanceof ApiError) {
     if (cause.status === 400) {
-      return '请求不合法：检查版本格式（1-64 位字母、数字、. _ + -）、目标是否启用、构建 ID 是否为本项目的成功构建'
+      return '请求不合法：检查版本格式（1-64 位字母、数字、. _ + -）、目标是否启用、构建 ID 是否为本项目的成功构建；若目标环境启用了审查门禁，请先选择一条该项目已批准的审查（没有则先到审查中心发起并等待批准）'
     }
     if (cause.status === 403) return '你在该项目没有部署权限：需要项目维护者或被允许的成员角色'
     if (cause.status === 404) return '项目不存在、对你不可见，或你在该项目没有写权限'
@@ -34,6 +35,7 @@ export function DeploymentNewPage() {
   const queryClient = useQueryClient()
   const [projectId, setProjectId] = useState('')
   const [targetId, setTargetId] = useState('')
+  const [reviewId, setReviewId] = useState('')
   const [version, setVersion] = useState('')
   const [buildId, setBuildId] = useState('')
   const [error, setError] = useState('')
@@ -49,8 +51,16 @@ export function DeploymentNewPage() {
     queryFn: listTargets,
     staleTime: 60_000,
   })
+  // 可选「关联网关审查」：仅该项目已批准的审查；门禁环境要求必须关联，默认关闭时可选。
+  const approvedReviewsQuery = useQuery({
+    queryKey: ['project-reviews', projectId, 'approved'],
+    queryFn: () => reviewsAPI.listByProject(projectId, { status: 'approved', limit: 100 }),
+    enabled: projectId !== '',
+    staleTime: 30_000,
+  })
   const projects = projectsQuery.data?.items ?? []
   const targets = targetsQuery.data?.items ?? []
+  const approvedReviews: Review[] = approvedReviewsQuery.data?.items ?? []
 
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault()
@@ -75,6 +85,7 @@ export function DeploymentNewPage() {
         targetId,
         version: trimmedVersion,
         buildId: buildId.trim() || undefined,
+        reviewId: reviewId || undefined,
       })
       await queryClient.invalidateQueries({ queryKey: ['deployments'] })
       nav(`/deploys/${deployment.id}`, {
@@ -98,7 +109,10 @@ export function DeploymentNewPage() {
           <Select
             id="deploy-project"
             value={projectId}
-            onChange={(e) => setProjectId(e.target.value)}
+            onChange={(e) => {
+              setProjectId(e.target.value)
+              setReviewId('')
+            }}
             disabled={busy || projectsQuery.isLoading}
           >
             <option value="">请选择项目</option>
@@ -108,6 +122,30 @@ export function DeploymentNewPage() {
               </option>
             ))}
           </Select>
+        </Field>
+        <Field
+          label="关联网关审查"
+          hint="选填；只列出该项目已批准的审查。目标环境启用审查门禁时必须关联"
+          htmlFor="deploy-review"
+        >
+          <Select
+            id="deploy-review"
+            value={reviewId}
+            onChange={(e) => setReviewId(e.target.value)}
+            disabled={busy || !projectId || approvedReviewsQuery.isLoading}
+          >
+            <option value="">不关联审查</option>
+            {approvedReviews.map((review) => (
+              <option key={review.id} value={review.id}>
+                {reviewOptionLabel(review)}
+              </option>
+            ))}
+          </Select>
+          {projectId !== '' && !approvedReviewsQuery.isLoading && approvedReviews.length === 0 && (
+            <p className="text-label-sm text-warning mt-space-xs">
+              该项目还没有已批准的审查；启用审查门禁的环境需要先到审查中心发起并批准一条审查。
+            </p>
+          )}
         </Field>
         <Field label="目标" hint="只列出启用中的目标；凭据不会回显" htmlFor="deploy-target">
           <Select

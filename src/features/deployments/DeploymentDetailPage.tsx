@@ -279,6 +279,13 @@ export function DeploymentDetailPage() {
               </span>
             </MetaRow>
           )}
+          {deployment.reviewId && (
+            <MetaRow label="审查">
+              <Link to={`/reviews/${deployment.reviewId}`} className="text-primary hover:underline">
+                查看关联审查
+              </Link>
+            </MetaRow>
+          )}
           {deployment.rollbackOf && (
             <MetaRow label="回滚自">
               <Link to={`/deploys/${deployment.rollbackOf}`} className="text-primary hover:underline">
