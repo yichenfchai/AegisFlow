@@ -192,6 +192,107 @@ go run ./cmd/rekey
 
 **schema 变更约定**：新增列必须带默认值或允许 NULL；新代码兼容旧数据；删除/重命名放在后续版本，并至少跨一个发布周期。
 
+## 生产化运维（升级/回滚/备份/租户级迁移）
+
+本节把升级、回滚、备份恢复与租户迁移串成可执行的运维流程；脚本用法、参数与故障排查见 [scripts/ops/README.md](../scripts/ops/README.md)，脚本本身（`scripts/ops/backup-postgres.ps1`、`restore-postgres.ps1`、`export-tenant.ps1`、`import-tenant.ps1`、`verify-schema.ps1`）面向 Windows PowerShell 5.1 与 `pwsh`，且**不在 CI 中运行**（需要真实数据库与凭据）。多租户阶段的 schema 版本是 v19：从 v19 起迁移只向前、没有 down migration，回滚必须走"恢复升级前备份 + 旧二进制"。
+
+### 升级前检查清单
+
+- [ ] 已用当前版本完成一次全库备份，`.dump` 与 `.sha256` 均落盘、**离线/加密保存**，并记录 SHA-256 到变更单。
+- [ ] 已记录当前 `SELECT max(version) FROM schema_migrations`（例如 19），并确认目标版本所需迁移清单来自同一发布线。
+- [ ] 已确认磁盘空间：备份大小、恢复演练库、PostgreSQL 数据目录与 WAL 均有足够余量（恢复需要一份额外全库空间）。
+- [ ] `AEGIS_SECRET_KEY`（轮换期还有 `AEGIS_SECRET_KEY_PREVIOUS`）、`AEGIS_JWT_SECRET`、TLS 私钥等机密已单独备份，且与数据库备份**分开存放**；轮换中的密钥不要提前删除。
+- [ ] 已确认所有副本/worker 都能在窗口内停止与重启，构建/部署队列已排空或允许 `interrupted`，网关摘流与恢复步骤明确。
+- [ ] 已安排变更窗口与回滚决策人，通知 tenant 管理员登录会短暂中断（滚动替换期间按副本摘流，正常无需全停）。
+- [ ] 已确认部署的 `AEGIS_DEFAULT_TENANT_SLUG` 在数据库中仍存在（v18/v19 升级与租户导入后尤其重要），否则 server 会拒绝启动。
+
+### 全库备份（升级前必须）
+
+```powershell
+$env:PGPASSWORD = Get-Content C:\secrets\pg.txt
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/ops/backup-postgres.ps1 `
+  -Database aegisflow -Host db.internal -Port 5432 -User aegis_backup `
+  -OutputDir D:\backups -SslMode verify-full
+```
+
+备份完成后确认输出中的 schema/归档库名、表数、TOC 条目数、文件大小与 SHA-256，并把哈希写入演练记录。`pg_restore --list` 校验失败或退出码非 0 时**不要继续升级**。Linux 环境等价的 `pg_dump` 命令见上文「备份与恢复」；恢复演练与租户导出同样可在隔离主机执行。
+
+### 升级步骤
+
+1. **停写/摘流**：把副本从网关摘除并停止旧版本进程（滚动替换时逐副本进行；本仓库迁移采用"先扩展后收缩"，但本批不改变 schema，升级窗口内仍建议避免新写入的部署/审批操作）。确认没有持锁的构建 worker 正在写库。
+2. **备份**：按上一节执行全库备份并校验归档；记录 `schema_migrations` 当前最大版本。
+3. **起新版本**：用新二进制启动（应用启动时在事务 advisory 锁下自动执行迁移，遇到未知更高版本会拒绝启动）。等待 `/readyz` 返回 200；观察启动日志确认迁移版本已推进到目标版本。
+4. **校验 schema**：
+
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/ops/verify-schema.ps1 `
+     -Database aegisflow -Host db.internal -Port 5432 -User aegis_backup -ExpectedVersion 19
+   ```
+
+   要求全部 `[PASS]`：`schema_migrations` 连续、24 张表齐全、14 张业务表 `tenant_id` NOT NULL 且外键/唯一索引存在。
+5. **冒烟**：`/healthz` 与 `/readyz` 200；管理员与一个普通租户用户（带 `tenantSlug`）登录成功；项目列表、构建详情、部署目标与审查/审批列表可读；触发一次构建并看到日志；设置页审计出现对应记录。多租户环境再抽查另一个租户数据不可见（跨租户 404）。
+6. **恢复流量**：把副本按依赖顺序重新接入网关并恢复写入，观察错误率、`/readyz`、构建/部署 worker 日志。
+7. **收尾**：确认构建/部署 worker 已领取租约、队列恢复；把备份哈希、迁移版本、冒烟结果、负责人写入演练记录。
+
+### 回滚策略（v19 起不可 down migrate）
+
+迁移账本没有 down migration，且 v13/v16/v19 之后旧二进制无法读取更高版本 schema（启动时拒绝）。因此：
+
+- **回滚 = 恢复升级前备份 + 回退旧二进制**，不是执行反向 SQL。升级前备份是唯一可信回滚点，没有可用备份就不应在生产执行不可逆迁移。
+- 回滚步骤：全部副本停写 → 新库恢复升级前 dump（`restore-postgres.ps1` 默认拒绝覆盖，建议恢复到新库）→ `verify-schema.ps1` 校验 → 用旧版本二进制指向恢复库启动 → `/readyz`+登录+关键列表冒烟 → 切流量。不要用 `pg_restore --clean` 直接覆盖在线库（会与在线连接/迁移锁冲突）。
+- 恢复出的库同样需要 `AEGIS_SECRET_KEY`（及轮换期旧钥），先跑 `cmd/rekey` dry run 确认密文可解（见「备份与恢复」第 4 步），再切生产。
+- 前端静态资源可独立回滚到上一版 `dist/` 并 `nginx -s reload`；API 与前端允许分开回退，但 schema 只能通过恢复备份回退。
+- 若只是应用版本问题而 schema 未变（本批只加脚本/文档，不改 schema），可以只回退二进制；一旦迁移已应用，回退二进制前必须确认它兼容当前 schema 版本。
+
+### 租户级备份/恢复（tenant 迁移）
+
+单个租户迁移不搬整库、不迁移会话：用 `export-tenant.ps1` 导出该租户全部业务数据（含 `secrets` 密文与 `project_members`），在目标库用 `import-tenant.ps1` 单事务导入。
+
+1. **准备**：目标库必须已由同发布线 server 启动并迁移到 **>= 导出包 schemaVersion**；记录源/目标 `max(version)` 与 `AEGIS_DEFAULT_TENANT_SLUG`。
+2. **停写窗口**：让该租户暂停触发构建/部署/审批/审查等写入（或整体摘流），避免导出快照之后仍有新写入未被迁移；导出本身是单快照一致的，但切换时应以停写窗口保证"导出后无新增"。
+3. **导出**：
+
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/ops/export-tenant.ps1 `
+     -TenantSlug acme -Database aegisflow -Host db.internal -Port 5432 -User aegis_backup `
+     -OutputDir D:\tenant-moves
+   ```
+
+   核对目录内 `manifest.json`：`schemaVersion`、租户 id/slug、逐表行数、总行数；导出包 README 说明密钥绑定，目录按机密数据管理（加密、访问控制、不入库）。
+4. **导入**：
+
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/ops/import-tenant.ps1 `
+     -TenantDir D:\tenant-moves\tenant-acme-20261128-231500 -Database aegisflow_new `
+     -Host db-new.internal -Port 5432 -User aegis_backup
+   ```
+
+   导入前会校验 manifest、每个 CSV 的 SHA-256 与表头、目标 schema 版本；目标库已有同 slug/同 id 租户时默认拒绝，确认替换才用 `-Force`（同一事务内删除并重建该租户数据，失败整体回滚）。目标 schema 更高时需显式 `-AllowNewerSchema`，并先确认新增迁移是加法变更。
+5. **校验**：`verify-schema.ps1` 全 PASS；逐表行数/关键数据与源库比对；用带 `tenantSlug` 的登录、项目/构建/部署/审查/审批列表与跨租户 404 做冒烟。**密钥要求**：目标部署必须配置与源部署相同的 `AEGIS_SECRET_KEY`（轮换期还需 `AEGIS_SECRET_KEY_PREVIOUS`），否则 `secrets` 与 `deployment_targets` 密文不可解密，只能重新录入；可用 `cmd/rekey` dry run 验证。
+6. **切换与回退**：确认目标部署 `AEGIS_DEFAULT_TENANT_SLUG` 指向仍存在的租户后切流量；保留源库数据与导出包直到租户验收完成。若导入出错，事务已回滚，修复后重试；若目标租户已被部分使用，用 `-Force` 从同一导出包重建（先确认目标库数据可丢弃）。
+
+### 密钥轮换注意
+
+- 部署目标凭据（`deployment_targets.secret_cipher`）轮换分两步：先设 `AEGIS_SECRET_KEY`=新钥、`AEGIS_SECRET_KEY_PREVIOUS`=旧钥并滚动重启（读先新后旧、写入只用新钥），再 `cmd/rekey` dry run 确认后 `-apply` 重加密，最后确认 `reencrypted=0` 再移除旧钥。详见「部署凭据密钥轮换」。
+- 独立密钥库（`secrets` 表，P5 批次 B）**没有多钥迁移**：轮换 `AEGIS_SECRET_KEY` 后旧密文不可读，且读取路径不存在，只能按运维流程重建。备份/恢复与租户迁移时，`secrets` 密文与**备份时点的当前密钥**绑定：恢复演练必须使用该时点的 `AEGIS_SECRET_KEY`，否则整库恢复后这些密文无法解密。
+- 轮换窗口内不要删除 `AEGIS_SECRET_KEY_PREVIOUS`；备份与导出包应按"需要哪把钥"记录密钥标识（不要记录密钥明文）。密钥与数据库备份必须分开保存。
+
+### 演练记录模板
+
+| 字段 | 内容 |
+| --- | --- |
+| 演练时间 | YYYY-MM-DD HH:MM–HH:MM（时区） |
+| 版本 | 后端/前端发布版本、期望 schema 版本、实际 `schema_migrations` 最大版本 |
+| 备份 | dump 文件名、大小、SHA-256、存储位置（加密/异地） |
+| 恢复 | 目标库、`restore-postgres.ps1` 结果、恢复后行数摘要、`verify-schema` 结果 |
+| 租户迁移 | 租户 slug/id、导出目录、manifest 总行数、导入目标库、导入后总行数、逐表比对结果 |
+| 密钥校验 | `cmd/rekey` dry run 输出（scanned/already_current/reencrypted/failed）、使用的密钥标识 |
+| 冒烟 | `/readyz`、管理员登录、项目/构建/部署/审查列表、跨租户 404 |
+| 实测 RTO/RPO | 从开始恢复到可登录的耗时、最近可恢复数据时间点 |
+| 负责人/结论 | 执行人、复核人、是否通过、遗留问题与后续动作 |
+
+演练至少每季度一次，在隔离环境进行，不接触生产凭据；演练记录按内部合规要求留存，不写入仓库。
+
 ## 监控与健康检查
 
 - `/healthz` 是进程存活（不查依赖），供编排系统做 liveness；`/readyz` 检查 PostgreSQL 与 Redis（2s 超时），依赖不可用时返回 503，供 readiness 与入口摘流。
