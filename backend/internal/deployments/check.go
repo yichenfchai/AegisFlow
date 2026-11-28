@@ -26,7 +26,7 @@ func (s *Service) Check(ctx context.Context, actor auth.Actor, id string) (Check
 	}
 	var endpoint, healthPath string
 	var sealed []byte
-	err := s.db.QueryRowContext(ctx, `SELECT endpoint,health_path,secret_cipher FROM deployment_targets WHERE id=$1`, id).Scan(&endpoint, &healthPath, &sealed)
+	err := s.db.QueryRowContext(ctx, `SELECT endpoint,health_path,secret_cipher FROM deployment_targets WHERE id=$1 AND tenant_id=$2`, id, actor.TenantID).Scan(&endpoint, &healthPath, &sealed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return CheckResult{}, ErrNotFound
 	}
@@ -50,8 +50,8 @@ func (s *Service) Check(ctx context.Context, actor auth.Actor, id string) (Check
 		return CheckResult{}, err
 	}
 	defer tx.Rollback()
-	updated, err := tx.ExecContext(ctx, `UPDATE deployment_targets SET last_check_at=$2,last_check_ok=$3,last_check_detail=$4 WHERE id=$1`,
-		id, result.CheckedAt, lastCheckOK, result.Detail)
+	updated, err := tx.ExecContext(ctx, `UPDATE deployment_targets SET last_check_at=$2,last_check_ok=$3,last_check_detail=$4 WHERE id=$1 AND tenant_id=$5`,
+		id, result.CheckedAt, lastCheckOK, result.Detail, actor.TenantID)
 	if err != nil {
 		return CheckResult{}, err
 	}

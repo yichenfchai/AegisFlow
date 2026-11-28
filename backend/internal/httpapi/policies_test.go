@@ -320,8 +320,8 @@ func TestProjectPolicyDeploymentGateHTTP(t *testing.T) {
 func seedHTTPPolicyScan(t *testing.T, db *sql.DB, projectID, verdict string, receivedAt int64) {
 	t.Helper()
 	id := seedHTTPID(t)
-	if _, err := db.Exec(`INSERT INTO scans(id,project_id,delivery_id,source,tool,version,verdict,summary,received_at)
-	 VALUES($1,$2,$3,'test-source','trivy','0.55.0',$4,'',$5)`, id, projectID, "delivery-"+id, verdict, receivedAt); err != nil {
+	if _, err := db.Exec(`INSERT INTO scans(id,tenant_id,project_id,delivery_id,source,tool,version,verdict,summary,received_at)
+	 VALUES($1,(SELECT tenant_id FROM projects WHERE id=$2),$2,$3,'test-source','trivy','0.55.0',$4,'',$5)`, id, projectID, "delivery-"+id, verdict, receivedAt); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -331,8 +331,8 @@ func seedHTTPPolicyScan(t *testing.T, db *sql.DB, projectID, verdict string, rec
 func seedHTTPPolicyRollbackSource(t *testing.T, db *sql.DB, projectID, targetID string, number int64, version string) string {
 	t.Helper()
 	id := seedHTTPID(t)
-	if _, err := db.Exec(`INSERT INTO deployments(id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,triggered_by,created_at)
-	 VALUES($1,$2,$3,'snapshot','https://snapshot.example.com','staging',$4,'succeeded',$5,$6,$7)`,
+	if _, err := db.Exec(`INSERT INTO deployments(id,tenant_id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,triggered_by,created_at)
+	 VALUES($1,(SELECT tenant_id FROM projects WHERE id=$2),$2,$3,'snapshot','https://snapshot.example.com','staging',$4,'succeeded',$5,$6,$7)`,
 		id, projectID, targetID, number, version, "admin", time.Now().Unix()-60); err != nil {
 		t.Fatal(err)
 	}

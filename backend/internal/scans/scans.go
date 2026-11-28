@@ -53,9 +53,11 @@ const (
 // Scan is one immutable scan result delivered by an external tool. Tool and
 // Version are empty when the delivery carried none; ReportURL is omitted when
 // absent. ProjectName is resolved from the project registry for display, so the
-// list does not need a second project query per row.
+// list does not need a second project query per row. TenantID is server-side
+// only; it is derived from the project the scan belongs to.
 type Scan struct {
 	ID          string `json:"id"`
+	TenantID    string `json:"-"`
 	ProjectID   string `json:"projectId"`
 	ProjectName string `json:"projectName"`
 	Source      string `json:"source"`
@@ -94,14 +96,14 @@ type Service struct {
 func New(db *sql.DB) *Service { return &Service{db: db} }
 
 // scanColumns is shared by every read; report_url may be NULL in the database.
-const scanColumns = `s.id,s.project_id,p.name,s.source,s.tool,s.version,s.verdict,s.summary,s.report_url,s.received_at`
+const scanColumns = `s.id,s.tenant_id,s.project_id,p.name,s.source,s.tool,s.version,s.verdict,s.summary,s.report_url,s.received_at`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
 func scanScan(row rowScanner) (*Scan, error) {
 	var scan Scan
 	var reportURL sql.NullString
-	if err := row.Scan(&scan.ID, &scan.ProjectID, &scan.ProjectName, &scan.Source, &scan.Tool, &scan.Version,
+	if err := row.Scan(&scan.ID, &scan.TenantID, &scan.ProjectID, &scan.ProjectName, &scan.Source, &scan.Tool, &scan.Version,
 		&scan.Verdict, &scan.Summary, &reportURL, &scan.ReceivedAt); err != nil {
 		return nil, err
 	}
@@ -191,8 +193,11 @@ func (s *Service) Ingest(ctx context.Context, projectID, deliveryID string, inpu
 	if err != nil {
 		return nil, false, err
 	}
-	var found int
-	err = s.db.QueryRowContext(ctx, `SELECT 1 FROM projects WHERE id=$1`, projectID).Scan(&found)
+	// The project resolves the owning tenant: the signed ingest webhook has no
+	// session, so the resource path is the tenant authority. Unknown ids are
+	// ErrNotFound; no cross-tenant or enumeration distinction is made.
+	var projectTenantID string
+	err = s.db.QueryRowContext(ctx, `SELECT tenant_id FROM projects WHERE id=$1`, projectID).Scan(&projectTenantID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, ErrNotFound
 	}
@@ -205,10 +210,10 @@ func (s *Service) Ingest(ctx context.Context, projectID, deliveryID string, inpu
 	}
 	receivedAt := time.Now().Unix()
 	result, err := s.db.ExecContext(ctx, `INSERT INTO scans
-		(id,project_id,delivery_id,source,tool,version,verdict,summary,report_url,received_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,''),$10)
-		ON CONFLICT (delivery_id) DO NOTHING
-		`, id, projectID, deliveryID, normalized.Source, normalized.Tool, normalized.Version,
+		(id,tenant_id,project_id,delivery_id,source,tool,version,verdict,summary,report_url,received_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11)
+		ON CONFLICT (tenant_id,delivery_id) DO NOTHING
+		`, id, projectTenantID, projectID, deliveryID, normalized.Source, normalized.Tool, normalized.Version,
 		normalized.Verdict, normalized.Summary, normalized.ReportURL, receivedAt)
 	if err != nil {
 		return nil, false, err
@@ -220,9 +225,10 @@ func (s *Service) Ingest(ctx context.Context, projectID, deliveryID string, inpu
 	// Read the stored row either way: a new delivery returns the row it just
 	// created, while a repeated delivery returns the original row unchanged (200)
 	// so the sender's retry is idempotent. The stored project is authoritative:
-	// it is the project the original delivery named.
+	// it is the project the original delivery named. A delivery id used in
+	// another tenant is a different idempotency scope and never collides here.
 	stored, err := scanScan(s.db.QueryRowContext(ctx, `SELECT `+scanColumns+` FROM scans s
-		JOIN projects p ON p.id=s.project_id WHERE s.delivery_id=$1`, deliveryID))
+		JOIN projects p ON p.id=s.project_id WHERE s.tenant_id=$1 AND s.delivery_id=$2`, projectTenantID, deliveryID))
 	if errors.Is(err, sql.ErrNoRows) {
 		// The conflicting row disappeared between INSERT and SELECT (project
 		// deletion cascaded); surface a conflict instead of a stale id.
@@ -244,7 +250,7 @@ func (s *Service) Get(ctx context.Context, actor auth.Actor, scanID string) (*Sc
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	scan, err := scanScan(s.db.QueryRowContext(ctx, `SELECT `+scanColumns+` FROM scans s
 		JOIN projects p ON p.id=s.project_id
-		WHERE s.id=$1 AND `+projects.VisiblePredicate("p", 2, 3), scanID, isAdmin, userID))
+		WHERE s.id=$1 AND s.tenant_id=$5 AND `+projects.VisiblePredicate("p", 2, 3, 4), scanID, actor.TenantID, isAdmin, userID, actor.TenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -260,8 +266,8 @@ func (s *Service) Get(ctx context.Context, actor auth.Actor, scanID string) (*Sc
 func visibleProject(ctx context.Context, db *sql.DB, actor auth.Actor, projectID string) error {
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	var found int
-	err := db.QueryRowContext(ctx, `SELECT 1 FROM projects p WHERE p.id=$1 AND `+projects.VisiblePredicate("p", 2, 3),
-		projectID, isAdmin, userID).Scan(&found)
+	err := db.QueryRowContext(ctx, `SELECT 1 FROM projects p WHERE p.id=$1 AND `+projects.VisiblePredicate("p", 2, 3, 4),
+		projectID, actor.TenantID, isAdmin, userID).Scan(&found)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -282,14 +288,14 @@ func (s *Service) ListProject(ctx context.Context, actor auth.Actor, projectID, 
 		return nil, 0, err
 	}
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM scans s WHERE s.project_id=$1 AND ($2='' OR s.verdict=$2)`,
-		projectID, verdict).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM scans s WHERE s.tenant_id=$3 AND s.project_id=$1 AND ($2='' OR s.verdict=$2)`,
+		projectID, verdict, actor.TenantID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+scanColumns+` FROM scans s
 		JOIN projects p ON p.id=s.project_id
-		WHERE s.project_id=$1 AND ($2='' OR s.verdict=$2)
-		ORDER BY s.received_at DESC,s.id DESC LIMIT $3 OFFSET $4`, projectID, verdict, limit, offset)
+		WHERE s.tenant_id=$5 AND s.project_id=$1 AND ($2='' OR s.verdict=$2)
+		ORDER BY s.received_at DESC,s.id DESC LIMIT $3 OFFSET $4`, projectID, verdict, limit, offset, actor.TenantID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -320,17 +326,17 @@ func (s *Service) ListVisible(ctx context.Context, actor auth.Actor, filter List
 	}
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	from := ` FROM scans s JOIN projects p ON p.id=s.project_id
-		WHERE ($1='' OR s.project_id=$1) AND ($2='' OR s.verdict=$2) AND ` + projects.VisiblePredicate("p", 3, 4)
+		WHERE ($1='' OR s.project_id=$1) AND ($2='' OR s.verdict=$2) AND ` + projects.VisiblePredicate("p", 3, 4, 5)
 	var total int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+from,
-		filter.ProjectID, filter.Verdict, isAdmin, userID).Scan(&total); err != nil {
+		filter.ProjectID, filter.Verdict, actor.TenantID, isAdmin, userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+scanColumns+` FROM scans s
 		JOIN projects p ON p.id=s.project_id
-		WHERE ($1='' OR s.project_id=$1) AND ($2='' OR s.verdict=$2) AND `+projects.VisiblePredicate("p", 3, 4)+`
-		ORDER BY s.received_at DESC,s.id DESC LIMIT $5 OFFSET $6`,
-		filter.ProjectID, filter.Verdict, isAdmin, userID, filter.Limit, filter.Offset)
+		WHERE ($1='' OR s.project_id=$1) AND ($2='' OR s.verdict=$2) AND `+projects.VisiblePredicate("p", 3, 4, 5)+`
+		ORDER BY s.received_at DESC,s.id DESC LIMIT $6 OFFSET $7`,
+		filter.ProjectID, filter.Verdict, actor.TenantID, isAdmin, userID, filter.Limit, filter.Offset)
 	if err != nil {
 		return nil, 0, err
 	}

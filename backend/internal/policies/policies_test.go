@@ -65,8 +65,8 @@ func seedScan(t *testing.T, db *sql.DB, projectID, verdict string, receivedAt in
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`INSERT INTO scans(id,project_id,delivery_id,source,tool,version,verdict,summary,received_at)
-	 VALUES($1,$2,$3,'test-source','trivy','0.55.0',$4,'',$5)`, id, projectID, "delivery-"+id, verdict, receivedAt); err != nil {
+	if _, err = db.Exec(`INSERT INTO scans(id,tenant_id,project_id,delivery_id,source,tool,version,verdict,summary,received_at)
+	 VALUES($1,(SELECT tenant_id FROM projects WHERE id=$2),$2,$3,'test-source','trivy','0.55.0',$4,'',$5)`, id, projectID, "delivery-"+id, verdict, receivedAt); err != nil {
 		t.Fatal(err)
 	}
 	return id

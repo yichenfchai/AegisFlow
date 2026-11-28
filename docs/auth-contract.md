@@ -2,7 +2,7 @@
 
 ## 范围和部署决定
 
-产品目标已明确为多人使用、多实例部署。采用 PostgreSQL 共享用户与会话、Redis 共享登录限流，多个 Go/Gin 应用副本通过负载均衡提供同源接口，无需粘性会话。SQLite 不再作为运行存储，旧开发数据不自动导入。业务数据访问按模块逐步抽出 Repository，Gin Context 不进入业务服务。构建 worker 为进程内单并发；副本之间用 PostgreSQL 会话级 advisory lock 竞争同一 worker 租约，只有持锁副本恢复中断构建并领取任务，其余副本待命并在锁释放后接管；领取继续使用 SKIP LOCKED 兜底。该租约保证同一时刻只有一个 worker，不提供并行吞吐。多租户处于阶段 F1：租户表与认证数据（用户/会话/JWT/审计）的租户归属、默认租户保证已交付，**业务数据隔离与租户开通入口尚未实现**；项目可见性与成员（服务端读过滤、写权限叠加与前端成员管理）已交付。
+产品目标已明确为多人使用、多实例部署。采用 PostgreSQL 共享用户与会话、Redis 共享登录限流，多个 Go/Gin 应用副本通过负载均衡提供同源接口，无需粘性会话。SQLite 不再作为运行存储，旧开发数据不自动导入。业务数据访问按模块逐步抽出 Repository，Gin Context 不进入业务服务。构建 worker 为进程内单并发；副本之间用 PostgreSQL 会话级 advisory lock 竞争同一 worker 租约，只有持锁副本恢复中断构建并领取任务，其余副本待命并在锁释放后接管；领取继续使用 SKIP LOCKED 兜底。该租约保证同一时刻只有一个 worker，不提供并行吞吐。多租户处于阶段 F2：租户表、认证数据租户归属、默认租户保证（F1）与**全量业务数据租户隔离 + 租户运维 CLI**（F2）已交付；登录页租户标识输入、界面租户展示与双租户 E2E 留待 F3。项目可见性与成员（服务端读过滤、写权限叠加与前端成员管理）已交付。
 
 数据库迁移与首次管理员创建使用 advisory 事务锁；刷新与退出锁定共享 session 行，跨实例并发消费旧令牌会触发一致撤销。所有实例须使用一致 JWT 密钥、会话配置与 Redis namespace。登录限流失败返回503，无进程内fallback。入口代理CIDR由 AEGIS_TRUSTED_PROXIES 明确指定，默认不信任转发头。部署样例和运维边界见 [部署说明](../deploy/README.md)。
 
@@ -60,10 +60,10 @@
 | POST /api/v1/projects/{id}/scans | **HMAC 签名（无用户会话）**：`X-AegisFlow-Timestamp`（±300s）+ `X-AegisFlow-Signature`（HMAC-SHA256）+ `X-AegisFlow-Delivery`（8–128 `[A-Za-z0-9._-]`），JSON `{source,tool?,version?,verdict,summary?,reportUrl?}` | 201；重复 `deliveryId` 幂等 200 返回既有记录；签名/时间戳/头缺失 401；未知项目 404；未配置 `AEGIS_INGEST_WEBHOOK_SECRET` 503 |
 | GET /api/v1/scans | Bearer（所有角色），limit/offset/projectId?/verdict? | 全局扫描分页，最新在前；仅含可见项目的扫描，不可见 `projectId` 过滤返回空列表（不可枚举） |
 | GET /api/v1/scans/{id} | Bearer（可见者） | 扫描详情（含 projectName）；不可见/不存在 404 |
-| POST /api/v1/security-events | **HMAC 签名（无用户会话）**：同上三个头，JSON `{source,severity,eventType,summary,occurredAt?,detailsUrl?}` | 201；重复 `deliveryId` 幂等 200 返回既有记录；`occurredAt` 不得晚于 now+300s；未配置 `AEGIS_INGEST_WEBHOOK_SECRET` 503 |
-| GET /api/v1/security-events | 管理员 Bearer，severity/status/source/limit/offset | 防御事件分页，按 occurredAt 倒序；非 admin 403 |
-| GET /api/v1/security-events/{id} | 管理员 Bearer | 事件详情；不存在 404；非 admin 403 |
-| POST /api/v1/security-events/{id}/ack | 管理员 Bearer，JSON {} | 200；open→acknowledged（记录确认人与时间），重复确认幂等不重复审计；不存在 404；非 admin 403 |
+| POST /api/v1/security-events | **HMAC 签名（无用户会话）**：同上三个头，JSON `{source,severity,eventType,summary,occurredAt?,detailsUrl?,tenantSlug?}` | 201；重复 `deliveryId` 幂等 200 返回既有记录（按租户幂等）；`occurredAt` 不得晚于 now+300s；`tenantSlug` 可选（签名覆盖，缺省为默认租户；未知/非法 404/400）；未配置 `AEGIS_INGEST_WEBHOOK_SECRET` 503 |
+| GET /api/v1/security-events | 管理员 Bearer，severity/status/source/limit/offset | 本租户防御事件分页，按 occurredAt 倒序；非 admin 403；跨租户事件 404 |
+| GET /api/v1/security-events/{id} | 管理员 Bearer | 本租户事件详情；不存在/跨租户 404；非 admin 403 |
+| POST /api/v1/security-events/{id}/ack | 管理员 Bearer，JSON {} | 200；open→acknowledged（记录确认人与时间），重复确认幂等不重复审计；不存在/跨租户 404；非 admin 403 |
 | GET /api/v1/knowledge | Bearer（所有已登录角色），q/limit/offset | 知识库分页 `{items,total,limit,offset}`，按 updatedAt 倒序；q 为标题子串（ILIKE，`%`/`_` 按字面转义），limit 1–100 默认 20；列表项不含正文 |
 | POST /api/v1/knowledge | 管理员 Bearer，JSON `{title,body,tags?}` | 201；title 1–200B 单行、body ≤100KB（原样存储）、tags ≤200B 单行逗号分隔（清洗空白）；同事务写 `knowledge.create`（detail 只含 id/title） |
 | GET /api/v1/knowledge/{id} | Bearer（所有已登录角色） | 文档详情（含 body，原样返回）；不存在 404 |
@@ -78,18 +78,23 @@ accessToken 仅存页面内存，不放 localStorage/sessionStorage。refresh to
 
 所有鉴权 POST 需要有效白名单 Origin，并拒绝 Sec-Fetch-Site: cross-site（唯一例外：OIDC provider 回跳的 `GET /api/v1/auth/oidc/callback` 是顶级跨站导航，允许 `Sec-Fetch-Site: cross-site`；该路径以一次性 state Cookie + 原子消费的 state 行作为 CSRF 防护，且在两者校验前不产生任何变更）。CORS 凭据只对精确白名单来源开放。即使调用者不是浏览器，也必须显式传 Origin；不提供 JSON refresh token 降级通道。跨站部署不在首版支持范围。
 
-### 租户模型（阶段 F1）
+### 租户模型（阶段 F1–F2）
 
-- 定位与边界：阶段 F1 交付租户基础——`tenants` 表（`id`/`slug` 唯一/`name`/`status active|suspended`/时间戳）、认证数据的租户归属（`auth_users`/`auth_sessions`/`auth_audit` 的 `tenant_id` NOT NULL 外键，`oidc_login_states.tenant_id` 可空外键）与默认租户保证；**不提供创建第二租户的 CLI/API，业务表（projects、builds、deployments 等）仍为全局对象**。租户开通入口与业务数据隔离在同一后续批次上线，保证"能创建第二租户的那一刻"隔离已经生效。
+- 定位与边界：阶段 F1 交付租户基础——`tenants` 表（`id`/`slug` 唯一/`name`/`status active|suspended`/时间戳）、认证数据的租户归属（`auth_users`/`auth_sessions`/`auth_audit` 的 `tenant_id` NOT NULL 外键，`oidc_login_states.tenant_id` 可空外键）与默认租户保证；阶段 F2 交付**全量业务数据租户隔离**（schema v19：14 张业务表 `tenant_id` NOT NULL 外键）与**租户运维 CLI** `cmd/tenant`（唯一租户创建入口，无 HTTP API）。业务隔离与开通入口同一批次上线：能创建第二租户的那一刻，所有查询已按租户过滤。
 - 默认租户：schema v18 seed 固定 id `tenant_default_0000000000000001`、slug `default`、name `Default`、status `active`。启动时按 `AEGIS_DEFAULT_TENANT_SLUG`（默认 `default`，1–32 个小写 ASCII 字母/数字/中间短横线，不可首尾短横线）保证该租户存在：若配置 slug 不同且当前只有 seed 租户，原子重命名该行（id/name 不变，已有行归属不变）；若仍不存在则启动失败并给出明确错误。bootstrap 管理员创建在默认租户。
 - 用户单租户归属：每个 `auth_users` 行属于恰好一个租户；用户名与邮箱只在租户内唯一（`UNIQUE(tenant_id, lower(username))`、`UNIQUE(tenant_id, lower(email)) WHERE email <> ''`），同一用户名/邮箱可存在于不同租户。`auth.User` 的租户字段仅服务端使用，本批不进入用户 JSON。
 - 登录解析：登录 body 可选 `tenantSlug`（严格 JSON：null、未知字段、非字符串拒绝；格式非法 400 validation_failed）。**有 slug**：按（租户, 用户名）查询；租户不存在、用户不存在、密码错误、租户 suspended 统一 401 unauthorized，不泄露差异。**无 slug**：跨租户按用户名查找，0 命中 401；唯一命中登录；多命中返回 **400 `tenant_required`**（消息 `tenantSlug is required: this email exists in multiple tenants`），客户端带 slug 重试。单租户部署永远唯一命中，行为与 F1 前一致。
 - JWT 与会话：access token 增加 `tid`（租户 id）声明；解析必须同时满足签名/issuer/audience/有效期、`tid` 非空、会话行 `tenant_id`、用户行 `tenant_id` 与 `tid` 一致、租户 `active`、会话未撤销未过期、用户未禁用，否则视为未认证（伪造/缺失/篡改 `tid` 均为 401）。会话行保存 `tenant_id`。
-- Refresh：每次刷新重校验用户存在、角色/禁用状态（与既有逻辑一致）与租户 active；会话租户与用户租户不一致或租户 suspended 时返回 401 并**撤销该会话**。租户恢复 active 后旧会话不会复活。
-- 租户内 RBAC：admin/member/viewer 仍是租户内角色（F1 只有默认租户，语义与 F1 前的全局角色等价）；所有管理员用户管理接口（列表/创建/重置密码/禁用启用/角色）只作用于 actor 的租户，跨租户用户一律 404；最后一个可用管理员保护按租户计算。
-- 审计隔离：`auth_audit.tenant_id` NOT NULL（无 actor 的系统行如审批过期归属默认租户），新增 `(tenant_id, created_at DESC, id)` 索引并保留既有筛选索引；审计列表与 CSV 导出按会话租户过滤，管理员看不到其他租户的审计。密码登录成功审计 detail 追加 `tenant=<slug>`；OIDC 登录 detail 仍为 `method=oidc`。
+- Refresh：每次刷新重校验用户存在、角色/禁用状态（与既有逻辑一致）与租户 active；会话租户与用户租户不一致或租户 suspended 时返回 401 并**撤销该会话**。租户恢复 active 后旧会话不会复活。业务数据隔离不改变该行为：suspended 租户登录、刷新与既有 access token 均被拒绝。
+- 租户内 RBAC：admin/member/viewer 是租户内角色；所有管理员用户管理接口（列表/创建/重置密码/禁用启用/角色）只作用于 actor 的租户，跨租户用户一律 404；最后一个可用管理员保护按租户计算。业务接口的 admin 同样只在**本租户**内拥有全量权限：跨租户资源一律 404，管理员身份不放宽租户边界。
+- 审计隔离：`auth_audit.tenant_id` NOT NULL。所有审计写入（业务动作、登录/用户动作、worker 系统动作）都带租户：审批过期的系统审计使用**所属审批/部署的租户**（不再回落到默认租户），bootstrap/管理员创建使用目标用户租户，租户开通等运维操作暂不入业务审计。审计列表与 CSV 导出按会话租户过滤，管理员看不到其他租户的审计。密码登录成功审计 detail 追加 `tenant=<slug>`；OIDC 登录 detail 仍为 `method=oidc`。
+- 业务数据隔离（F2）：`projects`、`builds`、`deployment_targets`、`deployments`、`approvals`、`approval_notifications`、`reviews`、`review_external_results`、`review_notifications`、`scans`、`security_events`、`knowledge_docs`、`secrets`、`project_policies` 均带 `tenant_id` NOT NULL 外键。**租户谓词**：所有列表、详情、更新、删除、编号分配、唯一冲突判断、搜索、分页/筛选、审计查询与 CSV、通知 outbox 都按 `actor.TenantID` 或父资源租户过滤；项目可见性谓词同时校验租户与 public/private 可见性，其它模块复用该谓词或按已校验父资源取数。跨租户一律 **404**（不泄露存在性，管理员接口也一样）；不可见项目的 `projectId` 过滤在全局列表端点返回空页（不可枚举），项目作用域端点（如 `GET /projects/{id}/deployments`）对不可见/跨租户项目返回 404。
+- 唯一约束租户化（F2）：项目名 `UNIQUE(tenant_id, lower(name))`、部署目标名 `UNIQUE(tenant_id, lower(name))`、`secrets.name` `UNIQUE(tenant_id, name)`、`review_external_results`/`scans`/`security_events` 的 `delivery_id` `UNIQUE(tenant_id, delivery_id)`；项目内编号（build/deployment/review number）不变（项目已属单一租户）。因此两个租户可各自拥有同名项目/目标/密钥，也可各自使用同一 `deliveryId`；同一租户内重复分别返回 409 或按幂等语义处理。
+- 入站证据归属（F2）：无会话的 HMAC 入站按资源反查租户——扫描用 URL 中的项目 id、审查外部结果用 URL 中的审查 id（未知或跨租户一律 404）；防御事件不是项目对象，签名 JSON body 可选 `tenantSlug`（HMAC 覆盖原始 body，因此租户选择已认证；缺省为部署默认租户，保持单租户集成兼容），未知/非法 slug 返回 404/400，不写任何行。`deliveryId` 幂等键按租户独立。
+- Worker 与 outbox（F2）：构建 worker、部署 worker、审批过期扫描与通知 notifier 领取的行都携带 `tenant_id`；系统审计（如审批过期）用所属租户，部署取数/目标读取/项目名按行租户过滤，审批与审查 Webhook payload 增加 `tenant:{id,slug}`（仅租户 id 与公开 slug，不含敏感信息）。单部署的 worker 会处理所有租户的任务（这是部署级系统进程），但每行的归属与后续读写严格按行租户；`build_log_events`/`deployment_events`/`project_members` 无独立租户列，读取总是先按租户校验父项目/构建/部署，写入只针对已领取/已授权的父行。指标只输出无租户标签的部署级构建状态计数，不含租户明细；日志不含其他租户数据。
+- 租户运维 CLI（F2，`cmd/tenant`）：唯一租户开通入口，复用 `AEGIS_DATABASE_URL`（与 server 相同；不需要 Redis/JWT 配置；数据库须先由 server 迁移，schema 版本不符时拒绝执行）。命令：`create --slug <slug> --name <name> [--admin-email <email>] [--admin-password <password>]`（创建租户；给了 email 则创建该租户 admin；未给密码时生成 24 字节随机 base64url 口令，**仅在 stdout 打印一次**并明确提示，不写日志/审计明文；slug 冲突/非法非 0 退出）、`create-admin --tenant <slug> --email <email> [--password <password>]`（用户名由 email local part 派生，冲突自动加 `-2`/`-3` 后缀）、`list`（id/slug/name/status/用户数/创建时间，无凭据）、`disable/enable --tenant <slug>`（status suspended/active）。CLI 与 HTTP 用户接口共用同一套校验、bcrypt 哈希、租户内唯一约束与审计写入（审计 actor 记为 `tenant-cli` 系统标签，只写用户名）；`--password` 会出现在进程列表/历史中，应优先使用生成口令或由密钥注入工具传入。运维 CLI 自身不入业务审计。
 - OIDC 过渡：`oidc_login_states.tenant_id` 记录发起租户（本批固定默认租户）；回调在该租户内按已验证 email 关联或自动开通账号；同邮箱跨租户的 SSO 歧义与租户选择留待前端/后续批次。
-- 其他契约不变：登录/刷新/退出 Cookie 属性、Origin/CSRF、限流、错误信封、`/users` 响应字段保持；`tenant_required` 是新增的 400 错误码，仅登录在跨租户同名时返回。本批边界（未做）：租户切换、子域/路径路由、每租户品牌、平台控制台、跨租户共享项目、租户配额与计费、LDAP/SAML。
+- 其他契约不变：登录/刷新/退出 Cookie 属性、Origin/CSRF、限流、错误信封、`/users` 响应字段保持；`tenant_required` 是登录在跨租户同名时返回的 400 错误码。本批边界（未做）：登录页租户标识输入与界面租户展示、双租户 E2E（F3）、租户切换、子域/路径路由、每租户品牌、平台控制台、跨租户共享项目、租户配额与计费、LDAP/SAML、真实生产库升级演练。
 
 ### 构建执行边界（P3 第一批）
 

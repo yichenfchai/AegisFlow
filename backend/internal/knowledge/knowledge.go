@@ -110,10 +110,11 @@ const documentColumns = `d.id,d.title,d.body,d.tags,d.created_by,COALESCE(cu.use
 
 // docJoins resolves creator/updater display names. Both joins are LEFT joins:
 // actor snapshots are not foreign keys, so a removed account must not hide the
-// document.
+// document. The joins are tenant-qualified like every other actor join, so a
+// corrupted snapshot can never display another tenant's username.
 const docJoins = ` FROM knowledge_docs d
-	LEFT JOIN auth_users cu ON cu.id=d.created_by
-	LEFT JOIN auth_users uu ON uu.id=d.updated_by`
+	LEFT JOIN auth_users cu ON cu.id=d.created_by AND cu.tenant_id=d.tenant_id
+	LEFT JOIN auth_users uu ON uu.id=d.updated_by AND uu.tenant_id=d.tenant_id`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -253,17 +254,19 @@ func writeAudit(ctx context.Context, tx *sql.Tx, actor auth.Actor, action, objec
 	return err
 }
 
-// getDocumentTx reads one document inside the caller's transaction.
-func getDocumentTx(ctx context.Context, tx *sql.Tx, id string) (*Document, error) {
-	doc, err := scanDocument(tx.QueryRowContext(ctx, `SELECT `+documentColumns+docJoins+` WHERE d.id=$1`, id))
+// getDocumentTx reads one document inside the caller's transaction, scoped to
+// the caller's tenant.
+func getDocumentTx(ctx context.Context, tx *sql.Tx, tenantID, id string) (*Document, error) {
+	doc, err := scanDocument(tx.QueryRowContext(ctx, `SELECT `+documentColumns+docJoins+` WHERE d.id=$1 AND d.tenant_id=$2`, id, tenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	return doc, err
 }
 
-// Create stores one new admin-authored document and audits knowledge.create in
-// the same transaction. The returned detail carries the stored body.
+// Create stores one new admin-authored document of the actor's tenant and audits
+// knowledge.create in the same transaction. The returned detail carries the
+// stored body.
 func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (*Document, error) {
 	if err := requireAdmin(actor); err != nil {
 		return nil, err
@@ -282,8 +285,8 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (*D
 		return nil, err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO knowledge_docs(id,title,body,tags,created_by,updated_by,created_at,updated_at)
-	 VALUES($1,$2,$3,$4,$5,$5,$6,$6)`, id, title, body, tags, actor.ID, now); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO knowledge_docs(id,tenant_id,title,body,tags,created_by,updated_by,created_at,updated_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$6,$7,$7)`, id, actor.TenantID, title, body, tags, actor.ID, now); err != nil {
 		return nil, err
 	}
 	if err = writeAudit(ctx, tx, actor, ActionCreate, id, fmt.Sprintf("id=%s title=%s", id, title)); err != nil {
@@ -297,12 +300,13 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (*D
 		CreatedAt: now, UpdatedAt: now}, Body: body}, nil
 }
 
-// Get returns one document with its body; an unknown id is ErrNotFound.
-func (s *Service) Get(ctx context.Context, docID string) (*Document, error) {
+// Get returns one document of the caller's tenant with its body; an unknown or
+// other-tenant id is ErrNotFound.
+func (s *Service) Get(ctx context.Context, actor auth.Actor, docID string) (*Document, error) {
 	if !auth.ValidID(docID) {
 		return nil, fmt.Errorf("%w: invalid knowledge id", ErrValidation)
 	}
-	doc, err := scanDocument(s.db.QueryRowContext(ctx, `SELECT `+documentColumns+docJoins+` WHERE d.id=$1`, docID))
+	doc, err := scanDocument(s.db.QueryRowContext(ctx, `SELECT `+documentColumns+docJoins+` WHERE d.id=$1 AND d.tenant_id=$2`, docID, actor.TenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -312,10 +316,10 @@ func (s *Service) Get(ctx context.Context, docID string) (*Document, error) {
 	return doc, nil
 }
 
-// List pages documents by last update (newest first) with an optional title
-// substring search. Every authenticated role may read; the body is never part
-// of the projection.
-func (s *Service) List(ctx context.Context, filter ListFilter) ([]Doc, int, error) {
+// List pages the caller's tenant's documents by last update (newest first) with
+// an optional title substring search. Every authenticated role may read; the body
+// is never part of the projection.
+func (s *Service) List(ctx context.Context, actor auth.Actor, filter ListFilter) ([]Doc, int, error) {
 	if err := paginate(filter.Limit, filter.Offset); err != nil {
 		return nil, 0, err
 	}
@@ -327,14 +331,15 @@ func (s *Service) List(ctx context.Context, filter ListFilter) ([]Doc, int, erro
 	// used for count and page so the two can never diverge.
 	pattern := likePattern(query)
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM knowledge_docs d WHERE d.title ILIKE $1 ESCAPE '\'`,
-		pattern).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM knowledge_docs d
+		WHERE d.tenant_id=$2 AND d.title ILIKE $1 ESCAPE '\'`,
+		pattern, actor.TenantID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+listColumns+docJoins+`
-		WHERE d.title ILIKE $1 ESCAPE '\'
-		ORDER BY d.updated_at DESC,d.id DESC LIMIT $2 OFFSET $3`,
-		pattern, filter.Limit, filter.Offset)
+		WHERE d.tenant_id=$2 AND d.title ILIKE $1 ESCAPE '\'
+		ORDER BY d.updated_at DESC,d.id DESC LIMIT $3 OFFSET $4`,
+		pattern, actor.TenantID, filter.Limit, filter.Offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -350,9 +355,9 @@ func (s *Service) List(ctx context.Context, filter ListFilter) ([]Doc, int, erro
 	return list, total, rows.Err()
 }
 
-// Update replaces the title/body/tags of an existing document, stamps the
-// updater and audits knowledge.update in the same transaction. An unknown id is
-// ErrNotFound.
+// Update replaces the title/body/tags of an existing document of the actor's
+// tenant, stamps the updater and audits knowledge.update in the same transaction.
+// An unknown or other-tenant id is ErrNotFound.
 func (s *Service) Update(ctx context.Context, actor auth.Actor, docID string, input Input) (*Document, error) {
 	if err := requireAdmin(actor); err != nil {
 		return nil, err
@@ -373,7 +378,7 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, docID string, in
 	// than a silently reported update; the audit row then always describes a
 	// document that still exists in this transaction.
 	var existing string
-	err = tx.QueryRowContext(ctx, `SELECT title FROM knowledge_docs WHERE id=$1 FOR UPDATE`, docID).Scan(&existing)
+	err = tx.QueryRowContext(ctx, `SELECT title FROM knowledge_docs WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, docID, actor.TenantID).Scan(&existing)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -381,11 +386,11 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, docID string, in
 		return nil, err
 	}
 	now := time.Now().Unix()
-	if _, err = tx.ExecContext(ctx, `UPDATE knowledge_docs SET title=$2,body=$3,tags=$4,updated_by=$5,updated_at=$6 WHERE id=$1`,
-		docID, title, body, tags, actor.ID, now); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE knowledge_docs SET title=$2,body=$3,tags=$4,updated_by=$5,updated_at=$6 WHERE id=$1 AND tenant_id=$7`,
+		docID, title, body, tags, actor.ID, now, actor.TenantID); err != nil {
 		return nil, err
 	}
-	doc, err := getDocumentTx(ctx, tx, docID)
+	doc, err := getDocumentTx(ctx, tx, actor.TenantID, docID)
 	if err != nil {
 		return nil, err
 	}
@@ -398,8 +403,8 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, docID string, in
 	return doc, nil
 }
 
-// Delete removes one document and audits knowledge.delete in the same
-// transaction. An unknown id is ErrNotFound.
+// Delete removes one document of the actor's tenant and audits knowledge.delete
+// in the same transaction. An unknown or other-tenant id is ErrNotFound.
 func (s *Service) Delete(ctx context.Context, actor auth.Actor, docID string) error {
 	if err := requireAdmin(actor); err != nil {
 		return err
@@ -413,7 +418,7 @@ func (s *Service) Delete(ctx context.Context, actor auth.Actor, docID string) er
 	}
 	defer tx.Rollback()
 	var title string
-	err = tx.QueryRowContext(ctx, `DELETE FROM knowledge_docs WHERE id=$1 RETURNING title`, docID).Scan(&title)
+	err = tx.QueryRowContext(ctx, `DELETE FROM knowledge_docs WHERE id=$1 AND tenant_id=$2 RETURNING title`, docID, actor.TenantID).Scan(&title)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}

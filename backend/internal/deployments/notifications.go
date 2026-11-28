@@ -50,14 +50,25 @@ const (
 // ApprovalNotification is the webhook JSON body. It deliberately contains no
 // target credential, deployment secret, request body or token. Usernames are
 // included for human-readable receivers; the IDs remain the stable identifiers.
+// The tenant block lets a receiver that handles several tenants route the event
+// without trusting the delivery address; it contains no sensitive information
+// (the slug is already visible on the login page).
 type ApprovalNotification struct {
 	DeliveryID          string                 `json:"deliveryId"`
 	Event               string                 `json:"event"`
 	OccurredAt          int64                  `json:"occurredAt"`
+	Tenant              NotificationTenant     `json:"tenant"`
 	Approval            Approval               `json:"approval"`
 	Deployment          NotificationDeployment `json:"deployment"`
 	RequestedByUsername string                 `json:"requestedByUsername,omitempty"`
 	DecidedByUsername   string                 `json:"decidedByUsername,omitempty"`
+}
+
+// NotificationTenant identifies the owning tenant of a notification event. Only
+// the opaque id and the public slug are included.
+type NotificationTenant struct {
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
 }
 
 // NotificationDeployment is the deployment snapshot included with an approval
@@ -77,6 +88,7 @@ type NotificationDeployment struct {
 
 type pendingNotification struct {
 	ID         string
+	TenantID   string
 	ApprovalID string
 	Event      string
 	Payload    []byte
@@ -144,9 +156,9 @@ func (s *Service) claimNotification(ctx context.Context) (pendingNotification, e
 		UPDATE approval_notifications n
 		SET next_attempt_at=$4
 		FROM next WHERE n.id=next.id
-		RETURNING n.id,n.approval_id,n.event,n.payload,n.attempts`,
+		RETURNING n.id,n.tenant_id,n.approval_id,n.event,n.payload,n.attempts`,
 		notificationPending, now, maxNotificationAttempts, now+int64(s.notificationClaimLease/time.Second)).
-		Scan(&notification.ID, &notification.ApprovalID, &notification.Event, &notification.Payload, &notification.Attempts)
+		Scan(&notification.ID, &notification.TenantID, &notification.ApprovalID, &notification.Event, &notification.Payload, &notification.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return pendingNotification{}, sql.ErrNoRows
 	}
@@ -271,21 +283,26 @@ func (s *Service) enqueueApprovalNotification(ctx context.Context, tx *sql.Tx, a
 		DeliveryID: deliveryID,
 		Event:      event,
 		OccurredAt: occurredAt,
+		Tenant:     NotificationTenant{ID: approval.TenantID},
 		Approval:   approval,
 		Deployment: NotificationDeployment{
 			ID:        approval.DeploymentID,
 			ProjectID: approval.ProjectID,
 		},
 	}
+	// The tenant slug is resolved in the same snapshot; the deployment and
+	// project are read inside the owning tenant only, so a corrupted cross-tenant
+	// link can never leak another tenant's project name into a payload.
 	err = tx.QueryRowContext(ctx, `
-		SELECT p.name,d.deployment_number,d.target_name,d.target_environment,d.version,d.status,d.rollback_of,
+		SELECT t.slug,p.name,d.deployment_number,d.target_name,d.target_environment,d.version,d.status,d.rollback_of,
 		       COALESCE(requester.username,''),COALESCE(decider.username,'')
 		FROM deployments d
 		JOIN projects p ON p.id=d.project_id
-		LEFT JOIN auth_users requester ON requester.id=$2
-		LEFT JOIN auth_users decider ON decider.id=$3
-		WHERE d.id=$1`, approval.DeploymentID, approval.RequestedBy, approval.DecidedBy).
-		Scan(&notification.Deployment.ProjectName, &notification.Deployment.DeploymentNumber,
+		JOIN tenants t ON t.id=d.tenant_id
+		LEFT JOIN auth_users requester ON requester.id=$2 AND requester.tenant_id=d.tenant_id
+		LEFT JOIN auth_users decider ON decider.id=$3 AND decider.tenant_id=d.tenant_id
+		WHERE d.id=$1 AND d.tenant_id=$4`, approval.DeploymentID, approval.RequestedBy, approval.DecidedBy, approval.TenantID).
+		Scan(&notification.Tenant.Slug, &notification.Deployment.ProjectName, &notification.Deployment.DeploymentNumber,
 			&notification.Deployment.TargetName, &notification.Deployment.Environment,
 			&notification.Deployment.Version, &notification.Deployment.Status,
 			&notification.Deployment.RollbackOf, &notification.RequestedByUsername, &notification.DecidedByUsername)
@@ -297,9 +314,9 @@ func (s *Service) enqueueApprovalNotification(ctx context.Context, tx *sql.Tx, a
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO approval_notifications
-		(id,approval_id,event,payload,status,attempts,next_attempt_at,delivered_at,last_error,created_at)
-		VALUES($1,$2,$3,$4::jsonb,$5,0,$6,0,'',$6)
+		(id,tenant_id,approval_id,event,payload,status,attempts,next_attempt_at,delivered_at,last_error,created_at)
+		VALUES($1,$2,$3,$4,$5::jsonb,$6,0,$7,0,'',$7)
 		ON CONFLICT (approval_id,event) DO NOTHING`,
-		deliveryID, approval.ID, event, string(body), notificationPending, time.Now().Unix())
+		deliveryID, approval.TenantID, approval.ID, event, string(body), notificationPending, time.Now().Unix())
 	return err
 }

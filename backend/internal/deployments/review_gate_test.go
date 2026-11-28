@@ -27,8 +27,8 @@ func seedReview(t *testing.T, db *sql.DB, projectID, status string) string {
 		t.Fatal(err)
 	}
 	now := time.Now().Unix()
-	if _, err = db.Exec(`INSERT INTO reviews(id,project_id,number,subject,description,version,external_url,status,requested_by,created_at,updated_at)
-	 VALUES($1,$2,$3,'gated release','','','',$4,$5,$6,$6)`, id, projectID, number, status, testActor.ID, now); err != nil {
+	if _, err = db.Exec(`INSERT INTO reviews(id,tenant_id,project_id,number,subject,description,version,external_url,status,requested_by,created_at,updated_at)
+	 VALUES($1,(SELECT tenant_id FROM projects WHERE id=$2),$2,$3,'gated release','','','',$4,$5,$6,$6)`, id, projectID, number, status, testActor.ID, now); err != nil {
 		t.Fatal(err)
 	}
 	return id

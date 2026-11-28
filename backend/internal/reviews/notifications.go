@@ -59,11 +59,21 @@ const (
 // description is the review body itself (the same text project viewers can
 // already read); everything else comes from the review row.
 type ReviewNotification struct {
-	DeliveryID string              `json:"deliveryId"`
-	Event      string              `json:"event"`
-	OccurredAt int64               `json:"occurredAt"`
-	Project    NotificationProject `json:"project"`
-	Review     NotificationReview  `json:"review"`
+	DeliveryID string `json:"deliveryId"`
+	Event      string `json:"event"`
+	OccurredAt int64  `json:"occurredAt"`
+	// Tenant lets a receiver that handles several tenants route the event; it
+	// carries only the opaque id and the public slug (already visible on the
+	// login page), never a credential.
+	Tenant  NotificationTenant  `json:"tenant"`
+	Project NotificationProject `json:"project"`
+	Review  NotificationReview  `json:"review"`
+}
+
+// NotificationTenant identifies the owning tenant of a review event.
+type NotificationTenant struct {
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
 }
 
 // NotificationProject identifies the project a review belongs to.
@@ -93,6 +103,7 @@ type NotificationReview struct {
 
 type pendingNotification struct {
 	ID       string
+	TenantID string
 	ReviewID string
 	Event    string
 	Payload  []byte
@@ -160,9 +171,9 @@ func (s *Service) claimNotification(ctx context.Context) (pendingNotification, e
 		UPDATE review_notifications n
 		SET next_attempt_at=$4
 		FROM next WHERE n.id=next.id
-		RETURNING n.id,n.review_id,n.event,n.payload,n.attempts`,
+		RETURNING n.id,n.tenant_id,n.review_id,n.event,n.payload,n.attempts`,
 		notificationPending, now, maxNotificationAttempts, now+int64(s.notificationClaimLease/time.Second)).
-		Scan(&notification.ID, &notification.ReviewID, &notification.Event, &notification.Payload, &notification.Attempts)
+		Scan(&notification.ID, &notification.TenantID, &notification.ReviewID, &notification.Event, &notification.Payload, &notification.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return pendingNotification{}, sql.ErrNoRows
 	}
@@ -287,8 +298,9 @@ func (s *Service) enqueueReviewNotification(ctx context.Context, tx *sql.Tx, rev
 	if err != nil {
 		return err
 	}
-	var projectName string
-	if err := tx.QueryRowContext(ctx, `SELECT name FROM projects WHERE id=$1`, review.ProjectID).Scan(&projectName); err != nil {
+	var projectName, tenantSlug string
+	if err := tx.QueryRowContext(ctx, `SELECT p.name,t.slug FROM projects p JOIN tenants t ON t.id=p.tenant_id
+		WHERE p.id=$1 AND p.tenant_id=$2`, review.ProjectID, review.TenantID).Scan(&projectName, &tenantSlug); err != nil {
 		return err
 	}
 	occurredAt := review.CreatedAt
@@ -299,6 +311,7 @@ func (s *Service) enqueueReviewNotification(ctx context.Context, tx *sql.Tx, rev
 		DeliveryID: deliveryID,
 		Event:      event,
 		OccurredAt: occurredAt,
+		Tenant:     NotificationTenant{ID: review.TenantID, Slug: tenantSlug},
 		Project:    NotificationProject{ID: review.ProjectID, Name: projectName},
 		Review: NotificationReview{
 			ID:              review.ID,
@@ -327,9 +340,9 @@ func (s *Service) enqueueReviewNotification(ctx context.Context, tx *sql.Tx, rev
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO review_notifications
-		(id,review_id,event,payload,status,attempts,next_attempt_at,last_error,created_at)
-		VALUES($1,$2,$3,$4::jsonb,$5,0,$6,'',$6)
+		(id,tenant_id,review_id,event,payload,status,attempts,next_attempt_at,last_error,created_at)
+		VALUES($1,$2,$3,$4,$5::jsonb,$6,0,$7,'',$7)
 		ON CONFLICT (review_id,event) DO NOTHING`,
-		deliveryID, review.ID, event, string(body), notificationPending, time.Now().Unix())
+		deliveryID, review.TenantID, review.ID, event, string(body), notificationPending, time.Now().Unix())
 	return err
 }

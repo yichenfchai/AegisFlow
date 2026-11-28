@@ -162,10 +162,11 @@ func Load() (Config, error) {
 	if os.Getenv("AEGIS_DATABASE_PATH") != "" {
 		return c, errors.New("AEGIS_DATABASE_PATH is obsolete; configure PostgreSQL with AEGIS_DATABASE_URL")
 	}
-	dbURL, parseErr := url.Parse(c.DatabaseURL)
-	if parseErr != nil || (dbURL.Scheme != "postgres" && dbURL.Scheme != "postgresql") || dbURL.Host == "" || dbURL.Path == "" || dbURL.Path == "/" {
-		return c, errors.New("AEGIS_DATABASE_URL must be a PostgreSQL URL with host and database name")
+	dbURL, parseErr := validateDatabaseURL(c.DatabaseURL)
+	if parseErr != nil {
+		return c, parseErr
 	}
+	c.DatabaseURL = dbURL
 	if _, err := redis.ParseURL(c.RedisURL); err != nil {
 		return c, errors.New("AEGIS_REDIS_URL must be a valid redis:// or rediss:// URL")
 	}
@@ -507,6 +508,29 @@ func Load() (Config, error) {
 		return c, errors.New("AEGIS_BUILD_ALLOW_LOCAL_REPO requires AEGIS_BUILD_CLONE=true")
 	}
 	return c, nil
+}
+
+// DatabaseURL validates and returns the shared PostgreSQL connection
+// configuration. Operational commands (cmd/tenant) use it instead of the full
+// server configuration: they need the same connection settings and validation,
+// but none of the HTTP/auth/build variables. Nothing new has to be configured
+// for them beyond the existing AEGIS_DATABASE_URL.
+func DatabaseURL() (string, error) {
+	if os.Getenv("AEGIS_DATABASE_PATH") != "" {
+		return "", errors.New("AEGIS_DATABASE_PATH is obsolete; configure PostgreSQL with AEGIS_DATABASE_URL")
+	}
+	return validateDatabaseURL(os.Getenv("AEGIS_DATABASE_URL"))
+}
+
+// validateDatabaseURL enforces the documented PostgreSQL URL shape for every
+// caller (server start and operational commands), so a malformed value fails the
+// same way everywhere.
+func validateDatabaseURL(raw string) (string, error) {
+	dbURL, parseErr := url.Parse(raw)
+	if parseErr != nil || (dbURL.Scheme != "postgres" && dbURL.Scheme != "postgresql") || dbURL.Host == "" || dbURL.Path == "" || dbURL.Path == "/" {
+		return "", errors.New("AEGIS_DATABASE_URL must be a PostgreSQL URL with host and database name")
+	}
+	return raw, nil
 }
 
 // validCPU accepts a positive decimal core count; Docker's --cpus takes the

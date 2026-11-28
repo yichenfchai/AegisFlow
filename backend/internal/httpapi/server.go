@@ -84,7 +84,12 @@ type Server struct {
 	// deliveries (AEGIS_INGEST_WEBHOOK_SECRET). Empty keeps both endpoints closed
 	// (503) while their read routes stay available.
 	ingestWebhookSecret []byte
-	metrics             *metrics.Registry
+	// defaultTenantID is the deployment's default tenant, used by the signed
+	// security-event ingest when its body names no tenant slug (the
+	// pre-multi-tenant behavior). It is never used for session-scoped routes:
+	// those always take the tenant from the authenticated actor.
+	defaultTenantID string
+	metrics         *metrics.Registry
 	// shutdownCtx is never nil: New substitutes context.Background() when the
 	// embedder does not pass one, so streaming selects can always wait on it.
 	shutdownCtx context.Context
@@ -151,6 +156,11 @@ type Options struct {
 	// deliveries (AEGIS_INGEST_WEBHOOK_SECRET). Empty keeps both machine
 	// endpoints closed with 503; their read routes stay available.
 	IngestWebhookSecret []byte
+	// DefaultTenantID is the deployment's default tenant id. The signed
+	// security-event ingest uses it when the body carries no tenantSlug, which
+	// keeps single-tenant integrations unchanged. Empty falls back to the
+	// seeded default tenant id.
+	DefaultTenantID string
 	// Metrics, when set, records request counters and latency histograms keyed
 	// by the matched route template. Nil disables recording.
 	Metrics *metrics.Registry
@@ -171,12 +181,17 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	if shutdownCtx == nil {
 		shutdownCtx = context.Background()
 	}
+	defaultTenantID := opts.DefaultTenantID
+	if defaultTenantID == "" {
+		defaultTenantID = tenants.DefaultID
+	}
 	s := &Server{auth: service, projects: opts.Projects, builds: opts.Builds, deployments: opts.Deployments, reviews: opts.Reviews,
 		scans: opts.Scans, securityEvents: opts.SecurityEvents, knowledge: opts.Knowledge, secrets: opts.Secrets, policies: opts.Policies,
 		oidc:   opts.OIDC,
 		logger: logger, ready: ready, origins: map[string]bool{}, limiter: opts.Limiter, cookieSecure: opts.CookieSecure,
 		reviewWebhookSecret: append([]byte(nil), opts.ReviewWebhookSecret...),
 		ingestWebhookSecret: append([]byte(nil), opts.IngestWebhookSecret...),
+		defaultTenantID:     defaultTenantID,
 		metrics:             opts.Metrics, shutdownCtx: shutdownCtx}
 	for _, o := range origins {
 		s.origins[o] = true
@@ -1231,7 +1246,7 @@ func (s *Server) listDeploymentTargetOptions(c *gin.Context) {
 		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
 		return
 	}
-	options, err := s.deployments.TargetOptions(c.Request.Context())
+	options, err := s.deployments.TargetOptions(c.Request.Context(), actorFrom(c))
 	if err != nil {
 		s.deploymentTargetError(c, err)
 		return
@@ -1404,6 +1419,15 @@ func (s *Server) listDeployments(c *gin.Context) {
 	if s.deployments == nil {
 		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
 		return
+	}
+	// The project-scoped route reports an invisible or other-tenant project as a
+	// 404 (like every other project-scoped read); the global list endpoint keeps
+	// the documented "invisible filter yields an empty page" behavior.
+	if s.projects != nil {
+		if _, err := s.projects.Get(c.Request.Context(), actorFrom(c), c.Param("id")); err != nil {
+			s.projectError(c, err)
+			return
+		}
 	}
 	limit, offset, ok := s.page(c)
 	if !ok {

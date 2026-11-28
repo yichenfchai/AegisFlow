@@ -37,7 +37,7 @@ func seedUser(t *testing.T, db *sql.DB, actor auth.Actor) {
 
 func ingestEvent(t *testing.T, s *Service, deliveryID string, input IngestInput) (*Event, bool) {
 	t.Helper()
-	event, created, err := s.Ingest(context.Background(), deliveryID, input)
+	event, created, err := s.Ingest(context.Background(), tenants.DefaultID, deliveryID, input)
 	if err != nil {
 		t.Fatalf("ingest %s: %v", deliveryID, err)
 	}
@@ -96,7 +96,7 @@ func TestIngestSecurityEventAndDeliveryIdempotency(t *testing.T) {
 		t.Fatalf("occurredAt = %d, want the explicit value", custom.OccurredAt)
 	}
 
-	if _, _, err := s.Ingest(context.Background(), "short", IngestInput{Source: "waf", Severity: SeverityLow, EventType: "probe", Summary: "x"}); !errors.Is(err, ErrValidation) {
+	if _, _, err := s.Ingest(context.Background(), tenants.DefaultID, "short", IngestInput{Source: "waf", Severity: SeverityLow, EventType: "probe", Summary: "x"}); !errors.Is(err, ErrValidation) {
 		t.Fatalf("invalid delivery error = %v", err)
 	}
 }
@@ -126,7 +126,7 @@ func TestIngestSecurityEventValidation(t *testing.T) {
 		{"negative occurredAt", "delivery-1015", IngestInput{Source: "waf", Severity: SeverityHigh, EventType: "x", Summary: "s", OccurredAt: -1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, _, err := s.Ingest(context.Background(), tc.delivery, tc.input); !errors.Is(err, ErrValidation) {
+			if _, _, err := s.Ingest(context.Background(), tenants.DefaultID, tc.delivery, tc.input); !errors.Is(err, ErrValidation) {
 				t.Fatalf("error = %v, want ErrValidation", err)
 			}
 		})

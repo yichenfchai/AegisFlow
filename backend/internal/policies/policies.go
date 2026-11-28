@@ -104,14 +104,15 @@ func validateInput(input Input) error {
 }
 
 // authorizeVisible applies the single project-visibility predicate: an invisible
-// project is reported as not found so policy reads cannot probe private project
-// ids. Visibility is the caller's responsibility before authorizeGate; keeping
-// it a separate step makes an invisible project a 404 instead of a 403.
+// project — including a project of another tenant — is reported as not found so
+// policy reads cannot probe private or foreign project ids. Visibility is the
+// caller's responsibility before authorizeGate; keeping it a separate step makes
+// an invisible project a 404 instead of a 403.
 func authorizeVisible(ctx context.Context, q projects.RowQuerier, actor auth.Actor, projectID string) error {
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	var found int
-	err := q.QueryRowContext(ctx, `SELECT 1 FROM projects p WHERE p.id=$1 AND `+projects.VisiblePredicate("p", 2, 3),
-		projectID, isAdmin, userID).Scan(&found)
+	err := q.QueryRowContext(ctx, `SELECT 1 FROM projects p WHERE p.id=$1 AND `+projects.VisiblePredicate("p", 2, 3, 4),
+		projectID, actor.TenantID, isAdmin, userID).Scan(&found)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -182,17 +183,18 @@ func (s *Service) Get(ctx context.Context, actor auth.Actor, projectID string) (
 	if err := authorizeVisible(ctx, s.db, actor, projectID); err != nil {
 		return Policy{}, err
 	}
-	return readPolicy(ctx, s.db, projectID)
+	return readPolicy(ctx, s.db, actor.TenantID, projectID)
 }
 
 // readPolicy loads one policy row (or the defaults) from a DB handle or a
-// transaction.
-func readPolicy(ctx context.Context, q projects.RowQuerier, projectID string) (Policy, error) {
+// transaction; the lookup is scoped to the tenant so a policy row can never be
+// read through another tenant's project id.
+func readPolicy(ctx context.Context, q projects.RowQuerier, tenantID, projectID string) (Policy, error) {
 	policy := defaultPolicy(projectID)
 	var updatedByName sql.NullString
 	err := q.QueryRowContext(ctx, `SELECT pp.require_review,pp.required_scan_verdict,pp.updated_by,u.username,pp.updated_at
-	 FROM project_policies pp LEFT JOIN auth_users u ON u.id=pp.updated_by
-	 WHERE pp.project_id=$1`, projectID).Scan(
+	 FROM project_policies pp LEFT JOIN auth_users u ON u.id=pp.updated_by AND u.tenant_id=pp.tenant_id
+	 WHERE pp.project_id=$1 AND pp.tenant_id=$2`, projectID, tenantID).Scan(
 		&policy.RequireReview, &policy.RequiredScanVerdict, &policy.UpdatedBy, &updatedByName, &policy.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return policy, nil
@@ -227,11 +229,11 @@ func (s *Service) Upsert(ctx context.Context, actor auth.Actor, projectID string
 		return Policy{}, err
 	}
 	now := time.Now().Unix()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO project_policies(project_id,require_review,required_scan_verdict,updated_by,updated_at)
-	 VALUES($1,$2,$3,$4,$5)
+	if _, err = tx.ExecContext(ctx, `INSERT INTO project_policies(project_id,tenant_id,require_review,required_scan_verdict,updated_by,updated_at)
+	 VALUES($1,$2,$3,$4,$5,$6)
 	 ON CONFLICT (project_id) DO UPDATE SET require_review=EXCLUDED.require_review,
 	 required_scan_verdict=EXCLUDED.required_scan_verdict, updated_by=EXCLUDED.updated_by, updated_at=EXCLUDED.updated_at`,
-		projectID, input.RequireReview, input.RequiredScanVerdict, actor.ID, now); err != nil {
+		projectID, actor.TenantID, input.RequireReview, input.RequiredScanVerdict, actor.ID, now); err != nil {
 		return Policy{}, err
 	}
 	if err = writeAudit(ctx, tx, actor, projectID, input); err != nil {

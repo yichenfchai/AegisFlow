@@ -183,8 +183,8 @@ func TestListExternalResultsVisibilityOrderingAndCap(t *testing.T) {
 	// The read is capped at 50 rows; insert the remaining rows directly so the
 	// test stays fast.
 	for i := 0; i < 55; i++ {
-		if _, err := db.Exec(`INSERT INTO review_external_results(id,review_id,delivery_id,source,verdict,summary,received_at)
-			VALUES($1,$2,$3,'bulk','passed','',$4)`, "bulk-"+string(rune('a'+i%26))+string(rune('a'+i/26)), publicReview.ID,
+		if _, err := db.Exec(`INSERT INTO review_external_results(id,tenant_id,review_id,delivery_id,source,verdict,summary,received_at)
+			VALUES($1,(SELECT tenant_id FROM reviews WHERE id=$2),$2,$3,'bulk','passed','',$4)`, "bulk-"+string(rune('a'+i%26))+string(rune('a'+i/26)), publicReview.ID,
 			"delivery-bulk-"+string(rune('a'+i%26))+string(rune('a'+i/26)), 1_700_100_000+int64(i)); err != nil {
 			t.Fatal(err)
 		}

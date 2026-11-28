@@ -49,12 +49,16 @@ func (s *Service) run(ctx context.Context) {
 }
 
 // claimNext atomically flips the oldest queued build to running. SKIP LOCKED
-// means concurrent instances never take the same build.
+// means concurrent instances never take the same build. The claimed row carries
+// tenant_id so the worker never has to guess a tenant: the single deployment-wide
+// worker executes builds of every tenant, but every follow-up read/write stays
+// keyed by the claimed build id (a global unique key) and the tenant travels with
+// the row for log writes and future tenant-scoped side effects.
 func (s *Service) claimNext(ctx context.Context) (*Build, error) {
 	row := s.db.QueryRowContext(ctx, `
 	WITH next AS (SELECT id FROM builds WHERE status=$1 ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED)
 	UPDATE builds b SET status=$2, started_at=$3 FROM next WHERE b.id=next.id
-	RETURNING b.id,b.project_id,b.build_number,b.status,b.branch,b.command,b.repo_url,b.triggered_by,b.created_at,b.started_at,b.finished_at`, StatusQueued, StatusRunning, time.Now().Unix())
+	RETURNING b.id,b.tenant_id,b.project_id,b.build_number,b.status,b.branch,b.command,b.repo_url,b.triggered_by,b.created_at,b.started_at,b.finished_at`, StatusQueued, StatusRunning, time.Now().Unix())
 	build, err := scanBuild(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, sql.ErrNoRows
@@ -498,6 +502,11 @@ func (w *logWriter) close() {
 	w.flush()
 }
 
+// appendEvents persists one batch of log lines. build_log_events deliberately
+// has no tenant column: a row is only written for a claimed build id and only
+// read through builds.Logs, which joins builds -> projects and applies the
+// tenant+visibility predicate, so the parent build id is the complete isolation
+// boundary here.
 func (s *Service) appendEvents(events []LogEvent) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
