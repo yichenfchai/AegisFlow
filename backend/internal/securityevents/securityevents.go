@@ -75,8 +75,10 @@ const (
 // Event is one defense event delivered by an external detection tool.
 // AcknowledgedBy/AcknowledgedByName/AcknowledgedAt only appear once an admin
 // acknowledged it; an open event omits them. DetailsURL is omitted when absent.
+// TenantID is server-side only: reads are always scoped to the admin's tenant.
 type Event struct {
 	ID                 string  `json:"id"`
+	TenantID           string  `json:"-"`
 	Source             string  `json:"source"`
 	Severity           string  `json:"severity"`
 	EventType          string  `json:"eventType"`
@@ -119,8 +121,10 @@ type Service struct {
 func New(db *sql.DB) *Service { return &Service{db: db} }
 
 // eventColumns is shared by every read; details_url/acknowledged_* may be NULL
-// in the database and the acknowledged username is resolved for display.
-const eventColumns = `e.id,e.source,e.severity,e.event_type,e.summary,e.status,e.details_url,
+// in the database and the acknowledged username is resolved for display. The
+// username join is tenant-qualified so an acknowledgement never displays another
+// tenant's username.
+const eventColumns = `e.id,e.tenant_id,e.source,e.severity,e.event_type,e.summary,e.status,e.details_url,
 	e.occurred_at,e.received_at,e.acknowledged_by,COALESCE(au.username,''),e.acknowledged_at`
 
 type rowScanner interface{ Scan(dest ...any) error }
@@ -129,7 +133,7 @@ func scanEvent(row rowScanner) (*Event, error) {
 	var event Event
 	var detailsURL, acknowledgedBy, acknowledgedByName sql.NullString
 	var acknowledgedAt sql.NullInt64
-	if err := row.Scan(&event.ID, &event.Source, &event.Severity, &event.EventType, &event.Summary,
+	if err := row.Scan(&event.ID, &event.TenantID, &event.Source, &event.Severity, &event.EventType, &event.Summary,
 		&event.Status, &detailsURL, &event.OccurredAt, &event.ReceivedAt, &acknowledgedBy,
 		&acknowledgedByName, &acknowledgedAt); err != nil {
 		return nil, err
@@ -235,11 +239,18 @@ func requireAdmin(actor auth.Actor) error {
 	return nil
 }
 
-// Ingest stores one signed defense-event delivery. The delivery id is the
-// idempotency key: a repeated delivery returns the stored row and created=false,
-// so a retried webhook never duplicates evidence even across replicas. Every
-// payload failure is ErrValidation.
-func (s *Service) Ingest(ctx context.Context, deliveryID string, input IngestInput) (*Event, bool, error) {
+// Ingest stores one signed defense-event delivery in tenantID. Defense events
+// are not project-scoped, so the signed ingest body carries an optional tenant
+// slug (`tenantSlug`) which the HTTP layer resolves to this id; because the HMAC
+// covers the raw body, the tenant choice is authenticated. The delivery id is the
+// idempotency key *within the tenant*: a repeated delivery returns the stored row
+// and created=false, so a retried webhook never duplicates evidence even across
+// replicas. An unknown tenant is ErrNotFound; every payload failure is
+// ErrValidation.
+func (s *Service) Ingest(ctx context.Context, tenantID, deliveryID string, input IngestInput) (*Event, bool, error) {
+	if !auth.ValidID(tenantID) {
+		return nil, false, ErrNotFound
+	}
 	if err := ingest.ValidDeliveryID(deliveryID); err != nil {
 		return nil, false, err
 	}
@@ -248,16 +259,24 @@ func (s *Service) Ingest(ctx context.Context, deliveryID string, input IngestInp
 	if err != nil {
 		return nil, false, err
 	}
+	var tenantStatus string
+	err = s.db.QueryRowContext(ctx, `SELECT status FROM tenants WHERE id=$1`, tenantID).Scan(&tenantStatus)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, ErrNotFound
+	}
+	if err != nil {
+		return nil, false, err
+	}
 	id, err := newID()
 	if err != nil {
 		return nil, false, err
 	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO security_events
-		(id,delivery_id,source,severity,event_type,summary,details_url,status,occurred_at,received_at,
+		(id,tenant_id,delivery_id,source,severity,event_type,summary,details_url,status,occurred_at,received_at,
 		 acknowledged_by,acknowledged_at)
-		VALUES($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10,NULL,NULL)
-		ON CONFLICT (delivery_id) DO NOTHING`,
-		id, deliveryID, normalized.Source, normalized.Severity, normalized.EventType, normalized.Summary,
+		VALUES($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),$9,$10,$11,NULL,NULL)
+		ON CONFLICT (tenant_id,delivery_id) DO NOTHING`,
+		id, tenantID, deliveryID, normalized.Source, normalized.Severity, normalized.EventType, normalized.Summary,
 		normalized.DetailsURL, StatusOpen, normalized.OccurredAt, now.Unix())
 	if err != nil {
 		return nil, false, err
@@ -269,7 +288,7 @@ func (s *Service) Ingest(ctx context.Context, deliveryID string, input IngestInp
 	// Read the stored row either way: a new delivery returns the row it just
 	// created, while a repeated delivery returns the original row unchanged (200)
 	// so the sender's retry is idempotent.
-	event, err := s.getByDeliveryID(ctx, deliveryID)
+	event, err := s.getByDeliveryID(ctx, tenantID, deliveryID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, fmt.Errorf("%w: delivery %q was removed concurrently", ErrConflict, deliveryID)
 	}
@@ -279,16 +298,18 @@ func (s *Service) Ingest(ctx context.Context, deliveryID string, input IngestInp
 	return event, inserted == 1, nil
 }
 
-func (s *Service) getByDeliveryID(ctx context.Context, deliveryID string) (*Event, error) {
+func (s *Service) getByDeliveryID(ctx context.Context, tenantID, deliveryID string) (*Event, error) {
 	return scanEvent(s.db.QueryRowContext(ctx, `SELECT `+eventColumns+` FROM security_events e
-		LEFT JOIN auth_users au ON au.id=e.acknowledged_by WHERE e.delivery_id=$1`, deliveryID))
+		LEFT JOIN auth_users au ON au.id=e.acknowledged_by AND au.tenant_id=e.tenant_id
+		WHERE e.tenant_id=$1 AND e.delivery_id=$2`, tenantID, deliveryID))
 }
 
 // getEventTx reads one event with its acknowledging username inside the
-// caller's transaction.
-func getEventTx(ctx context.Context, tx *sql.Tx, id string) (*Event, error) {
+// caller's transaction, scoped to the tenant.
+func getEventTx(ctx context.Context, tx *sql.Tx, tenantID, id string) (*Event, error) {
 	event, err := scanEvent(tx.QueryRowContext(ctx, `SELECT `+eventColumns+` FROM security_events e
-		LEFT JOIN auth_users au ON au.id=e.acknowledged_by WHERE e.id=$1`, id))
+		LEFT JOIN auth_users au ON au.id=e.acknowledged_by AND au.tenant_id=e.tenant_id
+		WHERE e.id=$1 AND e.tenant_id=$2`, id, tenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -321,17 +342,17 @@ func (s *Service) List(ctx context.Context, actor auth.Actor, filter ListFilter)
 		return nil, 0, err
 	}
 	from := ` FROM security_events e
-		WHERE ($1='' OR e.severity=$1) AND ($2='' OR e.status=$2) AND ($3='' OR e.source=$3)`
+		WHERE e.tenant_id=$4 AND ($1='' OR e.severity=$1) AND ($2='' OR e.status=$2) AND ($3='' OR e.source=$3)`
 	var total int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+from,
-		normalized.Severity, normalized.Status, normalized.Source).Scan(&total); err != nil {
+		normalized.Severity, normalized.Status, normalized.Source, actor.TenantID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+eventColumns+` FROM security_events e
-		LEFT JOIN auth_users au ON au.id=e.acknowledged_by
-		WHERE ($1='' OR e.severity=$1) AND ($2='' OR e.status=$2) AND ($3='' OR e.source=$3)
-		ORDER BY e.occurred_at DESC,e.id DESC LIMIT $4 OFFSET $5`,
-		normalized.Severity, normalized.Status, normalized.Source, normalized.Limit, normalized.Offset)
+		LEFT JOIN auth_users au ON au.id=e.acknowledged_by AND au.tenant_id=e.tenant_id
+		WHERE e.tenant_id=$4 AND ($1='' OR e.severity=$1) AND ($2='' OR e.status=$2) AND ($3='' OR e.source=$3)
+		ORDER BY e.occurred_at DESC,e.id DESC LIMIT $5 OFFSET $6`,
+		normalized.Severity, normalized.Status, normalized.Source, actor.TenantID, normalized.Limit, normalized.Offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -347,7 +368,7 @@ func (s *Service) List(ctx context.Context, actor auth.Actor, filter ListFilter)
 	return list, total, rows.Err()
 }
 
-// Get returns one defense event by id. Admin-only.
+// Get returns one defense event of the caller's tenant by id. Admin-only.
 func (s *Service) Get(ctx context.Context, actor auth.Actor, eventID string) (*Event, error) {
 	if err := requireAdmin(actor); err != nil {
 		return nil, err
@@ -356,7 +377,8 @@ func (s *Service) Get(ctx context.Context, actor auth.Actor, eventID string) (*E
 		return nil, fmt.Errorf("%w: invalid event id", ErrValidation)
 	}
 	event, err := scanEvent(s.db.QueryRowContext(ctx, `SELECT `+eventColumns+` FROM security_events e
-		LEFT JOIN auth_users au ON au.id=e.acknowledged_by WHERE e.id=$1`, eventID))
+		LEFT JOIN auth_users au ON au.id=e.acknowledged_by AND au.tenant_id=e.tenant_id
+		WHERE e.id=$1 AND e.tenant_id=$2`, eventID, actor.TenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -385,8 +407,8 @@ func (s *Service) Ack(ctx context.Context, actor auth.Actor, eventID string) (*E
 	// Lock the row: concurrent acknowledgements serialize, so only the first
 	// transition writes the audit row.
 	var severity, eventType, status string
-	err = tx.QueryRowContext(ctx, `SELECT severity,event_type,status FROM security_events WHERE id=$1 FOR UPDATE`,
-		eventID).Scan(&severity, &eventType, &status)
+	err = tx.QueryRowContext(ctx, `SELECT severity,event_type,status FROM security_events WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,
+		eventID, actor.TenantID).Scan(&severity, &eventType, &status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -395,14 +417,14 @@ func (s *Service) Ack(ctx context.Context, actor auth.Actor, eventID string) (*E
 	}
 	if status == StatusAcknowledged {
 		// Idempotent repeat: return the stored event unchanged, no audit row.
-		return getEventTx(ctx, tx, eventID)
+		return getEventTx(ctx, tx, actor.TenantID, eventID)
 	}
 	now := time.Now().Unix()
-	if _, err = tx.ExecContext(ctx, `UPDATE security_events SET status=$2,acknowledged_by=$3,acknowledged_at=$4 WHERE id=$1`,
-		eventID, StatusAcknowledged, actor.ID, now); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE security_events SET status=$2,acknowledged_by=$3,acknowledged_at=$4 WHERE id=$1 AND tenant_id=$5`,
+		eventID, StatusAcknowledged, actor.ID, now, actor.TenantID); err != nil {
 		return nil, err
 	}
-	event, err := getEventTx(ctx, tx, eventID)
+	event, err := getEventTx(ctx, tx, actor.TenantID, eventID)
 	if err != nil {
 		return nil, err
 	}

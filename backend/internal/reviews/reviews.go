@@ -74,8 +74,11 @@ const globalAdminRole = "admin"
 // Review is one change-review request. DecidedBy/DecidedByName/DecidedAt/Reason
 // only appear once a decision exists (or, for cancel, once the requester or a
 // maintainer cancelled the pending request); a pending review omits them.
+// TenantID is server-side only: every read is tenant-scoped, so it never enters
+// the JSON contract.
 type Review struct {
 	ID              string  `json:"id"`
+	TenantID        string  `json:"-"`
 	ProjectID       string  `json:"projectId"`
 	Number          int64   `json:"number"`
 	Subject         string  `json:"subject"`
@@ -177,12 +180,13 @@ func New(db *sql.DB, registry *projects.Service, options ...Options) *Service {
 	}
 }
 
-const reviewColumns = `id,project_id,number,subject,description,version,external_url,status,requested_by,decided_by,decided_at,reason,created_at,updated_at`
+const reviewColumns = `id,tenant_id,project_id,number,subject,description,version,external_url,status,requested_by,decided_by,decided_at,reason,created_at,updated_at`
 
 // reviewSelectColumns is reviewColumns with the requesting/deciding usernames
 // resolved for display (accounts are disabled, never deleted, so a username is
-// always available for a stored actor id).
-const reviewSelectColumns = `r.id,r.project_id,r.number,r.subject,r.description,r.version,r.external_url,r.status,r.requested_by,COALESCE(ru.username,''),r.decided_by,COALESCE(du.username,''),r.decided_at,r.reason,r.created_at,r.updated_at`
+// always available for a stored actor id). The user joins are tenant-qualified so
+// a corrupted actor link can never display another tenant's username.
+const reviewSelectColumns = `r.id,r.tenant_id,r.project_id,r.number,r.subject,r.description,r.version,r.external_url,r.status,r.requested_by,COALESCE(ru.username,''),r.decided_by,COALESCE(du.username,''),r.decided_at,r.reason,r.created_at,r.updated_at`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -196,7 +200,7 @@ func scanReview(row rowScanner) (*Review, error) {
 	var review Review
 	var decidedBy, reason sql.NullString
 	var decidedAt sql.NullInt64
-	if err := row.Scan(&review.ID, &review.ProjectID, &review.Number, &review.Subject, &review.Description, &review.Version,
+	if err := row.Scan(&review.ID, &review.TenantID, &review.ProjectID, &review.Number, &review.Subject, &review.Description, &review.Version,
 		&review.ExternalURL, &review.Status, &review.RequestedBy, &decidedBy, &decidedAt, &reason,
 		&review.CreatedAt, &review.UpdatedAt); err != nil {
 		return nil, err
@@ -218,7 +222,7 @@ func scanReviewWithNames(row rowScanner) (*Review, error) {
 	var review Review
 	var decidedBy, decidedByName, reason sql.NullString
 	var decidedAt sql.NullInt64
-	if err := row.Scan(&review.ID, &review.ProjectID, &review.Number, &review.Subject, &review.Description, &review.Version,
+	if err := row.Scan(&review.ID, &review.TenantID, &review.ProjectID, &review.Number, &review.Subject, &review.Description, &review.Version,
 		&review.ExternalURL, &review.Status, &review.RequestedBy, &review.RequestedByName,
 		&decidedBy, &decidedByName, &decidedAt, &reason, &review.CreatedAt, &review.UpdatedAt); err != nil {
 		return nil, err
@@ -366,13 +370,13 @@ func decideError(message string) error {
 }
 
 // visibleProject checks the single project-visibility predicate: an invisible
-// project is reported as not found so review ids cannot be used to enumerate a
-// private project.
+// project — including a project of another tenant — is reported as not found so
+// review ids cannot be used to enumerate a private or foreign project.
 func visibleProject(ctx context.Context, q rowQuerier, actor auth.Actor, projectID string) error {
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	var found int
-	err := q.QueryRowContext(ctx, `SELECT 1 FROM projects p WHERE p.id=$1 AND `+projects.VisiblePredicate("p", 2, 3),
-		projectID, isAdmin, userID).Scan(&found)
+	err := q.QueryRowContext(ctx, `SELECT 1 FROM projects p WHERE p.id=$1 AND `+projects.VisiblePredicate("p", 2, 3, 4),
+		projectID, actor.TenantID, isAdmin, userID).Scan(&found)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -437,8 +441,8 @@ func lockReview(ctx context.Context, tx *sql.Tx, id string) (*Review, error) {
 // transaction. The caller has already authorized the project.
 func getReviewTx(ctx context.Context, tx *sql.Tx, id string) (*Review, error) {
 	review, err := scanReviewWithNames(tx.QueryRowContext(ctx, `SELECT `+reviewSelectColumns+` FROM reviews r
-	 LEFT JOIN auth_users ru ON ru.id=r.requested_by
-	 LEFT JOIN auth_users du ON du.id=r.decided_by
+	 LEFT JOIN auth_users ru ON ru.id=r.requested_by AND ru.tenant_id=r.tenant_id
+	 LEFT JOIN auth_users du ON du.id=r.decided_by AND du.tenant_id=r.tenant_id
 	 WHERE r.id=$1`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -467,8 +471,11 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, projectID string
 	}
 	// The project row lock is the numbering serialization point (the
 	// build_count/deploy_count pattern); a missing row is a concurrent deletion.
+	// The row's tenant is the review's tenant: the authorizing predicate already
+	// proved it is the actor's tenant, but the row value is authoritative.
 	var count int64
-	err = tx.QueryRowContext(ctx, `SELECT review_count FROM projects WHERE id=$1 FOR UPDATE`, projectID).Scan(&count)
+	var projectTenantID string
+	err = tx.QueryRowContext(ctx, `SELECT review_count,tenant_id FROM projects WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, projectID, actor.TenantID).Scan(&count, &projectTenantID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -481,17 +488,17 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, projectID string
 	}
 	now := time.Now().Unix()
 	review := &Review{
-		ID: id, ProjectID: projectID, Number: count + 1, Subject: subject, Description: description,
+		ID: id, TenantID: projectTenantID, ProjectID: projectID, Number: count + 1, Subject: subject, Description: description,
 		Version: version, ExternalURL: externalURL, Status: StatusPending, RequestedBy: actor.ID,
 		RequestedByName: actor.Username, CreatedAt: now, UpdatedAt: now,
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO reviews(id,project_id,number,subject,description,version,external_url,status,requested_by,decided_by,decided_at,reason,created_at,updated_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,NULL,NULL,$10,$10)`,
-		review.ID, review.ProjectID, review.Number, review.Subject, review.Description, review.Version,
+	if _, err = tx.ExecContext(ctx, `INSERT INTO reviews(id,tenant_id,project_id,number,subject,description,version,external_url,status,requested_by,decided_by,decided_at,reason,created_at,updated_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,NULL,NULL,$11,$11)`,
+		review.ID, projectTenantID, review.ProjectID, review.Number, review.Subject, review.Description, review.Version,
 		review.ExternalURL, review.Status, review.RequestedBy, now); err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE projects SET review_count=$2 WHERE id=$1`, projectID, review.Number); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE projects SET review_count=$2 WHERE id=$1 AND tenant_id=$3`, projectID, review.Number, projectTenantID); err != nil {
 		return nil, err
 	}
 	if err = writeAudit(ctx, tx, actor, ActionRequest, review.ID, fmt.Sprintf("project=%s number=%d", projectID, review.Number)); err != nil {
@@ -517,9 +524,9 @@ func (s *Service) Get(ctx context.Context, actor auth.Actor, reviewID string) (*
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	review, err := scanReviewWithNames(s.db.QueryRowContext(ctx, `SELECT `+reviewSelectColumns+` FROM reviews r
 	 JOIN projects p ON p.id=r.project_id
-	 LEFT JOIN auth_users ru ON ru.id=r.requested_by
-	 LEFT JOIN auth_users du ON du.id=r.decided_by
-	 WHERE r.id=$1 AND `+projects.VisiblePredicate("p", 2, 3), reviewID, isAdmin, userID))
+	 LEFT JOIN auth_users ru ON ru.id=r.requested_by AND ru.tenant_id=r.tenant_id
+	 LEFT JOIN auth_users du ON du.id=r.decided_by AND du.tenant_id=r.tenant_id
+	 WHERE r.id=$1 AND r.tenant_id=$5 AND `+projects.VisiblePredicate("p", 2, 3, 4), reviewID, actor.TenantID, isAdmin, userID, actor.TenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -546,15 +553,15 @@ func (s *Service) List(ctx context.Context, actor auth.Actor, projectID, status 
 		return nil, 0, err
 	}
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reviews WHERE project_id=$1 AND ($2='' OR status=$2)`,
-		projectID, status).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reviews WHERE tenant_id=$1 AND project_id=$2 AND ($3='' OR status=$3)`,
+		actor.TenantID, projectID, status).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+reviewSelectColumns+` FROM reviews r
-	 LEFT JOIN auth_users ru ON ru.id=r.requested_by
-	 LEFT JOIN auth_users du ON du.id=r.decided_by
-	 WHERE r.project_id=$1 AND ($2='' OR r.status=$2)
-	 ORDER BY r.created_at DESC,r.number DESC,r.id DESC LIMIT $3 OFFSET $4`, projectID, status, limit, offset)
+	 LEFT JOIN auth_users ru ON ru.id=r.requested_by AND ru.tenant_id=r.tenant_id
+	 LEFT JOIN auth_users du ON du.id=r.decided_by AND du.tenant_id=r.tenant_id
+	 WHERE r.tenant_id=$1 AND r.project_id=$2 AND ($3='' OR r.status=$3)
+	 ORDER BY r.created_at DESC,r.number DESC,r.id DESC LIMIT $4 OFFSET $5`, actor.TenantID, projectID, status, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -589,18 +596,18 @@ func (s *Service) ListVisible(ctx context.Context, actor auth.Actor, filter List
 	}
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	from := ` FROM reviews r JOIN projects p ON p.id=r.project_id
-		WHERE ($1='' OR r.project_id=$1) AND ($2='' OR r.status=$2) AND ` + projects.VisiblePredicate("p", 3, 4)
+		WHERE ($1='' OR r.project_id=$1) AND ($2='' OR r.status=$2) AND ` + projects.VisiblePredicate("p", 3, 4, 5)
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+from, filter.ProjectID, filter.Status, isAdmin, userID).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+from, filter.ProjectID, filter.Status, actor.TenantID, isAdmin, userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+reviewSelectColumns+` FROM reviews r
 	 JOIN projects p ON p.id=r.project_id
-	 LEFT JOIN auth_users ru ON ru.id=r.requested_by
-	 LEFT JOIN auth_users du ON du.id=r.decided_by
-	 WHERE ($1='' OR r.project_id=$1) AND ($2='' OR r.status=$2) AND `+projects.VisiblePredicate("p", 3, 4)+`
-	 ORDER BY r.created_at DESC,r.number DESC,r.id DESC LIMIT $5 OFFSET $6`,
-		filter.ProjectID, filter.Status, isAdmin, userID, filter.Limit, filter.Offset)
+	 LEFT JOIN auth_users ru ON ru.id=r.requested_by AND ru.tenant_id=r.tenant_id
+	 LEFT JOIN auth_users du ON du.id=r.decided_by AND du.tenant_id=r.tenant_id
+	 WHERE ($1='' OR r.project_id=$1) AND ($2='' OR r.status=$2) AND `+projects.VisiblePredicate("p", 3, 4, 5)+`
+	 ORDER BY r.created_at DESC,r.number DESC,r.id DESC LIMIT $6 OFFSET $7`,
+		filter.ProjectID, filter.Status, actor.TenantID, isAdmin, userID, filter.Limit, filter.Offset)
 	if err != nil {
 		return nil, 0, err
 	}

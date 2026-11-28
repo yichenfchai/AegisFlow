@@ -41,9 +41,12 @@ const (
 	maxApprovalReasonBytes = 512
 )
 
-// Approval is one deployment approval request.
+// Approval is one deployment approval request. TenantID is server-side only: it
+// scopes every approval query and lets the worker attribute a system expiry audit
+// row to the owning tenant instead of a deployment-wide default.
 type Approval struct {
 	ID           string `json:"id"`
+	TenantID     string `json:"-"`
 	DeploymentID string `json:"deploymentId"`
 	ProjectID    string `json:"projectId"`
 	Status       string `json:"status"`
@@ -55,11 +58,11 @@ type Approval struct {
 	DecidedAt    int64  `json:"decidedAt"`
 }
 
-const approvalColumns = `id,deployment_id,project_id,status,requested_by,decided_by,reason,created_at,expires_at,decided_at`
+const approvalColumns = `id,tenant_id,deployment_id,project_id,status,requested_by,decided_by,reason,created_at,expires_at,decided_at`
 
 func scanApproval(row rowScanner) (Approval, error) {
 	var a Approval
-	if err := row.Scan(&a.ID, &a.DeploymentID, &a.ProjectID, &a.Status, &a.RequestedBy, &a.DecidedBy, &a.Reason,
+	if err := row.Scan(&a.ID, &a.TenantID, &a.DeploymentID, &a.ProjectID, &a.Status, &a.RequestedBy, &a.DecidedBy, &a.Reason,
 		&a.CreatedAt, &a.ExpiresAt, &a.DecidedAt); err != nil {
 		return Approval{}, err
 	}
@@ -120,9 +123,10 @@ func (s *Service) expirePendingApproval(ctx context.Context, tx *sql.Tx, approva
 	approval.Reason = "approval expired"
 	approval.DecidedAt = now
 	detail := "deployment=" + approval.DeploymentID + " reason=approval expired"
-	// The worker has no session actor: attribute the system row to the
-	// deployment's tenant (phase F1 has exactly one, the default tenant).
-	if err := writeAuditObject(ctx, tx, auth.Actor{TenantID: s.defaultTenantID}, ActionApprovalExpire, "approval", approval.ID, detail); err != nil {
+	// The worker has no session actor: attribute the system row to the owning
+	// deployment's tenant, carried on the approval row itself, never to a
+	// deployment-wide default.
+	if err := writeAuditObject(ctx, tx, auth.Actor{TenantID: approval.TenantID}, ActionApprovalExpire, "approval", approval.ID, detail); err != nil {
 		return Approval{}, err
 	}
 	if err := s.enqueueApprovalNotification(ctx, tx, approval, notificationExpired); err != nil {
@@ -164,6 +168,11 @@ func (s *Service) Approve(ctx context.Context, actor auth.Actor, approvalID stri
 	approval, err := lockApproval(ctx, tx, approvalID)
 	if err != nil {
 		return Approval{}, err
+	}
+	// Approval ids are global primary keys; the tenant boundary still applies.
+	// Another tenant's approval is a 404, exactly like an unknown id.
+	if approval.TenantID != actor.TenantID {
+		return Approval{}, ErrNotFound
 	}
 	if approval.Status == ApprovalApproved {
 		return approval, nil
@@ -233,6 +242,10 @@ func (s *Service) Reject(ctx context.Context, actor auth.Actor, approvalID, reas
 	if err != nil {
 		return Approval{}, err
 	}
+	// Another tenant's approval is a 404, always.
+	if approval.TenantID != actor.TenantID {
+		return Approval{}, ErrNotFound
+	}
 	if approval.Status == ApprovalRejected {
 		return approval, nil
 	}
@@ -281,8 +294,8 @@ func (s *Service) Reject(ctx context.Context, actor auth.Actor, approvalID, reas
 	return approval, nil
 }
 
-// ListApprovals pages approvals, newest first; status may be empty or one of
-// the four approval statuses.
+// ListApprovals pages the caller's tenant's approvals, newest first; status may
+// be empty or one of the four approval statuses.
 func (s *Service) ListApprovals(ctx context.Context, actor auth.Actor, status string, limit, offset int) ([]Approval, int, error) {
 	if status != "" && !validApprovalStatus(status) {
 		return nil, 0, fmt.Errorf("%w: status filter must be pending, approved, rejected or expired", ErrValidation)
@@ -291,11 +304,11 @@ func (s *Service) ListApprovals(ctx context.Context, actor auth.Actor, status st
 		return nil, 0, err
 	}
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM approvals WHERE ($1='' OR status=$1)`, status).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM approvals WHERE tenant_id=$1 AND ($2='' OR status=$2)`, actor.TenantID, status).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+approvalColumns+` FROM approvals
-	 WHERE ($1='' OR status=$1) ORDER BY created_at DESC,id DESC LIMIT $2 OFFSET $3`, status, limit, offset)
+	 WHERE tenant_id=$1 AND ($2='' OR status=$2) ORDER BY created_at DESC,id DESC LIMIT $3 OFFSET $4`, actor.TenantID, status, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}

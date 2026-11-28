@@ -47,7 +47,7 @@ func (s *Server) listKnowledge(c *gin.Context) {
 	if !ok {
 		return
 	}
-	list, total, err := s.knowledge.List(c.Request.Context(), knowledge.ListFilter{
+	list, total, err := s.knowledge.List(c.Request.Context(), actorFrom(c), knowledge.ListFilter{
 		Query: c.Query("q"), Limit: limit, Offset: offset,
 	})
 	if err != nil {
@@ -87,7 +87,7 @@ func (s *Server) getKnowledge(c *gin.Context) {
 		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
 		return
 	}
-	doc, err := s.knowledge.Get(c.Request.Context(), c.Param("id"))
+	doc, err := s.knowledge.Get(c.Request.Context(), actorFrom(c), c.Param("id"))
 	if err != nil {
 		s.knowledgeError(c, err)
 		return

@@ -310,3 +310,187 @@ func TestTenantMigrationUpgradesExistingDeployment(t *testing.T) {
 		t.Fatal("duplicate case-insensitive email inside one tenant accepted")
 	}
 }
+
+// businessTenantTables is the phase-F2 isolation surface: every business table
+// that stores tenant-owned rows.
+var businessTenantTables = []string{
+	"projects", "builds", "deployment_targets", "deployments", "approvals",
+	"approval_notifications", "reviews", "review_external_results",
+	"review_notifications", "scans", "security_events", "knowledge_docs",
+	"secrets", "project_policies",
+}
+
+// TestBusinessTenantMigrationUpgradesExistingDeployment replays the F1 schema
+// (v18), seeds the business rows an existing single-tenant deployment would
+// have, then applies v19 and asserts the designed data isolation: every
+// business row is backfilled with the seeded tenant, the columns become NOT NULL
+// with RESTRICT foreign keys, the deployment-global uniqueness rules become
+// tenant-scoped, and the tenant-first list indexes exist.
+func TestBusinessTenantMigrationUpgradesExistingDeployment(t *testing.T) {
+	db := testutil.OpenPostgres(t)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, applied_at BIGINT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 18; i++ {
+		for _, statement := range Migrations[i] {
+			if _, err := db.ExecContext(ctx, statement); err != nil {
+				t.Fatalf("seed migration %d: %v", i+1, err)
+			}
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES($1,$2)`, i+1, time.Now().Unix()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One row per business table, exactly as a pre-F2 deployment would have it.
+	for _, statement := range []string{
+		`INSERT INTO projects(id,name,status,created_by,created_at,updated_at) VALUES('legacyproject00001','web','active','u1',100,100)`,
+		`INSERT INTO builds(id,project_id,build_number,status,command,created_at) VALUES('legacybuild0000001','legacyproject00001',1,'succeeded','make',100)`,
+		`INSERT INTO deployment_targets(id,name,kind,environment,endpoint,status,created_at,updated_at) VALUES('legacytarget000001','prod','http','production','https://example.test','active',100,100)`,
+		`INSERT INTO deployments(id,project_id,target_id,deployment_number,status,version,created_at) VALUES('legacydeploy000001','legacyproject00001','legacytarget000001',1,'succeeded','v1',100)`,
+		`INSERT INTO approvals(id,deployment_id,project_id,status,created_at,expires_at) VALUES('legacyapproval001','legacydeploy000001','legacyproject00001','pending',100,200)`,
+		`INSERT INTO approval_notifications(id,approval_id,event,payload,next_attempt_at,created_at) VALUES('legacyappnotify001','legacyapproval001','approval.requested','{}',100,100)`,
+		`INSERT INTO reviews(id,project_id,number,subject,status,created_at,updated_at) VALUES('legacyreview000001','legacyproject00001',1,'change','pending',100,100)`,
+		`INSERT INTO review_external_results(id,review_id,delivery_id,source,verdict,received_at) VALUES('legacyextresult01','legacyreview000001','legacy-review-delivery-0001','ci','passed',100)`,
+		`INSERT INTO review_notifications(id,review_id,event,payload,next_attempt_at,created_at) VALUES('legacyrevnotify01','legacyreview000001','review.requested','{}',100,100)`,
+		`INSERT INTO scans(id,project_id,delivery_id,source,verdict,received_at) VALUES('legacyscan0000001','legacyproject00001','legacy-scan-delivery-0001','scanner','passed',100)`,
+		`INSERT INTO security_events(id,delivery_id,source,severity,event_type,summary,occurred_at,received_at) VALUES('legacyevent000001','legacy-event-delivery-0001','ids','high','intrusion','blocked',100,100)`,
+		`INSERT INTO knowledge_docs(id,title,body,created_by,updated_by,created_at,updated_at) VALUES('legacydoc00000001','runbook','body','u1','u1',100,100)`,
+		`INSERT INTO secrets(id,name,ciphertext,key_version,created_by,created_at,updated_at) VALUES('legacysecret000001','deploy-key',E'\\x00'::bytea,1,'u1',100,100)`,
+		`INSERT INTO project_policies(project_id,require_review,required_scan_verdict,updated_by,updated_at) VALUES('legacyproject00001',true,'passed','u1',100)`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("seed legacy business row: %v", err)
+		}
+	}
+
+	if err := Apply(ctx, db); err != nil {
+		t.Fatalf("apply business tenant migration over existing rows: %v", err)
+	}
+
+	// Child tables intentionally stay tenant-free: their rows are reached only
+	// through an already tenant-checked parent.
+	for _, table := range []string{"build_log_events", "deployment_events", "project_members"} {
+		if _, ok := columnState(t, db, table, "tenant_id"); ok {
+			t.Fatalf("%s unexpectedly gained a tenant_id column", table)
+		}
+	}
+
+	// Every business row is backfilled with the seeded default tenant.
+	counts := map[string]int{
+		"projects": 1, "builds": 1, "deployment_targets": 1, "deployments": 1,
+		"approvals": 1, "approval_notifications": 1, "reviews": 1,
+		"review_external_results": 1, "review_notifications": 1, "scans": 1,
+		"security_events": 1, "knowledge_docs": 1, "secrets": 1, "project_policies": 1,
+	}
+	for _, table := range businessTenantTables {
+		var total, defaultTenant int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*),COUNT(*) FILTER (WHERE tenant_id=$1) FROM `+table, seedTenantID).Scan(&total, &defaultTenant); err != nil {
+			t.Fatalf("%s: %v", table, err)
+		}
+		if total != counts[table] || defaultTenant != counts[table] {
+			t.Fatalf("%s backfill = %d/%d, want %d/%d", table, defaultTenant, total, counts[table], counts[table])
+		}
+	}
+
+	// Every business tenant column is NOT NULL and carries a RESTRICT foreign key.
+	for _, table := range businessTenantTables {
+		info, ok := columnState(t, db, table, "tenant_id")
+		if !ok {
+			t.Fatalf("%s.tenant_id missing", table)
+		}
+		if info.dataType != "text" || info.isNullable != "NO" {
+			t.Fatalf("%s.tenant_id = %+v, want NOT NULL text", table, info)
+		}
+		var fk int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pg_constraint
+			WHERE conname=$1 AND contype='f' AND conrelid=$2::regclass AND confdeltype='r'`, table+"_tenant_fk", table).Scan(&fk); err != nil {
+			t.Fatal(err)
+		}
+		if fk != 1 {
+			t.Fatalf("foreign key %s_tenant_fk on %s missing or not ON DELETE RESTRICT", table, table)
+		}
+	}
+
+	// The deployment-global uniqueness rules are replaced by tenant-scoped ones.
+	for _, name := range []string{"projects_name_lower_idx", "deployment_targets_name_lower_idx"} {
+		if _, ok := indexDefinition(t, db, name); ok {
+			t.Fatalf("legacy global index %s still exists", name)
+		}
+	}
+	for name, columns := range map[string]string{
+		"projects_tenant_name_lower_idx":               "UNIQUE",
+		"deployment_targets_tenant_name_lower_idx":     "UNIQUE",
+		"projects_tenant_status_name_idx":              "tenant_id, status, lower(name)",
+		"deployment_targets_tenant_status_name_idx":    "tenant_id, status, lower(name)",
+		"builds_tenant_created_idx":                    "(tenant_id, created_at DESC, id)",
+		"deployments_tenant_created_idx":               "(tenant_id, created_at DESC, id)",
+		"approvals_tenant_created_idx":                 "(tenant_id, created_at DESC, id)",
+		"reviews_tenant_created_idx":                   "(tenant_id, created_at DESC, id)",
+		"scans_tenant_verdict_received_idx":            "(tenant_id, verdict, received_at DESC, id)",
+		"security_events_tenant_status_occurred_idx":   "(tenant_id, status, occurred_at DESC, id)",
+		"security_events_tenant_severity_occurred_idx": "(tenant_id, severity, occurred_at DESC)",
+		"knowledge_docs_tenant_updated_idx":            "(tenant_id, updated_at DESC, id)",
+		"secrets_tenant_created_idx":                   "(tenant_id, created_at DESC, id)",
+	} {
+		definition, ok := indexDefinition(t, db, name)
+		if !ok {
+			t.Fatalf("index %s missing after F2 migration", name)
+		}
+		if !strings.Contains(definition, columns) {
+			t.Fatalf("index %s definition %q does not cover %q", name, definition, columns)
+		}
+	}
+	if definition, ok := indexDefinition(t, db, "projects_tenant_name_lower_idx"); !ok || !strings.Contains(definition, "tenant_id, lower(name)") {
+		t.Fatalf("projects tenant name index = %q (exists=%v)", definition, ok)
+	}
+	if definition, ok := indexDefinition(t, db, "deployment_targets_tenant_name_lower_idx"); !ok || !strings.Contains(definition, "tenant_id, lower(name)") {
+		t.Fatalf("target tenant name index = %q (exists=%v)", definition, ok)
+	}
+	for _, constraint := range []struct{ table, name string }{
+		{"secrets", "secrets_tenant_name_key"},
+		{"scans", "scans_tenant_delivery_key"},
+		{"security_events", "security_events_tenant_delivery_key"},
+		{"review_external_results", "review_external_results_tenant_delivery_key"},
+	} {
+		var columns string
+		err := db.QueryRowContext(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname=$1 AND conrelid=$2::regclass`,
+			constraint.name, constraint.table).Scan(&columns)
+		if err != nil {
+			t.Fatalf("tenant unique constraint on %s missing: %v", constraint.table, err)
+		}
+		if !strings.Contains(columns, "UNIQUE (tenant_id,") {
+			t.Fatalf("%s definition = %q, want tenant-scoped unique", constraint.name, columns)
+		}
+	}
+
+	// A second tenant may reuse every globally-unique value; the same tenant may
+	// never duplicate it. This is the isolation contract the application
+	// predicates rely on.
+	const otherTenantID = "tenant_other_0000000000000001"
+	if _, err := db.ExecContext(ctx, `INSERT INTO tenants(id,slug,name,status,created_at,updated_at)
+		VALUES($1,'other','Other','active',1,1)`, otherTenantID); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`INSERT INTO projects(id,tenant_id,name,status,created_at,updated_at) VALUES('otherproject000001',$1,'web','active',1,1)`,
+		`INSERT INTO deployment_targets(id,tenant_id,name,kind,environment,endpoint,status,created_at,updated_at) VALUES('othertarget0000001',$1,'prod','http','production','https://example.test','active',1,1)`,
+		`INSERT INTO secrets(id,tenant_id,name,ciphertext,key_version,created_by,created_at,updated_at) VALUES('othersecret0000001',$1,'deploy-key',E'\\x00'::bytea,1,'u1',1,1)`,
+		`INSERT INTO scans(id,tenant_id,project_id,delivery_id,source,verdict,received_at) VALUES('otherscan000000001',$1,'otherproject000001','legacy-scan-delivery-0001','scanner','passed',1)`,
+		`INSERT INTO security_events(id,tenant_id,delivery_id,source,severity,event_type,summary,occurred_at,received_at) VALUES('otherevent0000001',$1,'legacy-event-delivery-0001','ids','high','intrusion','blocked',1,1)`,
+		`INSERT INTO review_external_results(id,tenant_id,review_id,delivery_id,source,verdict,received_at) SELECT 'otherextresult001',$1,id,'legacy-review-delivery-0001','ci','passed',1 FROM reviews LIMIT 1`,
+	} {
+		if _, err := db.ExecContext(ctx, statement, otherTenantID); err != nil {
+			t.Fatalf("cross-tenant uniqueness rejected: %v", err)
+		}
+	}
+	for _, statement := range []string{
+		`INSERT INTO projects(id,tenant_id,name,status,created_at,updated_at) VALUES('dupproject0000001',$1,'web','active',1,1)`,
+		`INSERT INTO secrets(id,tenant_id,name,ciphertext,key_version,created_by,created_at,updated_at) VALUES('dupsecret00000001',$1,'deploy-key',E'\\x01'::bytea,1,'u1',1,1)`,
+		`INSERT INTO scans(id,tenant_id,project_id,delivery_id,source,verdict,received_at) VALUES('dupscan0000000001',$1,'legacyproject00001','legacy-scan-delivery-0001','scanner','passed',1)`,
+	} {
+		if _, err := db.ExecContext(ctx, statement, seedTenantID); err == nil {
+			t.Fatalf("duplicate inside one tenant accepted: %s", statement)
+		}
+	}
+}

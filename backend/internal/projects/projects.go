@@ -145,21 +145,26 @@ func New(db *sql.DB) *Service { return &Service{db: db} }
 const projectColumns = `p.id,p.name,p.description,p.repo_url,p.default_branch,p.build_command,p.status,p.visibility,p.created_by,p.created_at,p.updated_at`
 
 // VisiblePredicate renders the SQL condition that restricts a query to projects
-// the actor may see. It is the single definition of project visibility; other
-// packages embed it so a joined query filters and paginates identically.
+// the actor may see. It is the single definition of project visibility and
+// tenant isolation for project-scoped data: every builder of builds,
+// deployments, reviews, scans, policies and their lists embeds it, so a joined
+// query filters both the tenant and the per-project visibility identically.
 //
-// alias is the projects table alias in the caller's query, adminParam is the
-// 1-based index of the caller's "is global admin" boolean parameter, and
-// actorParam is the index of the caller's user id. Both parameters appear more
-// than once, so PostgreSQL requires their placeholders to be reused verbatim.
-func VisiblePredicate(alias string, adminParam, actorParam int) string {
-	return fmt.Sprintf(`(%[1]s.visibility='%[2]s' OR $%[3]d OR %[1]s.created_by=$%[4]d OR EXISTS (
-		SELECT 1 FROM project_members pm WHERE pm.project_id=%[1]s.id AND pm.user_id=$%[4]d))`,
-		alias, VisibilityPublic, adminParam, actorParam)
+// alias is the projects table alias in the caller's query, tenantParam is the
+// 1-based index of the caller's tenant id parameter, adminParam is the index of
+// the "is global admin" boolean and actorParam is the index of the caller's user
+// id. Every parameter appears more than once, so PostgreSQL requires their
+// placeholders to be reused verbatim.
+func VisiblePredicate(alias string, tenantParam, adminParam, actorParam int) string {
+	return fmt.Sprintf(`(%[1]s.tenant_id=$%[2]d AND (%[1]s.visibility='%[3]s' OR $%[4]d OR %[1]s.created_by=$%[5]d OR EXISTS (
+		SELECT 1 FROM project_members pm WHERE pm.project_id=%[1]s.id AND pm.user_id=$%[5]d)))`,
+		alias, tenantParam, VisibilityPublic, adminParam, actorParam)
 }
 
-// VisibilityArgs returns the parameter pair VisiblePredicate expects for this
-// actor: whether the actor is a global admin, and the actor's user id.
+// VisibilityArgs returns the non-tenant parameter pair VisiblePredicate expects
+// for this actor: whether the actor is a global admin, and the actor's user id.
+// Callers pass actor.TenantID as the tenant parameter and must never derive it
+// from client input.
 func VisibilityArgs(actor auth.Actor) (isAdmin bool, userID string) {
 	return actor.Role == globalAdminRole, actor.ID
 }
@@ -171,25 +176,38 @@ type RowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// projectVisibility resolves one project inside the actor's tenant. A project of
+// another tenant is reported as not found (404): cross-tenant ids are never an
+// existence oracle. Tenant isolation is checked before role or visibility, so a
+// global admin cannot reach another tenant's project either.
+func projectVisibility(ctx context.Context, q RowQuerier, actor auth.Actor, projectID string) (string, error) {
+	var visibility string
+	err := q.QueryRowContext(ctx, `SELECT visibility FROM projects WHERE id=$1 AND tenant_id=$2`, projectID, actor.TenantID).Scan(&visibility)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	return visibility, nil
+}
+
 // AuthorizeWrite applies the project-maintainer overlay on top of the global
 // role. The global role stays a ceiling: a viewer never writes, an admin always
 // may. A private project additionally requires the caller to be one of its
 // maintainers; a public project keeps the pre-membership rule where any member
-// may write. An invisible project is reported as not found, never as forbidden.
+// may write. An invisible project is reported as not found, never as forbidden,
+// and a project belonging to another tenant is also not found.
 func (s *Service) AuthorizeWrite(ctx context.Context, q RowQuerier, actor auth.Actor, projectID string) error {
+	visibility, err := projectVisibility(ctx, q, actor, projectID)
+	if err != nil {
+		return err
+	}
 	if actor.Role == globalAdminRole {
 		return nil
 	}
 	if actor.Role != globalMemberRole {
 		return fmt.Errorf("%w: read-only roles cannot modify projects", ErrForbidden)
-	}
-	var visibility string
-	err := q.QueryRowContext(ctx, `SELECT visibility FROM projects WHERE id=$1`, projectID).Scan(&visibility)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
-	}
-	if err != nil {
-		return err
 	}
 	if visibility != VisibilityPrivate {
 		return nil
@@ -209,8 +227,12 @@ func (s *Service) AuthorizeWrite(ctx context.Context, q RowQuerier, actor auth.A
 // maintainer of that project. It is deliberately stricter than AuthorizeWrite:
 // being allowed to write a public project does not imply being allowed to
 // approve or reject its reviews. Visibility stays the caller's responsibility,
-// so an invisible project is a 404 before this check runs.
+// so an invisible project is a 404 before this check runs; a project of another
+// tenant is a 404 as well.
 func (s *Service) AuthorizeDecide(ctx context.Context, q RowQuerier, actor auth.Actor, projectID string) error {
+	if _, err := projectVisibility(ctx, q, actor, projectID); err != nil {
+		return err
+	}
 	if actor.Role == globalAdminRole {
 		return nil
 	}
@@ -245,9 +267,9 @@ func memberRole(ctx context.Context, q RowQuerier, userID, projectID string) (ro
 // caller that arrives after the archive sees the archived status. FOR SHARE is
 // enough (the archive path takes FOR UPDATE on the same row) and, unlike FOR
 // UPDATE, cannot deadlock two concurrent membership writes.
-func requireActiveProject(ctx context.Context, tx *sql.Tx, projectID string) error {
+func requireActiveProject(ctx context.Context, tx *sql.Tx, projectID, tenantID string) error {
 	var status string
-	err := tx.QueryRowContext(ctx, `SELECT status FROM projects WHERE id=$1 FOR SHARE`, projectID).Scan(&status)
+	err := tx.QueryRowContext(ctx, `SELECT status FROM projects WHERE id=$1 AND tenant_id=$2 FOR SHARE`, projectID, tenantID).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -419,8 +441,8 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (*P
 		return nil, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `INSERT INTO projects(id,name,description,repo_url,default_branch,build_command,status,visibility,created_by,created_at,updated_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10) ON CONFLICT (lower(name)) DO NOTHING`, id, input.Name, input.Description, input.RepoURL, input.DefaultBranch, input.BuildCommand, StatusActive, visibility, actor.ID, now)
+	result, err := tx.ExecContext(ctx, `INSERT INTO projects(id,tenant_id,name,description,repo_url,default_branch,build_command,status,visibility,created_by,created_at,updated_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) ON CONFLICT (tenant_id, lower(name)) DO NOTHING`, id, actor.TenantID, input.Name, input.Description, input.RepoURL, input.DefaultBranch, input.BuildCommand, StatusActive, visibility, actor.ID, now)
 	if err != nil {
 		return nil, err
 	}
@@ -452,7 +474,7 @@ func (s *Service) Get(ctx context.Context, actor auth.Actor, id string) (*Projec
 	}
 	isAdmin, userID := VisibilityArgs(actor)
 	project, err := scanProject(s.db.QueryRowContext(ctx, `SELECT `+projectColumns+` FROM projects p
-	 WHERE p.id=$1 AND `+VisiblePredicate("p", 2, 3), id, isAdmin, userID))
+	 WHERE p.id=$1 AND `+VisiblePredicate("p", 2, 3, 4), id, actor.TenantID, isAdmin, userID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -473,12 +495,12 @@ func (s *Service) List(ctx context.Context, actor auth.Actor, status string, lim
 	}
 	isAdmin, userID := VisibilityArgs(actor)
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects p WHERE ($1='' OR p.status=$1) AND `+VisiblePredicate("p", 2, 3), status, isAdmin, userID).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects p WHERE ($1='' OR p.status=$1) AND `+VisiblePredicate("p", 2, 3, 4), status, actor.TenantID, isAdmin, userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+projectColumns+` FROM projects p
-	 WHERE ($1='' OR p.status=$1) AND `+VisiblePredicate("p", 4, 5)+`
-	 ORDER BY lower(p.name),p.id LIMIT $2 OFFSET $3`, status, limit, offset, isAdmin, userID)
+	 WHERE ($1='' OR p.status=$1) AND `+VisiblePredicate("p", 4, 5, 6)+`
+	 ORDER BY lower(p.name),p.id LIMIT $2 OFFSET $3`, status, limit, offset, actor.TenantID, isAdmin, userID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -511,9 +533,10 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 	defer tx.Rollback()
 	isAdmin, userID := VisibilityArgs(actor)
 	// The visibility predicate runs inside the locking read, so an actor who
-	// cannot see the project cannot update it either (404, not 403).
+	// cannot see the project cannot update it either (404, not 403); the same
+	// predicate also rejects a project of another tenant.
 	current, err := scanProject(tx.QueryRowContext(ctx, `SELECT `+projectColumns+` FROM projects p
-	 WHERE p.id=$1 AND `+VisiblePredicate("p", 2, 3)+` FOR UPDATE`, id, isAdmin, userID))
+	 WHERE p.id=$1 AND `+VisiblePredicate("p", 2, 3, 4)+` FOR UPDATE`, id, actor.TenantID, isAdmin, userID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -581,7 +604,7 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 	}
 	if fieldChange && updated.Name != current.Name {
 		var conflict int
-		if err = tx.QueryRowContext(ctx, `SELECT 1 FROM projects WHERE lower(name)=lower($1) AND id<>$2`, updated.Name, id).Scan(&conflict); errors.Is(err, sql.ErrNoRows) {
+		if err = tx.QueryRowContext(ctx, `SELECT 1 FROM projects WHERE lower(name)=lower($1) AND id<>$2 AND tenant_id=$3`, updated.Name, id, actor.TenantID).Scan(&conflict); errors.Is(err, sql.ErrNoRows) {
 			err = nil
 		}
 		if err != nil {
@@ -592,8 +615,8 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 		}
 	}
 	updated.UpdatedAt = time.Now().Unix()
-	if _, err = tx.ExecContext(ctx, `UPDATE projects SET name=$2,description=$3,repo_url=$4,default_branch=$5,build_command=$6,visibility=$7,status=$8,updated_at=$9 WHERE id=$1`,
-		id, updated.Name, updated.Description, updated.RepoURL, updated.DefaultBranch, updated.BuildCommand, updated.Visibility, updated.Status, updated.UpdatedAt); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE projects SET name=$2,description=$3,repo_url=$4,default_branch=$5,build_command=$6,visibility=$7,status=$8,updated_at=$9 WHERE id=$1 AND tenant_id=$10`,
+		id, updated.Name, updated.Description, updated.RepoURL, updated.DefaultBranch, updated.BuildCommand, updated.Visibility, updated.Status, updated.UpdatedAt, actor.TenantID); err != nil {
 		// A concurrent rename can pass the pre-check above before either
 		// transaction commits; the unique index still rejects the loser.
 		if isUniqueViolation(err) {
@@ -638,9 +661,9 @@ func (s *Service) ListMembers(ctx context.Context, actor auth.Actor, projectID s
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+memberColumns+` FROM project_members pm
-	 LEFT JOIN auth_users u ON u.id=pm.user_id
+	 LEFT JOIN auth_users u ON u.id=pm.user_id AND u.tenant_id=$2
 	 WHERE pm.project_id=$1
-	 ORDER BY CASE pm.role WHEN '`+RoleMaintainer+`' THEN 0 ELSE 1 END, COALESCE(u.username,''), pm.user_id`, projectID)
+	 ORDER BY CASE pm.role WHEN '`+RoleMaintainer+`' THEN 0 ELSE 1 END, COALESCE(u.username,''), pm.user_id`, projectID, actor.TenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -680,11 +703,13 @@ func (s *Service) AddMember(ctx context.Context, actor auth.Actor, projectID, us
 	if err = s.AuthorizeWrite(ctx, tx, actor, projectID); err != nil {
 		return nil, err
 	}
-	if err = requireActiveProject(ctx, tx, projectID); err != nil {
+	if err = requireActiveProject(ctx, tx, projectID, actor.TenantID); err != nil {
 		return nil, err
 	}
+	// Membership is always intra-tenant: a user id from another tenant is
+	// indistinguishable from a missing account (404), never a cross-tenant add.
 	var username string
-	err = tx.QueryRowContext(ctx, `SELECT username FROM auth_users WHERE id=$1`, userID).Scan(&username)
+	err = tx.QueryRowContext(ctx, `SELECT username FROM auth_users WHERE id=$1 AND tenant_id=$2`, userID, actor.TenantID).Scan(&username)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%w: user not found", ErrNotFound)
 	}
@@ -735,7 +760,7 @@ func (s *Service) UpdateMemberRole(ctx context.Context, actor auth.Actor, projec
 	if err = s.AuthorizeWrite(ctx, tx, actor, projectID); err != nil {
 		return nil, err
 	}
-	if err = requireActiveProject(ctx, tx, projectID); err != nil {
+	if err = requireActiveProject(ctx, tx, projectID, actor.TenantID); err != nil {
 		return nil, err
 	}
 	// The creator keeps owner access for the lifetime of the project; like
@@ -746,8 +771,8 @@ func (s *Service) UpdateMemberRole(ctx context.Context, actor auth.Actor, projec
 	}
 	member, err := scanMember(tx.QueryRowContext(ctx, `UPDATE project_members pm SET role=$3
 	 WHERE pm.project_id=$1 AND pm.user_id=$2
-	 RETURNING pm.project_id,pm.user_id,(SELECT username FROM auth_users WHERE id=pm.user_id),pm.role,pm.created_by,pm.created_at`,
-		projectID, userID, role))
+	 RETURNING pm.project_id,pm.user_id,(SELECT username FROM auth_users WHERE id=pm.user_id AND tenant_id=$4),pm.role,pm.created_by,pm.created_at`,
+		projectID, userID, role, actor.TenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%w: membership not found", ErrNotFound)
 	}
@@ -784,7 +809,7 @@ func (s *Service) RemoveMember(ctx context.Context, actor auth.Actor, projectID,
 	if err = s.AuthorizeWrite(ctx, tx, actor, projectID); err != nil {
 		return err
 	}
-	if err = requireActiveProject(ctx, tx, projectID); err != nil {
+	if err = requireActiveProject(ctx, tx, projectID, actor.TenantID); err != nil {
 		return err
 	}
 	if userID == project.CreatedBy {
@@ -799,7 +824,7 @@ func (s *Service) RemoveMember(ctx context.Context, actor auth.Actor, projectID,
 		return err
 	}
 	var username string
-	_ = tx.QueryRowContext(ctx, `SELECT username FROM auth_users WHERE id=$1`, userID).Scan(&username)
+	_ = tx.QueryRowContext(ctx, `SELECT username FROM auth_users WHERE id=$1 AND tenant_id=$2`, userID, actor.TenantID).Scan(&username)
 	if err = writeAudit(ctx, tx, actor, ActionMemberRemove, projectID, fmt.Sprintf("user=%s role=%s", username, role)); err != nil {
 		return err
 	}

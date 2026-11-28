@@ -115,7 +115,7 @@ func (s *Service) secretReady() bool { return len(s.secretKey) == 32 }
 // key_version are never selected for a response.
 const metadataColumns = `s.id,s.name,s.created_by,COALESCE(cu.username,''),s.created_at,s.updated_at`
 
-const metadataJoins = ` FROM secrets s LEFT JOIN auth_users cu ON cu.id=s.created_by`
+const metadataJoins = ` FROM secrets s LEFT JOIN auth_users cu ON cu.id=s.created_by AND cu.tenant_id=s.tenant_id`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -226,18 +226,20 @@ func writeAudit(ctx context.Context, tx *sql.Tx, actor auth.Actor, action, objec
 	return err
 }
 
-// getMetadataTx reads one secret's metadata inside the caller's transaction.
-func getMetadataTx(ctx context.Context, tx *sql.Tx, id string) (*Metadata, error) {
-	meta, err := scanMetadata(tx.QueryRowContext(ctx, `SELECT `+metadataColumns+metadataJoins+` WHERE s.id=$1`, id))
+// getMetadataTx reads one secret's metadata inside the caller's transaction,
+// scoped to the tenant.
+func getMetadataTx(ctx context.Context, tx *sql.Tx, tenantID, id string) (*Metadata, error) {
+	meta, err := scanMetadata(tx.QueryRowContext(ctx, `SELECT `+metadataColumns+metadataJoins+` WHERE s.id=$1 AND s.tenant_id=$2`, id, tenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	return meta, err
 }
 
-// Create stores a new named secret: the value is sealed before it reaches the
-// database and secret.create is audited in the same transaction. A duplicate
-// name is ErrConflict; a missing key is ErrNotConfigured (nothing is written).
+// Create stores a new named secret of the actor's tenant: the value is sealed
+// before it reaches the database and secret.create is audited in the same
+// transaction. A duplicate name inside the tenant is ErrConflict; a missing key
+// is ErrNotConfigured (nothing is written).
 func (s *Service) Create(ctx context.Context, actor auth.Actor, name, value string) (*Metadata, error) {
 	if err := requireAdmin(actor); err != nil {
 		return nil, err
@@ -266,8 +268,8 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, name, value stri
 		return nil, err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO secrets(id,name,ciphertext,key_version,created_by,created_at,updated_at)
-	 VALUES($1,$2,$3,1,$4,$5,$5)`, id, name, ciphertext, actor.ID, now)
+	_, err = tx.ExecContext(ctx, `INSERT INTO secrets(id,tenant_id,name,ciphertext,key_version,created_by,created_at,updated_at)
+	 VALUES($1,$2,$3,$4,1,$5,$6,$6)`, id, actor.TenantID, name, ciphertext, actor.ID, now)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return nil, fmt.Errorf("%w: secret name already exists", ErrConflict)
@@ -284,8 +286,8 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, name, value stri
 		CreatedAt: now, UpdatedAt: now}, nil
 }
 
-// List pages secret metadata, newest first. No response field can carry the
-// value or the ciphertext.
+// List pages the caller's tenant's secret metadata, newest first. No response
+// field can carry the value or the ciphertext.
 func (s *Service) List(ctx context.Context, actor auth.Actor, filter ListFilter) ([]Metadata, int, error) {
 	if err := requireAdmin(actor); err != nil {
 		return nil, 0, err
@@ -294,11 +296,11 @@ func (s *Service) List(ctx context.Context, actor auth.Actor, filter ListFilter)
 		return nil, 0, err
 	}
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM secrets`).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM secrets WHERE tenant_id=$1`, actor.TenantID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+metadataColumns+metadataJoins+`
-		ORDER BY s.created_at DESC,s.id DESC LIMIT $1 OFFSET $2`, filter.Limit, filter.Offset)
+		WHERE s.tenant_id=$1 ORDER BY s.created_at DESC,s.id DESC LIMIT $2 OFFSET $3`, actor.TenantID, filter.Limit, filter.Offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -339,7 +341,7 @@ func (s *Service) Rotate(ctx context.Context, actor auth.Actor, secretID, value 
 	}
 	defer tx.Rollback()
 	var keyVersion int
-	err = tx.QueryRowContext(ctx, `SELECT key_version FROM secrets WHERE id=$1 FOR UPDATE`, secretID).Scan(&keyVersion)
+	err = tx.QueryRowContext(ctx, `SELECT key_version FROM secrets WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, secretID, actor.TenantID).Scan(&keyVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -350,11 +352,11 @@ func (s *Service) Rotate(ctx context.Context, actor auth.Actor, secretID, value 
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE secrets SET ciphertext=$2,key_version=$3,updated_at=$4 WHERE id=$1`,
-		secretID, ciphertext, keyVersion+1, time.Now().Unix()); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE secrets SET ciphertext=$2,key_version=$3,updated_at=$4 WHERE id=$1 AND tenant_id=$5`,
+		secretID, ciphertext, keyVersion+1, time.Now().Unix(), actor.TenantID); err != nil {
 		return nil, err
 	}
-	meta, err := getMetadataTx(ctx, tx, secretID)
+	meta, err := getMetadataTx(ctx, tx, actor.TenantID, secretID)
 	if err != nil {
 		return nil, err
 	}
@@ -382,7 +384,7 @@ func (s *Service) Delete(ctx context.Context, actor auth.Actor, secretID string)
 	}
 	defer tx.Rollback()
 	var name string
-	err = tx.QueryRowContext(ctx, `DELETE FROM secrets WHERE id=$1 RETURNING name`, secretID).Scan(&name)
+	err = tx.QueryRowContext(ctx, `DELETE FROM secrets WHERE id=$1 AND tenant_id=$2 RETURNING name`, secretID, actor.TenantID).Scan(&name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}

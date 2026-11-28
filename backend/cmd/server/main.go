@@ -198,9 +198,6 @@ func run(logger *slog.Logger) error {
 		// The per-project automation policy composes on top of the environment
 		// gate; projects without a stored policy stay exactly as before.
 		PolicyGate: policyStore,
-		// System-generated deployment audits (approval expiry) have no session
-		// actor; they are scoped to the deployment's default tenant.
-		DefaultTenantID: defaultTenant.ID,
 	})
 	// Metrics are opt-in and live on their own listener: the public API origin
 	// must not expose deployment-wide counters, and scraping needs no session.
@@ -213,7 +210,7 @@ func run(logger *slog.Logger) error {
 	// alone would wait out its 10s drain whenever an SSE client is connected.
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Reviews: reviewCenter, Scans: scanRegistry, SecurityEvents: defenseEvents, Knowledge: knowledgeBase, Secrets: secretStore, Policies: policyStore, OIDC: oidcService, ReviewWebhookSecret: cfg.ReviewWebhookSecret, IngestWebhookSecret: cfg.IngestWebhookSecret, Metrics: monitoring, ShutdownContext: signalCtx})
+	handler := httpapi.New(service, logger, ready, cfg.AllowedOrigins, httpapi.Options{CookieSecure: cfg.CookieSecure, Limiter: ratelimit.NewWithLimit(cache, cfg.RedisNamespace, cfg.LoginRateLimit), TrustedProxies: cfg.TrustedProxies, Projects: registry, Builds: pipeline, Deployments: deploymentsService, Reviews: reviewCenter, Scans: scanRegistry, SecurityEvents: defenseEvents, Knowledge: knowledgeBase, Secrets: secretStore, Policies: policyStore, OIDC: oidcService, ReviewWebhookSecret: cfg.ReviewWebhookSecret, IngestWebhookSecret: cfg.IngestWebhookSecret, DefaultTenantID: defaultTenant.ID, Metrics: monitoring, ShutdownContext: signalCtx})
 	server := &http.Server{Addr: cfg.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	if monitoring != nil {
 		mux := http.NewServeMux()

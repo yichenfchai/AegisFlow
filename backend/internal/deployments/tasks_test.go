@@ -124,8 +124,8 @@ func seedDeployment(t *testing.T, db *sql.DB, projectID, targetID string, number
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`INSERT INTO deployments(id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,triggered_by,created_at)
-	 VALUES($1,$2,$3,'snapshot','https://snapshot.example.com','production',$4,$5,$6,$7,$8)`,
+	if _, err = db.Exec(`INSERT INTO deployments(id,tenant_id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,triggered_by,created_at)
+	 VALUES($1,(SELECT tenant_id FROM projects WHERE id=$2),$2,$3,'snapshot','https://snapshot.example.com','production',$4,$5,$6,$7,$8)`,
 		id, projectID, targetID, number, status, version, testActor.ID, createdAt); err != nil {
 		t.Fatal(err)
 	}
@@ -168,16 +168,16 @@ func TestCreateDeploymentValidationSnapshotAndNumbering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`INSERT INTO builds(id,project_id,build_number,status,branch,command,triggered_by,created_at)
-	 VALUES($1,$2,1,'succeeded','main','echo ok',$3,$4)`, buildID, project.ID, testActor.ID, time.Now().Unix()); err != nil {
+	if _, err = db.Exec(`INSERT INTO builds(id,tenant_id,project_id,build_number,status,branch,command,triggered_by,created_at)
+	 VALUES($1,(SELECT tenant_id FROM projects WHERE id=$2),$2,1,'succeeded','main','echo ok',$3,$4)`, buildID, project.ID, testActor.ID, time.Now().Unix()); err != nil {
 		t.Fatal(err)
 	}
 	failedBuildID, err := newID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`INSERT INTO builds(id,project_id,build_number,status,branch,command,triggered_by,created_at)
-	 VALUES($1,$2,2,'failed','main','echo ok',$3,$4)`, failedBuildID, project.ID, testActor.ID, time.Now().Unix()); err != nil {
+	if _, err = db.Exec(`INSERT INTO builds(id,tenant_id,project_id,build_number,status,branch,command,triggered_by,created_at)
+	 VALUES($1,(SELECT tenant_id FROM projects WHERE id=$2),$2,2,'failed','main','echo ok',$3,$4)`, failedBuildID, project.ID, testActor.ID, time.Now().Unix()); err != nil {
 		t.Fatal(err)
 	}
 	other := taskProject(t, registry, "deploy-other")

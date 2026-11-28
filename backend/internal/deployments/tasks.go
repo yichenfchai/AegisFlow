@@ -37,9 +37,12 @@ const (
 var versionPattern = regexp.MustCompile(`^[A-Za-z0-9._+-]{1,64}$`)
 
 // Deployment is one deploy attempt. Target fields are the snapshot taken at
-// trigger time; history stays explainable after the target is edited.
+// trigger time; history stays explainable after the target is edited. TenantID
+// is server-side only: every query is tenant-scoped, so it never enters the JSON
+// contract, but the worker carries it with the claimed row.
 type Deployment struct {
 	ID                string `json:"id"`
+	TenantID          string `json:"-"`
 	ProjectID         string `json:"projectId"`
 	TargetID          string `json:"targetId"`
 	TargetName        string `json:"targetName"`
@@ -80,12 +83,12 @@ type DeploymentEvent struct {
 	CreatedAt    int64  `json:"createdAt"`
 }
 
-const deploymentColumns = `id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,build_id,rollback_of,approval_id,review_id,triggered_by,detail,created_at,started_at,finished_at`
+const deploymentColumns = `id,tenant_id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,build_id,rollback_of,approval_id,review_id,triggered_by,detail,created_at,started_at,finished_at`
 
 func scanDeployment(row rowScanner) (Deployment, error) {
 	var d Deployment
 	var reviewID sql.NullString
-	if err := row.Scan(&d.ID, &d.ProjectID, &d.TargetID, &d.TargetName, &d.TargetEndpoint, &d.TargetEnvironment,
+	if err := row.Scan(&d.ID, &d.TenantID, &d.ProjectID, &d.TargetID, &d.TargetName, &d.TargetEndpoint, &d.TargetEnvironment,
 		&d.DeploymentNumber, &d.Status, &d.Version, &d.BuildID, &d.RollbackOf, &d.ApprovalID, &reviewID, &d.TriggeredBy,
 		&d.Detail, &d.CreatedAt, &d.StartedAt, &d.FinishedAt); err != nil {
 		return Deployment{}, err
@@ -112,15 +115,16 @@ type targetSnapshot struct {
 	HasSecret   bool
 }
 
-// targetSnapshotFor reads the target fields a new deployment snapshots. A
-// target that is missing or disabled is a validation error: deploy tasks are
-// admin-only, so there is no enumeration concern.
-func targetSnapshotFor(ctx context.Context, q rowQuerier, id string) (targetSnapshot, error) {
+// targetSnapshotFor reads the target fields a new deployment snapshots, inside
+// the deployment row's tenant. A target that is missing, belongs to another
+// tenant or is disabled is a validation error: deploy tasks are admin-only, so
+// there is no enumeration concern.
+func targetSnapshotFor(ctx context.Context, q rowQuerier, tenantID, id string) (targetSnapshot, error) {
 	var t targetSnapshot
 	t.ID = id
 	var hasSecret int
 	err := q.QueryRowContext(ctx, `SELECT name,endpoint,deploy_path,environment,status,(octet_length(secret_cipher)>0)::int
-	 FROM deployment_targets WHERE id=$1`, id).Scan(&t.Name, &t.Endpoint, &t.DeployPath, &t.Environment, &t.Status, &hasSecret)
+	 FROM deployment_targets WHERE id=$1 AND tenant_id=$2`, id, tenantID).Scan(&t.Name, &t.Endpoint, &t.DeployPath, &t.Environment, &t.Status, &hasSecret)
 	if errors.Is(err, sql.ErrNoRows) {
 		return targetSnapshot{}, fmt.Errorf("%w: deployment target not found", ErrValidation)
 	}
@@ -160,9 +164,9 @@ func archivedProjectError() error {
 // deployment write on an archived project. FOR SHARE serializes against the
 // archive transition (which updates the project row) without upgrading the lock
 // later, so it cannot deadlock against another deployment write.
-func requireActiveProjectForDeployment(ctx context.Context, tx *sql.Tx, projectID string) error {
+func requireActiveProjectForDeployment(ctx context.Context, tx *sql.Tx, projectID, tenantID string) error {
 	var status string
-	err := tx.QueryRowContext(ctx, `SELECT status FROM projects WHERE id=$1 FOR SHARE`, projectID).Scan(&status)
+	err := tx.QueryRowContext(ctx, `SELECT status FROM projects WHERE id=$1 AND tenant_id=$2 FOR SHARE`, projectID, tenantID).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -200,7 +204,7 @@ func (s *Service) CreateDeployment(ctx context.Context, actor auth.Actor, projec
 	if err = s.authorizeProjectWrite(ctx, tx, actor, projectID); err != nil {
 		return Deployment{}, err
 	}
-	target, err := targetSnapshotFor(ctx, tx, input.TargetID)
+	target, err := targetSnapshotFor(ctx, tx, actor.TenantID, input.TargetID)
 	if err != nil {
 		return Deployment{}, err
 	}
@@ -244,8 +248,8 @@ func (s *Service) CreateDeployment(ctx context.Context, actor auth.Actor, projec
 func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.Actor, projectID string, target targetSnapshot,
 	version, buildID, reviewID, rollbackOf string, policyApplied bool, action string) (Deployment, error) {
 	var count int64
-	var projectStatus string
-	err := tx.QueryRowContext(ctx, `SELECT deploy_count,status FROM projects WHERE id=$1 FOR UPDATE`, projectID).Scan(&count, &projectStatus)
+	var projectStatus, projectTenantID string
+	err := tx.QueryRowContext(ctx, `SELECT deploy_count,status,tenant_id FROM projects WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, projectID, actor.TenantID).Scan(&count, &projectStatus, &projectTenantID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, ErrNotFound
 	}
@@ -283,7 +287,7 @@ func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.
 	}
 	now := time.Now().Unix()
 	deployment := Deployment{
-		ID: id, ProjectID: projectID, TargetID: target.ID, TargetName: target.Name,
+		ID: id, TenantID: projectTenantID, ProjectID: projectID, TargetID: target.ID, TargetName: target.Name,
 		TargetEndpoint: target.Endpoint, TargetEnvironment: target.Environment, DeploymentNumber: count + 1,
 		Status: status, Version: version, BuildID: buildID, RollbackOf: rollbackOf, ApprovalID: approvalID,
 		ReviewID: reviewID, TriggeredBy: actor.ID, CreatedAt: now,
@@ -294,13 +298,13 @@ func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.
 	if reviewID != "" {
 		reviewValue = reviewID
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO deployments(id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,build_id,rollback_of,approval_id,review_id,triggered_by,detail,created_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'',$15)`,
-		deployment.ID, projectID, deployment.TargetID, deployment.TargetName, deployment.TargetEndpoint, deployment.TargetEnvironment,
+	if _, err = tx.ExecContext(ctx, `INSERT INTO deployments(id,tenant_id,project_id,target_id,target_name,target_endpoint,target_environment,deployment_number,status,version,build_id,rollback_of,approval_id,review_id,triggered_by,detail,created_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'',$16)`,
+		deployment.ID, projectTenantID, projectID, deployment.TargetID, deployment.TargetName, deployment.TargetEndpoint, deployment.TargetEnvironment,
 		deployment.DeploymentNumber, status, version, buildID, rollbackOf, approvalID, reviewValue, actor.ID, now); err != nil {
 		return Deployment{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE projects SET deploy_count=$2 WHERE id=$1`, projectID, deployment.DeploymentNumber); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE projects SET deploy_count=$2 WHERE id=$1 AND tenant_id=$3`, projectID, deployment.DeploymentNumber, projectTenantID); err != nil {
 		return Deployment{}, err
 	}
 	detail := ""
@@ -326,12 +330,12 @@ func (s *Service) enqueueDeployment(ctx context.Context, tx *sql.Tx, actor auth.
 	if approvalRequired {
 		expiresAt := now + int64(s.approvalTTL/time.Second)
 		approval := Approval{
-			ID: approvalID, DeploymentID: deployment.ID, ProjectID: projectID,
+			ID: approvalID, TenantID: projectTenantID, DeploymentID: deployment.ID, ProjectID: projectID,
 			Status: ApprovalPending, RequestedBy: actor.ID, CreatedAt: now, ExpiresAt: expiresAt,
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO approvals(id,deployment_id,project_id,status,requested_by,decided_by,reason,created_at,expires_at,decided_at)
-		 VALUES($1,$2,$3,'pending',$4,'','',$5,$6,0)`,
-			approval.ID, approval.DeploymentID, approval.ProjectID, approval.RequestedBy, approval.CreatedAt, approval.ExpiresAt); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO approvals(id,tenant_id,deployment_id,project_id,status,requested_by,decided_by,reason,created_at,expires_at,decided_at)
+		 VALUES($1,$2,$3,$4,'pending',$5,'','',$6,$7,0)`,
+			approval.ID, approval.TenantID, approval.DeploymentID, approval.ProjectID, approval.RequestedBy, approval.CreatedAt, approval.ExpiresAt); err != nil {
 			return Deployment{}, err
 		}
 		if err = writeAuditObject(ctx, tx, actor, ActionApprovalRequest, "approval", approvalID, "deployment="+deployment.ID); err != nil {
@@ -354,7 +358,7 @@ func (s *Service) GetDeployment(ctx context.Context, actor auth.Actor, id string
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	deployment, err := scanDeployment(s.db.QueryRowContext(ctx,
 		`SELECT `+deploymentColumnsQualified+` FROM deployments d JOIN projects p ON p.id=d.project_id
-		 WHERE d.id=$1 AND `+projects.VisiblePredicate("p", 2, 3), id, isAdmin, userID))
+		 WHERE d.id=$1 AND `+projects.VisiblePredicate("p", 2, 3, 4), id, actor.TenantID, isAdmin, userID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, ErrNotFound
 	}
@@ -379,14 +383,14 @@ func (s *Service) ListDeployments(ctx context.Context, actor auth.Actor, project
 	}
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	filter := ` FROM deployments d JOIN projects p ON p.id=d.project_id
-		WHERE ($1='' OR d.project_id=$1) AND ($2='' OR d.status=$2) AND ` + projects.VisiblePredicate("p", 3, 4)
+		WHERE ($1='' OR d.project_id=$1) AND ($2='' OR d.status=$2) AND ` + projects.VisiblePredicate("p", 3, 4, 5)
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+filter, projectID, status, isAdmin, userID).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)`+filter, projectID, status, actor.TenantID, isAdmin, userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+deploymentColumnsQualified+filter+`
-		ORDER BY d.created_at DESC,d.deployment_number DESC,d.id DESC LIMIT $5 OFFSET $6`,
-		projectID, status, isAdmin, userID, limit, offset)
+		ORDER BY d.created_at DESC,d.deployment_number DESC,d.id DESC LIMIT $6 OFFSET $7`,
+		projectID, status, actor.TenantID, isAdmin, userID, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -422,7 +426,7 @@ func (s *Service) CancelDeployment(ctx context.Context, actor auth.Actor, id str
 	// deployment lock; taking the approval lock first keeps the lock order
 	// consistent with approve/reject/expire.
 	var approvalID, projectID string
-	err = tx.QueryRowContext(ctx, `SELECT approval_id, project_id FROM deployments WHERE id=$1`, id).Scan(&approvalID, &projectID)
+	err = tx.QueryRowContext(ctx, `SELECT approval_id, project_id FROM deployments WHERE id=$1 AND tenant_id=$2`, id, actor.TenantID).Scan(&approvalID, &projectID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, ErrNotFound
 	}
@@ -433,7 +437,7 @@ func (s *Service) CancelDeployment(ctx context.Context, actor auth.Actor, id str
 		return Deployment{}, err
 	}
 	// Cancelling is a project write too: an archived project stays read-only.
-	if err = requireActiveProjectForDeployment(ctx, tx, projectID); err != nil {
+	if err = requireActiveProjectForDeployment(ctx, tx, projectID, actor.TenantID); err != nil {
 		return Deployment{}, err
 	}
 	var approval *Approval
@@ -443,6 +447,11 @@ func (s *Service) CancelDeployment(ctx context.Context, actor auth.Actor, id str
 			return Deployment{}, lockErr
 		}
 		if lockErr == nil {
+			// A deployment id and its approval always share a tenant; the check
+			// is defense in depth against a corrupted cross-tenant link.
+			if locked.TenantID != actor.TenantID {
+				return Deployment{}, ErrNotFound
+			}
 			approval = &locked
 		}
 	}
@@ -518,7 +527,7 @@ func (s *Service) RollbackDeployment(ctx context.Context, actor auth.Actor, id, 
 	// Authorize before taking the deployment lock so a caller without write
 	// access neither sees the row nor blocks it.
 	var projectID string
-	if err = tx.QueryRowContext(ctx, `SELECT project_id FROM deployments WHERE id=$1`, id).Scan(&projectID); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT project_id FROM deployments WHERE id=$1 AND tenant_id=$2`, id, actor.TenantID).Scan(&projectID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Deployment{}, ErrNotFound
 		}
@@ -527,7 +536,7 @@ func (s *Service) RollbackDeployment(ctx context.Context, actor auth.Actor, id, 
 	if err = s.authorizeProjectWrite(ctx, tx, actor, projectID); err != nil {
 		return Deployment{}, err
 	}
-	source, err := scanDeployment(tx.QueryRowContext(ctx, `SELECT `+deploymentColumns+` FROM deployments WHERE id=$1 FOR UPDATE`, id))
+	source, err := scanDeployment(tx.QueryRowContext(ctx, `SELECT `+deploymentColumns+` FROM deployments WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, id, actor.TenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deployment{}, ErrNotFound
 	}
@@ -548,7 +557,7 @@ func (s *Service) RollbackDeployment(ctx context.Context, actor auth.Actor, id, 
 	if err != nil {
 		return Deployment{}, err
 	}
-	target, err := targetSnapshotFor(ctx, tx, source.TargetID)
+	target, err := targetSnapshotFor(ctx, tx, source.TenantID, source.TargetID)
 	if err != nil {
 		return Deployment{}, err
 	}

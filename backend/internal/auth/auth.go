@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
@@ -122,6 +123,15 @@ func New(db *sql.DB, secret string, accessTTL, refreshTTL time.Duration) *Servic
 	return &Service{db: db, secret: []byte(secret), accessTTL: accessTTL, refreshTTL: refreshTTL, defaultTenantSlug: tenants.DefaultSlug}
 }
 
+// NewProvisioner builds a database-only account provisioner for the tenant
+// operations CLI. It issues no tokens: the signing secret is a fixed placeholder
+// and the token TTLs only satisfy the service's structural validation, so this
+// handle can create accounts but can never authenticate anyone. The HTTP server
+// must keep using New with the real signing key.
+func NewProvisioner(db *sql.DB) *Service {
+	return &Service{db: db, secret: []byte("tenant-cli-provisioner-no-token-issuance"), accessTTL: time.Minute, refreshTTL: time.Hour, defaultTenantSlug: tenants.DefaultSlug}
+}
+
 // tenantSlug returns the configured default tenant slug.
 func (s *Service) tenantSlug() string {
 	if s.defaultTenantSlug == "" {
@@ -151,6 +161,17 @@ func (s *Service) DefaultTenant(ctx context.Context) (*tenants.Tenant, error) {
 		return nil, err
 	}
 	return tenants.BySlug(ctx, s.db, s.tenantSlug())
+}
+
+// TenantBySlug resolves one tenant for callers that name it explicitly rather
+// than carrying a session, such as the signed security-event ingest whose JSON
+// body names a tenant slug. The slug is validated before the query so a bad
+// value cannot reach the database; an unknown slug returns tenants.ErrNotFound.
+func (s *Service) TenantBySlug(ctx context.Context, slug string) (*tenants.Tenant, error) {
+	if err := s.valid(); err != nil {
+		return nil, err
+	}
+	return tenants.BySlug(ctx, s.db, slug)
 }
 
 func (s *Service) valid() error {
@@ -236,11 +257,31 @@ func (s *Service) Bootstrap(ctx context.Context, username, password string) erro
 // CreateUser does not authorize the caller; the HTTP layer must require an
 // admin. The new account always belongs to the actor's tenant.
 func (s *Service) CreateUser(ctx context.Context, actor Actor, username, password, displayName, role string) (*User, error) {
-	if err := s.valid(); err != nil {
-		return nil, err
-	}
 	tenantID, err := actorTenantID(actor)
 	if err != nil {
+		return nil, err
+	}
+	return s.createUserInTenant(ctx, actor, tenantID, username, password, displayName, role)
+}
+
+// ProvisionCLIUser creates one account in an explicit tenant for the tenant
+// operations CLI. It shares validation, bcrypt hashing, per-tenant uniqueness
+// and the audit write with CreateUser, so the command cannot create a user the
+// HTTP path would reject. The command has no session, so the audit row is
+// attributed to the synthetic "tenant-cli" system actor; only the username is
+// recorded (never the password) and the owning tenant is the target tenant.
+func (s *Service) ProvisionCLIUser(ctx context.Context, tenantID, username, password, displayName, role string) (*User, error) {
+	if err := requireTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	return s.createUserInTenant(ctx, Actor{TenantID: tenantID, Username: "tenant-cli", Role: "admin"}, tenantID, username, password, displayName, role)
+}
+
+// createUserInTenant is the one account-creation path for both the HTTP admin
+// API and the tenant CLI: the same validation, hashing, per-tenant unique index
+// and same-transaction audit row. tenantID is always server-derived.
+func (s *Service) createUserInTenant(ctx context.Context, actor Actor, tenantID, username, password, displayName, role string) (*User, error) {
+	if err := s.valid(); err != nil {
 		return nil, err
 	}
 	if displayName == "" {
@@ -267,6 +308,9 @@ func (s *Service) CreateUser(ctx context.Context, actor Actor, username, passwor
 	 VALUES($1,$2,$3,$4,$5,$6,0,$7) ON CONFLICT (tenant_id, lower(username)) DO NOTHING`,
 		id, tenantID, username, string(hash), displayName, role, now)
 	if err != nil {
+		if isForeignKeyViolation(err) {
+			return nil, fmt.Errorf("%w: tenant", ErrNotFound)
+		}
 		return nil, err
 	}
 	n, err := result.RowsAffected()
@@ -283,6 +327,14 @@ func (s *Service) CreateUser(ctx context.Context, actor Actor, username, passwor
 		return nil, err
 	}
 	return &User{ID: id, TenantID: tenantID, Username: username, DisplayName: displayName, Role: role, CreatedAt: now}, nil
+}
+
+// isForeignKeyViolation reports a PostgreSQL foreign-key failure. The tenant CLI
+// resolves the tenant before creating the account, but a concurrent tenant
+// deletion still surfaces here and must not be reported as a server error.
+func isForeignKeyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
 }
 
 func scanUser(row interface{ Scan(dest ...any) error }) (*User, error) {

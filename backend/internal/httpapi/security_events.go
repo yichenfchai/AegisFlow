@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yichenfchai/AegisFlow/backend/internal/securityevents"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 )
 
 // Defense events (P5 remaining modules, batch A). The write side is a signed
@@ -18,6 +19,11 @@ import (
 // ingestSecurityEvent accepts one signed defense-event delivery. A retried
 // delivery returns the stored row with 200, a new one returns 201, and an
 // unconfigured secret keeps the whole endpoint closed with 503.
+//
+// Defense events are not project-scoped, so the signed body optionally names the
+// owning tenant (`tenantSlug`); the HMAC covers the raw bytes, so the tenant
+// choice is authenticated. Without it the delivery lands in the deployment's
+// default tenant (the pre-multi-tenant behavior).
 func (s *Server) ingestSecurityEvent(c *gin.Context) {
 	if s.securityEvents == nil || len(s.ingestWebhookSecret) == 0 {
 		s.fail(c, 503, "dependencies_unavailable", "ingest is not configured")
@@ -38,11 +44,32 @@ func (s *Server) ingestSecurityEvent(c *gin.Context) {
 		Summary    string `json:"summary"`
 		OccurredAt int64  `json:"occurredAt"`
 		DetailsURL string `json:"detailsUrl"`
+		// TenantSlug selects the owning tenant for a multi-tenant deployment.
+		// It is part of the signed body; empty means the default tenant.
+		TenantSlug string `json:"tenantSlug"`
 	}
 	if !s.decodeRawJSON(c, raw, &input) {
 		return
 	}
-	event, created, err := s.securityEvents.Ingest(c.Request.Context(), delivery, securityevents.IngestInput{
+	tenantID := s.defaultTenantID
+	if input.TenantSlug != "" {
+		if !tenants.ValidSlug(input.TenantSlug) {
+			s.fail(c, 400, "validation_failed", "tenantSlug must be 1-32 lowercase letters, digits and inner hyphens")
+			return
+		}
+		tenant, err := s.auth.TenantBySlug(c.Request.Context(), input.TenantSlug)
+		if err != nil {
+			if errors.Is(err, tenants.ErrNotFound) {
+				s.fail(c, 404, "not_found", "resource not found")
+				return
+			}
+			s.logger.ErrorContext(c.Request.Context(), "security event tenant lookup failed", "requestId", requestID(c), "error", err)
+			s.fail(c, 500, "internal_error", "internal server error")
+			return
+		}
+		tenantID = tenant.ID
+	}
+	event, created, err := s.securityEvents.Ingest(c.Request.Context(), tenantID, delivery, securityevents.IngestInput{
 		Source: input.Source, Severity: input.Severity, EventType: input.EventType, Summary: input.Summary,
 		OccurredAt: input.OccurredAt, DetailsURL: input.DetailsURL,
 	})

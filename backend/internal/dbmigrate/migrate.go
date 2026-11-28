@@ -465,6 +465,112 @@ var Migrations = [][]string{{
 	`CREATE UNIQUE INDEX auth_users_tenant_username_lower_idx ON auth_users(tenant_id, lower(username))`,
 	`CREATE UNIQUE INDEX auth_users_tenant_email_lower_idx ON auth_users(tenant_id, lower(email)) WHERE email <> ''`,
 	`CREATE INDEX auth_audit_tenant_time_idx ON auth_audit(tenant_id, created_at DESC, id)`,
+}, {
+	// Business data isolation (phase F2). Every business table gains a
+	// tenant_id NOT NULL foreign key so a row can never exist outside a tenant,
+	// and every uniqueness rule that used to be deployment-global becomes
+	// tenant-scoped: two tenants may each own the project "web", the secret
+	// "deploy-key" or the same external delivery id. The backfill is safe
+	// because schema v18 had no tenant-creation entry point: every row that can
+	// exist at this point belongs to the seeded default tenant. The F1 seed id
+	// is used literally for the same reason the v18 auth backfill used it: the
+	// id is stable across AEGIS_DEFAULT_TENANT_SLUG renames.
+	//
+	// Child tables stay without a tenant column by design: build_log_events and
+	// deployment_events are only ever written for a build/deployment row that
+	// was itself loaded by id (worker claim) and only ever read through a query
+	// that joins builds/deployments/projects and applies the tenant predicate.
+	// Their SQL is audited in the package comments; adding a redundant column
+	// would not add an isolation property (the parent id already bounds them).
+	//
+	// The list indexes put tenant_id first: every business list query now
+	// filters by the caller's tenant before ordering and paginating, so the
+	// pre-F2 global indexes would no longer serve them.
+	`ALTER TABLE projects ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE builds ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE deployment_targets ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE deployments ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE approvals ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE approval_notifications ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE reviews ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE review_external_results ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE review_notifications ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE scans ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE security_events ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE knowledge_docs ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE secrets ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE project_policies ADD COLUMN tenant_id TEXT`,
+	`UPDATE projects SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE builds SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE deployment_targets SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE deployments SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE approvals SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE approval_notifications SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE reviews SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE review_external_results SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE review_notifications SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE scans SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE security_events SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE knowledge_docs SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE secrets SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE project_policies SET tenant_id='tenant_default_0000000000000001'`,
+	`ALTER TABLE projects ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE builds ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE deployment_targets ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE deployments ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE approvals ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE approval_notifications ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE reviews ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE review_external_results ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE review_notifications ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE scans ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE security_events ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE knowledge_docs ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE secrets ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE project_policies ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE projects ADD CONSTRAINT projects_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE builds ADD CONSTRAINT builds_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE deployment_targets ADD CONSTRAINT deployment_targets_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE deployments ADD CONSTRAINT deployments_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE approvals ADD CONSTRAINT approvals_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE approval_notifications ADD CONSTRAINT approval_notifications_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE reviews ADD CONSTRAINT reviews_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE review_external_results ADD CONSTRAINT review_external_results_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE review_notifications ADD CONSTRAINT review_notifications_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE scans ADD CONSTRAINT scans_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE security_events ADD CONSTRAINT security_events_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE knowledge_docs ADD CONSTRAINT knowledge_docs_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE secrets ADD CONSTRAINT secrets_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE project_policies ADD CONSTRAINT project_policies_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`DROP INDEX projects_name_lower_idx`,
+	`DROP INDEX projects_status_name_idx`,
+	`CREATE UNIQUE INDEX projects_tenant_name_lower_idx ON projects(tenant_id, lower(name))`,
+	`CREATE INDEX projects_tenant_status_name_idx ON projects(tenant_id, status, lower(name))`,
+	`CREATE INDEX builds_tenant_created_idx ON builds(tenant_id, created_at DESC, id)`,
+	`DROP INDEX deployment_targets_name_lower_idx`,
+	`DROP INDEX deployment_targets_status_name_idx`,
+	`CREATE UNIQUE INDEX deployment_targets_tenant_name_lower_idx ON deployment_targets(tenant_id, lower(name))`,
+	`CREATE INDEX deployment_targets_tenant_status_name_idx ON deployment_targets(tenant_id, status, lower(name))`,
+	`CREATE INDEX deployments_tenant_created_idx ON deployments(tenant_id, created_at DESC, id)`,
+	`CREATE INDEX approvals_tenant_created_idx ON approvals(tenant_id, created_at DESC, id)`,
+	`CREATE INDEX reviews_tenant_created_idx ON reviews(tenant_id, created_at DESC, id)`,
+	`ALTER TABLE review_external_results DROP CONSTRAINT review_external_results_delivery_id_key`,
+	`ALTER TABLE review_external_results ADD CONSTRAINT review_external_results_tenant_delivery_key UNIQUE (tenant_id, delivery_id)`,
+	`ALTER TABLE scans DROP CONSTRAINT scans_delivery_id_key`,
+	`ALTER TABLE scans ADD CONSTRAINT scans_tenant_delivery_key UNIQUE (tenant_id, delivery_id)`,
+	`ALTER TABLE security_events DROP CONSTRAINT security_events_delivery_id_key`,
+	`ALTER TABLE security_events ADD CONSTRAINT security_events_tenant_delivery_key UNIQUE (tenant_id, delivery_id)`,
+	`DROP INDEX scans_verdict_received_idx`,
+	`CREATE INDEX scans_tenant_verdict_received_idx ON scans(tenant_id, verdict, received_at DESC, id)`,
+	`DROP INDEX security_events_status_occurred_idx`,
+	`DROP INDEX security_events_severity_occurred_idx`,
+	`CREATE INDEX security_events_tenant_status_occurred_idx ON security_events(tenant_id, status, occurred_at DESC, id)`,
+	`CREATE INDEX security_events_tenant_severity_occurred_idx ON security_events(tenant_id, severity, occurred_at DESC)`,
+	`DROP INDEX knowledge_docs_updated_idx`,
+	`CREATE INDEX knowledge_docs_tenant_updated_idx ON knowledge_docs(tenant_id, updated_at DESC, id)`,
+	`ALTER TABLE secrets DROP CONSTRAINT secrets_name_key`,
+	`ALTER TABLE secrets ADD CONSTRAINT secrets_tenant_name_key UNIQUE (tenant_id, name)`,
+	`CREATE INDEX secrets_tenant_created_idx ON secrets(tenant_id, created_at DESC, id)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped

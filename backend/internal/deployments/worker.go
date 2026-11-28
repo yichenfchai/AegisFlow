@@ -119,7 +119,7 @@ func (s *Service) execute(ctx context.Context, deployment Deployment) {
 			deployment.DeploymentNumber, deployment.TargetName, deployment.Version)
 	}
 
-	target, err := s.executionTargetFor(execCtx, deployment.TargetID)
+	target, err := s.executionTargetFor(execCtx, deployment.TenantID, deployment.TargetID)
 	if err != nil {
 		writer.systemf("deployment target unavailable")
 		s.finish(deployment, DeployFailed, "deployment target unavailable")
@@ -137,7 +137,7 @@ func (s *Service) execute(ctx context.Context, deployment Deployment) {
 		s.finish(deployment, DeployFailed, "deployment target credential unavailable")
 		return
 	}
-	projectName, err := s.projectName(execCtx, deployment.ProjectID)
+	projectName, err := s.projectName(execCtx, deployment.TenantID, deployment.ProjectID)
 	if err != nil {
 		writer.systemf("deployment project unavailable")
 		s.finish(deployment, DeployFailed, "deployment project unavailable")
@@ -361,9 +361,12 @@ func (s *Service) deploymentCancelled(id string) bool {
 	return err == nil && current.Status == DeployCancelled
 }
 
-func (s *Service) executionTargetFor(ctx context.Context, id string) (executionTarget, error) {
+// executionTargetFor loads the live target state for one execution, scoped to
+// the claimed deployment's tenant: the worker processes every tenant's rows, so
+// the tenant travels with the row and is never guessed.
+func (s *Service) executionTargetFor(ctx context.Context, tenantID, id string) (executionTarget, error) {
 	var target executionTarget
-	err := s.db.QueryRowContext(ctx, `SELECT endpoint,deploy_path,health_path,status,secret_cipher FROM deployment_targets WHERE id=$1`, id).
+	err := s.db.QueryRowContext(ctx, `SELECT endpoint,deploy_path,health_path,status,secret_cipher FROM deployment_targets WHERE id=$1 AND tenant_id=$2`, id, tenantID).
 		Scan(&target.Endpoint, &target.DeployPath, &target.HealthPath, &target.Status, &target.Sealed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return executionTarget{}, ErrNotFound
@@ -374,9 +377,9 @@ func (s *Service) executionTargetFor(ctx context.Context, id string) (executionT
 	return target, nil
 }
 
-func (s *Service) projectName(ctx context.Context, id string) (string, error) {
+func (s *Service) projectName(ctx context.Context, tenantID, id string) (string, error) {
 	var name string
-	err := s.db.QueryRowContext(ctx, `SELECT name FROM projects WHERE id=$1`, id).Scan(&name)
+	err := s.db.QueryRowContext(ctx, `SELECT name FROM projects WHERE id=$1 AND tenant_id=$2`, id, tenantID).Scan(&name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}

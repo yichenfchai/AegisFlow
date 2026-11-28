@@ -27,7 +27,7 @@ func TestTargetOptionsListsActiveTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	options, err := s.TargetOptions(ctx)
+	options, err := s.TargetOptions(ctx, testActor)
 	if err != nil {
 		t.Fatal(err)
 	}

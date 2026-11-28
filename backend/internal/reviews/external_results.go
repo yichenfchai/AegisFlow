@@ -47,6 +47,9 @@ type ExternalResult struct {
 	Summary    string `json:"summary"`
 	URL        string `json:"url"`
 	ReceivedAt int64  `json:"receivedAt"`
+	// TenantID is server-side only; it is derived from the review the result
+	// was delivered against and is never part of the JSON contract.
+	TenantID string `json:"-"`
 }
 
 // ExternalResultInput is the validated inbound payload. DeliveryID and
@@ -58,14 +61,14 @@ type ExternalResultInput struct {
 	URL     string
 }
 
-const externalResultColumns = `id,review_id,delivery_id,source,verdict,summary,url,received_at`
+const externalResultColumns = `id,tenant_id,review_id,delivery_id,source,verdict,summary,url,received_at`
 
 // scanExternalResult scans externalResultColumns; a NULL url is the stored
 // representation of "no link".
 func scanExternalResult(row rowScanner) (*ExternalResult, error) {
 	var result ExternalResult
 	var url sql.NullString
-	if err := row.Scan(&result.ID, &result.ReviewID, &result.DeliveryID, &result.Source, &result.Verdict,
+	if err := row.Scan(&result.ID, &result.TenantID, &result.ReviewID, &result.DeliveryID, &result.Source, &result.Verdict,
 		&result.Summary, &url, &result.ReceivedAt); err != nil {
 		return nil, err
 	}
@@ -164,8 +167,11 @@ func (s *Service) IngestExternalResult(ctx context.Context, reviewID, deliveryID
 	if err != nil {
 		return nil, false, err
 	}
-	var found int
-	err = s.db.QueryRowContext(ctx, `SELECT 1 FROM reviews WHERE id=$1`, reviewID).Scan(&found)
+	// The review id resolves the owning tenant: the signed webhook has no
+	// session, so the resource itself is the tenant authority. Unknown and
+	// cross-tenant reviews are indistinguishable (404).
+	var reviewTenantID string
+	err = s.db.QueryRowContext(ctx, `SELECT tenant_id FROM reviews WHERE id=$1`, reviewID).Scan(&reviewTenantID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, ErrNotFound
 	}
@@ -178,22 +184,23 @@ func (s *Service) IngestExternalResult(ctx context.Context, reviewID, deliveryID
 	}
 	receivedAt := time.Now().Unix()
 	result, err := scanExternalResult(s.db.QueryRowContext(ctx, `INSERT INTO review_external_results
-		(id,review_id,delivery_id,source,verdict,summary,url,received_at)
-		VALUES($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8)
-		ON CONFLICT (delivery_id) DO NOTHING
+		(id,tenant_id,review_id,delivery_id,source,verdict,summary,url,received_at)
+		VALUES($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),$9)
+		ON CONFLICT (tenant_id,delivery_id) DO NOTHING
 		RETURNING `+externalResultColumns,
-		id, reviewID, deliveryID, normalized.Source, normalized.Verdict, normalized.Summary, normalized.URL, receivedAt))
+		id, reviewTenantID, reviewID, deliveryID, normalized.Source, normalized.Verdict, normalized.Summary, normalized.URL, receivedAt))
 	switch {
 	case err == nil:
 		return result, true, nil
 	case !errors.Is(err, sql.ErrNoRows):
 		return nil, false, err
 	}
-	// The delivery id already exists: return the stored row unchanged (200), so
-	// the sender's retry is idempotent. The stored review id is authoritative;
-	// it is the row the original delivery created.
+	// The delivery id already exists in this tenant: return the stored row
+	// unchanged (200), so the sender's retry is idempotent. The stored review id
+	// is authoritative; it is the row the original delivery created. A delivery
+	// id used by another tenant is a distinct id and never collides here.
 	stored, err := scanExternalResult(s.db.QueryRowContext(ctx,
-		`SELECT `+externalResultColumns+` FROM review_external_results WHERE delivery_id=$1`, deliveryID))
+		`SELECT `+externalResultColumns+` FROM review_external_results WHERE tenant_id=$1 AND delivery_id=$2`, reviewTenantID, deliveryID))
 	if errors.Is(err, sql.ErrNoRows) {
 		// The conflicting row disappeared between INSERT and SELECT (review or
 		// project deletion cascaded); surface a conflict instead of a stale id.
@@ -213,8 +220,8 @@ func (s *Service) ListExternalResults(ctx context.Context, actor auth.Actor, rev
 	if !auth.ValidID(reviewID) {
 		return nil, fmt.Errorf("%w: invalid review id", ErrValidation)
 	}
-	var projectID string
-	err := s.db.QueryRowContext(ctx, `SELECT project_id FROM reviews WHERE id=$1`, reviewID).Scan(&projectID)
+	var projectID, reviewTenantID string
+	err := s.db.QueryRowContext(ctx, `SELECT project_id,tenant_id FROM reviews WHERE id=$1`, reviewID).Scan(&projectID, &reviewTenantID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -225,7 +232,7 @@ func (s *Service) ListExternalResults(ctx context.Context, actor auth.Actor, rev
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+externalResultColumns+` FROM review_external_results
-		WHERE review_id=$1 ORDER BY received_at DESC,id DESC LIMIT $2`, reviewID, maxExternalResults)
+		WHERE tenant_id=$1 AND review_id=$2 ORDER BY received_at DESC,id DESC LIMIT $3`, reviewTenantID, reviewID, maxExternalResults)
 	if err != nil {
 		return nil, err
 	}

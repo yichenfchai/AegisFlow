@@ -268,12 +268,12 @@ func TestValidationConflictsPermissionsAndPagination(t *testing.T) {
 			t.Fatalf("filter %+v: %v", filter, err)
 		}
 	}
-	if _, err := db.Exec(`INSERT INTO secrets(id,name,ciphertext,key_version,created_by,created_at,updated_at)
-		VALUES('pagination-0000000001','page-a','',1,$1,9000000001,9000000001)`, adminActor.ID); err != nil {
+	if _, err := db.Exec(`INSERT INTO secrets(id,tenant_id,name,ciphertext,key_version,created_by,created_at,updated_at)
+		VALUES('pagination-0000000001',$1,'page-a','',1,$2,9000000001,9000000001)`, tenants.DefaultID, adminActor.ID); err != nil {
 		t.Fatalf("seed pagination row: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO secrets(id,name,ciphertext,key_version,created_by,created_at,updated_at)
-		VALUES('pagination-0000000002','page-b','',1,$1,9000000002,9000000002)`, adminActor.ID); err != nil {
+	if _, err := db.Exec(`INSERT INTO secrets(id,tenant_id,name,ciphertext,key_version,created_by,created_at,updated_at)
+		VALUES('pagination-0000000002',$1,'page-b','',1,$2,9000000002,9000000002)`, tenants.DefaultID, adminActor.ID); err != nil {
 		t.Fatal(err)
 	}
 	page, total, err := s.List(ctx, adminActor, ListFilter{Limit: 1, Offset: 0})

@@ -44,8 +44,13 @@ func Terminal(status string) bool {
 }
 
 type Build struct {
-	ID          string `json:"id"`
-	ProjectID   string `json:"projectId"`
+	ID        string `json:"id"`
+	ProjectID string `json:"projectId"`
+	// TenantID is the owning tenant. It is server-side only: the API never
+	// exposes another tenant's rows, so the field is not part of the JSON
+	// contract. The worker carries it when it claims a row so its log writes and
+	// any future tenant-scoped side effect never fall back to a default tenant.
+	TenantID    string `json:"-"`
 	BuildNumber int64  `json:"buildNumber"`
 	Status      string `json:"status"`
 	Branch      string `json:"branch"`
@@ -112,12 +117,12 @@ func newWithLimits(db *sql.DB, projectRegistry *projects.Service, timeout time.D
 	return &Service{db: db, projects: projectRegistry, timeout: timeout, maxEvents: maxEvents, notify: make(chan struct{}, 1), leaseRetry: defaultLeaseRetry}
 }
 
-const buildColumns = `id,project_id,build_number,status,branch,command,repo_url,triggered_by,created_at,started_at,finished_at`
+const buildColumns = `id,tenant_id,project_id,build_number,status,branch,command,repo_url,triggered_by,created_at,started_at,finished_at`
 
 // buildColumnsQualified is buildColumns with the table alias needed by the
 // visibility join: reads embed projects.VisiblePredicate, so a build of an
-// invisible project is not found rather than forbidden.
-const buildColumnsQualified = `b.id,b.project_id,b.build_number,b.status,b.branch,b.command,b.repo_url,b.triggered_by,b.created_at,b.started_at,b.finished_at`
+// invisible or other-tenant project is not found rather than forbidden.
+const buildColumnsQualified = `b.id,b.tenant_id,b.project_id,b.build_number,b.status,b.branch,b.command,b.repo_url,b.triggered_by,b.created_at,b.started_at,b.finished_at`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -144,7 +149,7 @@ func writeAudit(ctx context.Context, tx *sql.Tx, actor auth.Actor, action, objec
 
 func scanBuild(row rowScanner) (*Build, error) {
 	var b Build
-	if err := row.Scan(&b.ID, &b.ProjectID, &b.BuildNumber, &b.Status, &b.Branch, &b.Command, &b.RepoURL, &b.TriggeredBy, &b.CreatedAt, &b.StartedAt, &b.FinishedAt); err != nil {
+	if err := row.Scan(&b.ID, &b.TenantID, &b.ProjectID, &b.BuildNumber, &b.Status, &b.Branch, &b.Command, &b.RepoURL, &b.TriggeredBy, &b.CreatedAt, &b.StartedAt, &b.FinishedAt); err != nil {
 		return nil, err
 	}
 	return &b, nil
@@ -195,7 +200,7 @@ func (s *Service) enqueue(ctx context.Context, actor auth.Actor, projectID, bran
 	// The visibility predicate runs inside the locking read: triggering a build
 	// on an invisible project is a 404, exactly like reading it.
 	err = tx.QueryRowContext(ctx, `SELECT p.status,p.build_command,p.default_branch,p.repo_url,p.build_count FROM projects p
-	 WHERE p.id=$1 AND `+projects.VisiblePredicate("p", 2, 3)+` FOR UPDATE`, projectID, isAdmin, userID).Scan(&status, &command, &defaultBranch, &repoURL, &count)
+	 WHERE p.id=$1 AND `+projects.VisiblePredicate("p", 2, 3, 4)+` FOR UPDATE`, projectID, actor.TenantID, isAdmin, userID).Scan(&status, &command, &defaultBranch, &repoURL, &count)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -221,12 +226,12 @@ func (s *Service) enqueue(ctx context.Context, actor auth.Actor, projectID, bran
 		return nil, err
 	}
 	now := time.Now().Unix()
-	build := &Build{ID: id, ProjectID: projectID, BuildNumber: count + 1, Status: StatusQueued, Branch: branch, Command: command, RepoURL: repoURL, TriggeredBy: actor.ID, CreatedAt: now}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO builds(id,project_id,build_number,status,branch,command,repo_url,triggered_by,created_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, id, projectID, build.BuildNumber, StatusQueued, branch, command, repoURL, actor.ID, now); err != nil {
+	build := &Build{ID: id, TenantID: actor.TenantID, ProjectID: projectID, BuildNumber: count + 1, Status: StatusQueued, Branch: branch, Command: command, RepoURL: repoURL, TriggeredBy: actor.ID, CreatedAt: now}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO builds(id,tenant_id,project_id,build_number,status,branch,command,repo_url,triggered_by,created_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, id, actor.TenantID, projectID, build.BuildNumber, StatusQueued, branch, command, repoURL, actor.ID, now); err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE projects SET build_count=$2 WHERE id=$1`, projectID, build.BuildNumber); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE projects SET build_count=$2 WHERE id=$1 AND tenant_id=$3`, projectID, build.BuildNumber, actor.TenantID); err != nil {
 		return nil, err
 	}
 	if err = writeAudit(ctx, tx, actor, action, id, fmt.Sprintf("project=%s build=%d%s", projectID, build.BuildNumber, detailSuffix)); err != nil {
@@ -295,7 +300,7 @@ func (s *Service) Get(ctx context.Context, actor auth.Actor, id string) (*Build,
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	build, err := scanBuild(s.db.QueryRowContext(ctx, `SELECT `+buildColumnsQualified+` FROM builds b
 	 JOIN projects p ON p.id=b.project_id
-	 WHERE b.id=$1 AND `+projects.VisiblePredicate("p", 2, 3), id, isAdmin, userID))
+	 WHERE b.id=$1 AND `+projects.VisiblePredicate("p", 2, 3, 4), id, actor.TenantID, isAdmin, userID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -317,13 +322,13 @@ func (s *Service) List(ctx context.Context, actor auth.Actor, projectID string, 
 	isAdmin, userID := projects.VisibilityArgs(actor)
 	var total int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM builds b JOIN projects p ON p.id=b.project_id
-	 WHERE ($1='' OR b.project_id=$1) AND `+projects.VisiblePredicate("p", 2, 3), projectID, isAdmin, userID).Scan(&total); err != nil {
+	 WHERE ($1='' OR b.project_id=$1) AND `+projects.VisiblePredicate("p", 2, 3, 4), projectID, actor.TenantID, isAdmin, userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+buildColumnsQualified+` FROM builds b
 	 JOIN projects p ON p.id=b.project_id
-	 WHERE ($1='' OR b.project_id=$1) AND `+projects.VisiblePredicate("p", 4, 5)+`
-	 ORDER BY b.created_at DESC,b.id DESC LIMIT $2 OFFSET $3`, projectID, limit, offset, isAdmin, userID)
+	 WHERE ($1='' OR b.project_id=$1) AND `+projects.VisiblePredicate("p", 4, 5, 6)+`
+	 ORDER BY b.created_at DESC,b.id DESC LIMIT $2 OFFSET $3`, projectID, limit, offset, actor.TenantID, isAdmin, userID)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -361,8 +366,8 @@ func (s *Service) Logs(ctx context.Context, actor auth.Actor, buildID string, af
 	rows, err := s.db.QueryContext(ctx, `SELECT e.id,e.build_id,e.stream,e.message,e.created_at FROM build_log_events e
 	 JOIN builds b ON b.id=e.build_id
 	 JOIN projects p ON p.id=b.project_id
-	 WHERE e.build_id=$1 AND e.id>$2 AND `+projects.VisiblePredicate("p", 4, 5)+`
-	 ORDER BY e.id LIMIT $3`, buildID, after, limit, isAdmin, userID)
+	 WHERE e.build_id=$1 AND e.id>$2 AND `+projects.VisiblePredicate("p", 4, 5, 6)+`
+	 ORDER BY e.id LIMIT $3`, buildID, after, limit, actor.TenantID, isAdmin, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -401,7 +406,7 @@ func (s *Service) Cancel(ctx context.Context, actor auth.Actor, id string) (*Bui
 	}
 	defer tx.Rollback()
 	build, err := scanBuild(tx.QueryRowContext(ctx, `UPDATE builds SET status=$2, finished_at=CASE WHEN finished_at=0 THEN $3 ELSE finished_at END
-	 WHERE id=$1 AND status IN ($4,$5) RETURNING `+buildColumns, id, StatusCancelled, time.Now().Unix(), StatusQueued, StatusRunning))
+	 WHERE id=$1 AND tenant_id=$6 AND status IN ($4,$5) RETURNING `+buildColumns, id, StatusCancelled, time.Now().Unix(), StatusQueued, StatusRunning, actor.TenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		// Distinguish "already cancelled" from "finished another way"; the re-read
 		// also keeps the visibility check on the fallback path.

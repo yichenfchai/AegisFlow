@@ -48,6 +48,19 @@ info:
     returns 400 tenant_required). Administrative user routes and the audit list/export
     only ever read or mutate the caller's tenant; users of other tenants are 404.
 
+    Multi-tenancy phase F2: every business table carries tenant_id, and every
+    project, build, deployment target, deployment, approval, review, scan, defense
+    event, knowledge document, secret and project policy read/write is scoped to
+    the caller's tenant. A resource of another tenant is always 404 (never 403),
+    lists/filters/pagination/audit/CSV/search never include foreign rows, and
+    uniqueness is per tenant (two tenants may each own the project "web", the
+    secret "deploy-key" or the same external delivery id). Signed inbound
+    evidence is attributed to the resource's tenant: scans via the project id,
+    review external results via the review id, and defense events via the optional
+    tenantSlug in the signed JSON body (absent = the default tenant). Tenant
+    creation has no HTTP API: operators use the tenant CLI. The tenant_id column
+    is server-side only and never appears in a response.
+
     GET /metrics is only offered on the optional separate metrics listener
     (AEGIS_METRICS_ADDR, disabled by default), never on this API listener, and it
     is deliberately unauthenticated so a scraper needs no session; bind it to
@@ -1433,7 +1446,7 @@ paths:
       tags: [DeploymentTargets]
       operationId: listDeploymentTargets
       summary: List deployment targets (admin only)
-      description: Ordered by name case-insensitively, then id. Deployment targets are global administrative objects; members and viewers get 403 on every route in this group.
+      description: Ordered by name case-insensitively, then id. Deployment targets are admin-only and scoped to the caller's tenant; another tenant's targets are never listed or readable (404), and members/viewers get 403 on every route in this group.
       security:
         - bearerAuth: []
       parameters:
@@ -1649,7 +1662,7 @@ paths:
       tags: [Deployments]
       operationId: listProjectDeployments
       summary: List a project's deployments (visible projects)
-      description: Newest first, restricted to projects the caller can see. A member with write access to the project can enqueue, cancel and roll back here.
+      description: Newest first, restricted to the project; an invisible or other-tenant project is 404. A member with write access to the project can enqueue, cancel and roll back here.
       security:
         - bearerAuth: []
       parameters:
@@ -1679,6 +1692,7 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
     post:
       tags: [Deployments]
@@ -2698,8 +2712,9 @@ paths:
       summary: List defense events (admin-only)
       description: |
         Newest occurrence first, filtered by the optional severity, status and
-        source query parameters. Defense events are global administrative
-        objects: member/viewer callers receive 403.
+        source query parameters. Defense events are admin-only and scoped to the
+        caller's tenant; another tenant's events are never listed or readable
+        (404). member/viewer callers receive 403.
       security:
         - bearerAuth: []
       parameters:
@@ -3259,7 +3274,7 @@ components:
       name: X-AegisFlow-Delivery
       in: header
       required: true
-      description: 8-128 characters of A-Z a-z 0-9 . _ -; globally unique idempotency key
+      description: 8-128 characters of A-Z a-z 0-9 . _ -; idempotency key, unique per tenant (the same delivery id may be used independently in another tenant)
       schema: { type: string, pattern: '^[A-Za-z0-9._-]{8,128}$' }
   requestBodies:
     EmptyObject:
@@ -3773,7 +3788,7 @@ components:
       properties:
         id: { type: string }
         reviewId: { type: string }
-        deliveryId: { type: string, description: Sender delivery id; globally unique and the idempotency key for retries }
+        deliveryId: { type: string, description: Sender delivery id; unique per tenant and the idempotency key for retries }
         source: { type: string, description: 'External tool name: 1-64 UTF-8 bytes on one line, trimmed' }
         verdict: { type: string, enum: [passed, failed, warning] }
         summary: { type: string, description: 'At most 500 UTF-8 bytes; newlines preserved, other control characters removed; empty when the delivery carried no note' }
@@ -3874,6 +3889,12 @@ components:
         summary: { type: string, minLength: 1, maxLength: 1000, description: 'Required; 1-1000 UTF-8 bytes; newlines preserved, other control characters removed' }
         occurredAt: { type: integer, format: int64, description: 'Optional Unix seconds; defaults to now, must not be more than 300 seconds in the future' }
         detailsUrl: { type: string, maxLength: 2048, description: 'Optional absolute http(s) URL without userinfo or fragment; display-only, never fetched' }
+        tenantSlug:
+          type: string
+          minLength: 1
+          maxLength: 32
+          pattern: '^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$'
+          description: 'Optional owning tenant slug for a multi-tenant deployment. The body bytes are covered by the HMAC signature, so the tenant choice is authenticated. Omit it for the deployment default tenant (the pre-F2 single-tenant behavior). An unknown or malformed slug is 404/400 and never creates an event.'
     KnowledgeDoc:
       type: object
       additionalProperties: false

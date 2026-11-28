@@ -21,7 +21,9 @@ import (
 // "latest scan" means the same row a reader sees first. A project with no scan
 // yields an empty latestScanVerdict; a project with a policy row yields the
 // stored values. projectID must reference an existing project (the caller holds
-// the project row lock in the deployment path).
+// the project row lock in the deployment path, after its own tenant check), so
+// the policy and scan reads are keyed by a globally unique project id and cannot
+// cross a tenant boundary.
 func (s *Service) DeploymentGate(ctx context.Context, tx *sql.Tx, projectID string) (requireReview bool, requiredScanVerdict, latestScanVerdict string, err error) {
 	requiredScanVerdict = RequiredScanVerdictNone
 	err = tx.QueryRowContext(ctx, `SELECT require_review,required_scan_verdict FROM project_policies WHERE project_id=$1`,

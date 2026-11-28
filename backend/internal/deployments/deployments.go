@@ -25,7 +25,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
-	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 )
 
 var (
@@ -122,17 +121,15 @@ type Options struct {
 	// *http.Transport; a fully custom RoundTripper dials on its own and must
 	// provide an equivalent guard itself.
 	HTTPClient *http.Client
-	// DefaultTenantID is the deployment's tenant for system-generated audit rows
-	// (approval expiry), which have no actor. Phase F1 has exactly one tenant;
-	// business-table tenant isolation arrives with the next batch. Empty falls
-	// back to the seeded default tenant id.
-	DefaultTenantID string
 }
 
 // Target is the public view of a deployment target. Secret material is never
-// part of it; HasSecret only reports whether one is stored.
+// part of it; HasSecret only reports whether one is stored. TenantID is
+// server-side only: every target query is scoped to the caller's tenant, so the
+// field is not part of the JSON contract.
 type Target struct {
 	ID              string `json:"id"`
+	TenantID        string `json:"-"`
 	Name            string `json:"name"`
 	Kind            string `json:"kind"`
 	Environment     string `json:"environment"`
@@ -222,10 +219,6 @@ type Service struct {
 	rekeyBeforeWrite func(targetID string)
 	// leaseRetry overrides the standby lease retry in tests.
 	leaseRetry time.Duration
-	// defaultTenantID scopes system-generated audit rows (approval expiry has
-	// no actor). Phase F1 has a single tenant; deployment rows themselves are
-	// not tenant-scoped yet and get their tenant in the business-isolation batch.
-	defaultTenantID string
 }
 
 // New builds the registry and deployment service. A nil HTTPClient uses a
@@ -292,10 +285,6 @@ func New(db *sql.DB, opts Options) *Service {
 	if healthAttempts < 0 {
 		healthAttempts = 0
 	}
-	defaultTenantID := opts.DefaultTenantID
-	if defaultTenantID == "" {
-		defaultTenantID = tenants.DefaultID
-	}
 	return &Service{
 		db:                     db,
 		projects:               opts.Projects,
@@ -316,7 +305,6 @@ func New(db *sql.DB, opts Options) *Service {
 		healthInterval:         healthInterval,
 		notificationClaimLease: claimLease,
 		leaseRetry:             defaultLeaseRetry,
-		defaultTenantID:        defaultTenantID,
 	}
 }
 
@@ -358,15 +346,16 @@ func secretNotConfigured() error {
 }
 
 // targetColumns is the select list of every read; has_secret is derived so the
-// ciphertext never leaves the database for a normal read.
-const targetColumns = `id,name,kind,environment,endpoint,health_path,deploy_path,(octet_length(secret_cipher)>0)::int,status,created_by,created_at,updated_at,last_check_at,last_check_ok,last_check_detail`
+// ciphertext never leaves the database for a normal read. tenant_id is selected
+// for the server-side TenantID field only.
+const targetColumns = `id,tenant_id,name,kind,environment,endpoint,health_path,deploy_path,(octet_length(secret_cipher)>0)::int,status,created_by,created_at,updated_at,last_check_at,last_check_ok,last_check_detail`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
 func scanTarget(row rowScanner) (Target, error) {
 	var t Target
 	var hasSecret, lastCheckOK int
-	if err := row.Scan(&t.ID, &t.Name, &t.Kind, &t.Environment, &t.Endpoint, &t.HealthPath, &t.DeployPath, &hasSecret, &t.Status, &t.CreatedBy, &t.CreatedAt, &t.UpdatedAt, &t.LastCheckAt, &lastCheckOK, &t.LastCheckDetail); err != nil {
+	if err := row.Scan(&t.ID, &t.TenantID, &t.Name, &t.Kind, &t.Environment, &t.Endpoint, &t.HealthPath, &t.DeployPath, &hasSecret, &t.Status, &t.CreatedBy, &t.CreatedAt, &t.UpdatedAt, &t.LastCheckAt, &lastCheckOK, &t.LastCheckDetail); err != nil {
 		return Target{}, err
 	}
 	t.HasSecret = hasSecret != 0
@@ -623,16 +612,16 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (Ta
 		}
 	}
 	now := time.Now().Unix()
-	target := Target{ID: id, Name: input.Name, Kind: kind, Environment: environment, Endpoint: input.Endpoint,
+	target := Target{ID: id, TenantID: actor.TenantID, Name: input.Name, Kind: kind, Environment: environment, Endpoint: input.Endpoint,
 		HealthPath: healthPath, DeployPath: deployPath, HasSecret: input.Secret != "", Status: status, CreatedBy: actor.ID, CreatedAt: now, UpdatedAt: now}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return Target{}, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `INSERT INTO deployment_targets(id,name,kind,environment,endpoint,health_path,deploy_path,secret_cipher,status,created_by,created_at,updated_at)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) ON CONFLICT (lower(name)) DO NOTHING`,
-		id, target.Name, kind, environment, input.Endpoint, healthPath, deployPath, cipher, status, actor.ID, now)
+	result, err := tx.ExecContext(ctx, `INSERT INTO deployment_targets(id,tenant_id,name,kind,environment,endpoint,health_path,deploy_path,secret_cipher,status,created_by,created_at,updated_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12) ON CONFLICT (tenant_id, lower(name)) DO NOTHING`,
+		id, actor.TenantID, target.Name, kind, environment, input.Endpoint, healthPath, deployPath, cipher, status, actor.ID, now)
 	if err != nil {
 		return Target{}, err
 	}
@@ -650,13 +639,14 @@ func (s *Service) Create(ctx context.Context, actor auth.Actor, input Input) (Ta
 	return target, nil
 }
 
-// Get returns one target by id. Callers are already authorized by the HTTP
-// layer (admin only); a malformed or unknown id is never a 403.
+// Get returns one target by id inside the caller's tenant. Callers are already
+// authorized by the HTTP layer (admin only); a malformed, unknown or other-tenant
+// id is never a 403.
 func (s *Service) Get(ctx context.Context, actor auth.Actor, id string) (Target, error) {
 	if !auth.ValidID(id) {
 		return Target{}, fmt.Errorf("%w: invalid deployment target id", ErrValidation)
 	}
-	target, err := scanTarget(s.db.QueryRowContext(ctx, `SELECT `+targetColumns+` FROM deployment_targets WHERE id=$1`, id))
+	target, err := scanTarget(s.db.QueryRowContext(ctx, `SELECT `+targetColumns+` FROM deployment_targets WHERE id=$1 AND tenant_id=$2`, id, actor.TenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Target{}, ErrNotFound
 	}
@@ -666,17 +656,18 @@ func (s *Service) Get(ctx context.Context, actor auth.Actor, id string) (Target,
 	return target, nil
 }
 
-// List pages every target, ordered by name; totals use the same predicate.
+// List pages the caller's tenant's targets, ordered by name; totals use the same
+// tenant predicate.
 func (s *Service) List(ctx context.Context, actor auth.Actor, limit, offset int) ([]Target, int, error) {
 	if err := paginate(limit, offset); err != nil {
 		return nil, 0, err
 	}
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM deployment_targets`).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM deployment_targets WHERE tenant_id=$1`, actor.TenantID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+targetColumns+` FROM deployment_targets
-	 ORDER BY lower(name),id LIMIT $1 OFFSET $2`, limit, offset)
+	 WHERE tenant_id=$1 ORDER BY lower(name),id LIMIT $2 OFFSET $3`, actor.TenantID, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -706,7 +697,7 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 		return Target{}, err
 	}
 	defer tx.Rollback()
-	current, err := scanTarget(tx.QueryRowContext(ctx, `SELECT `+targetColumns+` FROM deployment_targets WHERE id=$1 FOR UPDATE`, id))
+	current, err := scanTarget(tx.QueryRowContext(ctx, `SELECT `+targetColumns+` FROM deployment_targets WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, id, actor.TenantID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Target{}, ErrNotFound
 	}
@@ -785,7 +776,7 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 	}
 	if updated.Name != current.Name {
 		var conflict int
-		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM deployment_targets WHERE lower(name)=lower($1) AND id<>$2`, updated.Name, id).Scan(&conflict); err == nil {
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM deployment_targets WHERE lower(name)=lower($1) AND id<>$2 AND tenant_id=$3`, updated.Name, id, actor.TenantID).Scan(&conflict); err == nil {
 			return Target{}, fmt.Errorf("%w: deployment target name already exists", ErrConflict)
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return Target{}, err
@@ -800,7 +791,7 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 			return Target{}, err
 		}
 	} else if !secretChanged && current.HasSecret {
-		if err := tx.QueryRowContext(ctx, `SELECT secret_cipher FROM deployment_targets WHERE id=$1`, id).Scan(&cipher); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT secret_cipher FROM deployment_targets WHERE id=$1 AND tenant_id=$2`, id, actor.TenantID).Scan(&cipher); err != nil {
 			return Target{}, err
 		}
 	}
@@ -808,8 +799,8 @@ func (s *Service) Update(ctx context.Context, actor auth.Actor, id string, patch
 		updated.HasSecret = *patch.Secret != ""
 	}
 	updated.UpdatedAt = time.Now().Unix()
-	if _, err := tx.ExecContext(ctx, `UPDATE deployment_targets SET name=$2,environment=$3,endpoint=$4,health_path=$5,deploy_path=$6,secret_cipher=$7,status=$8,updated_at=$9 WHERE id=$1`,
-		id, updated.Name, updated.Environment, updated.Endpoint, updated.HealthPath, updated.DeployPath, cipher, updated.Status, updated.UpdatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE deployment_targets SET name=$2,environment=$3,endpoint=$4,health_path=$5,deploy_path=$6,secret_cipher=$7,status=$8,updated_at=$9 WHERE id=$1 AND tenant_id=$10`,
+		id, updated.Name, updated.Environment, updated.Endpoint, updated.HealthPath, updated.DeployPath, cipher, updated.Status, updated.UpdatedAt, actor.TenantID); err != nil {
 		if isUniqueViolation(err) {
 			return Target{}, fmt.Errorf("%w: deployment target name already exists", ErrConflict)
 		}
@@ -837,7 +828,7 @@ func (s *Service) Remove(ctx context.Context, actor auth.Actor, id string) error
 	}
 	defer tx.Rollback()
 	var name string
-	err = tx.QueryRowContext(ctx, `DELETE FROM deployment_targets WHERE id=$1 RETURNING name`, id).Scan(&name)
+	err = tx.QueryRowContext(ctx, `DELETE FROM deployment_targets WHERE id=$1 AND tenant_id=$2 RETURNING name`, id, actor.TenantID).Scan(&name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}

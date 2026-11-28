@@ -498,8 +498,8 @@ func TestConcurrentRenameMapsUniqueViolationToConflict(t *testing.T) {
 	}
 	defer pending.Rollback()
 	now := time.Now().Unix()
-	if _, err = pending.ExecContext(ctx, `INSERT INTO projects(id,name,status,created_by,created_at,updated_at)
-	 VALUES($1,'gamma-race','active',$2,$3,$3)`, "pending-00000000000001", testActor.ID, now); err != nil {
+	if _, err = pending.ExecContext(ctx, `INSERT INTO projects(id,tenant_id,name,status,created_by,created_at,updated_at)
+	 VALUES($1,$2,'gamma-race','active',$3,$4,$4)`, "pending-00000000000001", testActor.TenantID, testActor.ID, now); err != nil {
 		t.Fatal(err)
 	}
 	// Remember the backend that holds the uncommitted row, so the wait below is

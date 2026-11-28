@@ -1,17 +1,25 @@
 // Package tenants owns tenant identity primitives shared by startup
-// configuration and the auth service. Phase F1 (multi-tenancy foundations)
-// introduces exactly one tenant: the fixed row seeded by schema v18. Creating
-// additional tenants is deliberately deferred to the batch that also isolates
-// business data, so this package has no create/list API yet.
+// configuration, the auth service and the tenant operations CLI. Phase F1
+// introduced exactly one tenant (the fixed row seeded by schema v18); phase F2
+// adds the operator-only create/list/status primitives below so a second tenant
+// can be provisioned, and every business query is already tenant-scoped the
+// moment it exists. There is deliberately no HTTP tenant-management API yet.
 package tenants
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
 )
@@ -37,6 +45,10 @@ var (
 	ErrNotFound = errors.New("tenant not found")
 	// ErrInvalidSlug rejects slugs outside the documented format.
 	ErrInvalidSlug = errors.New("invalid tenant slug")
+	// ErrValidation rejects an invalid display name or status.
+	ErrValidation = errors.New("validation failed")
+	// ErrConflict means the slug is already taken.
+	ErrConflict = errors.New("conflict")
 )
 
 // slugPattern is the documented AEGIS_DEFAULT_TENANT_SLUG format: 1-32
@@ -152,4 +164,130 @@ func EnsureDefault(ctx context.Context, db *sql.DB, slug string) (*Tenant, error
 		return nil, err
 	}
 	return created, nil
+}
+
+// normalizeName trims and validates a tenant display name: non-empty, valid
+// UTF-8, at most 128 bytes and a single line (it is rendered in operator output
+// and, in a later batch, the UI).
+func normalizeName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if !utf8.ValidString(name) || name == "" || len(name) > 128 {
+		return "", fmt.Errorf("%w: name must be 1-128 UTF-8 bytes", ErrValidation)
+	}
+	if strings.ContainsFunc(name, unicode.IsControl) {
+		return "", fmt.Errorf("%w: name must be a single line without control characters", ErrValidation)
+	}
+	return name, nil
+}
+
+// newID returns a 24-character base64url id with the same shape every other
+// identity row uses.
+func newID() (string, error) {
+	b := make([]byte, 18)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// Create provisions one new tenant. The slug is validated here and by the schema
+// CHECK; a duplicate slug is ErrConflict and an invalid one ErrInvalidSlug, so
+// the CLI can exit non-zero with a precise reason. New tenants start active.
+// Creation does not migrate or seed business data: a tenant is a pure isolation
+// boundary, and every business table is already tenant-scoped.
+func Create(ctx context.Context, db *sql.DB, slug, name string) (*Tenant, error) {
+	if !ValidSlug(slug) {
+		return nil, fmt.Errorf("%w: %q must match %s (1-%d lowercase letters, digits and inner hyphens)", ErrInvalidSlug, slug, slugPattern.String(), MaxSlugLength)
+	}
+	name, err := normalizeName(name)
+	if err != nil {
+		return nil, err
+	}
+	id, err := newID()
+	if err != nil {
+		return nil, err
+	}
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	// The tenants advisory lock serializes creation against the startup
+	// EnsureDefault rename, exactly like the migration path.
+	if err = dbmigrate.Lock(ctx, tx, "tenants"); err != nil {
+		return nil, err
+	}
+	now := time.Now().Unix()
+	_, err = tx.ExecContext(ctx, `INSERT INTO tenants(id,slug,name,status,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$5)`,
+		id, slug, name, StatusActive, now)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, fmt.Errorf("%w: tenant slug %q already exists", ErrConflict, slug)
+		}
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &Tenant{ID: id, Slug: slug, Name: name, Status: StatusActive, CreatedAt: now, UpdatedAt: now}, nil
+}
+
+// SetStatus changes one tenant's status (active or suspended) by slug and
+// returns the updated row. A suspended tenant can no longer authenticate or
+// refresh: the auth service re-checks the tenant row on every request. Existing
+// sessions are not deleted; they become unusable while the tenant is suspended
+// and stay revoked/expired semantics unchanged for the rest.
+func SetStatus(ctx context.Context, db *sql.DB, slug, status string) (*Tenant, error) {
+	if !ValidSlug(slug) {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidSlug, slug)
+	}
+	if status != StatusActive && status != StatusSuspended {
+		return nil, fmt.Errorf("%w: status must be active or suspended", ErrValidation)
+	}
+	now := time.Now().Unix()
+	result, err := db.ExecContext(ctx, `UPDATE tenants SET status=$2,updated_at=$3 WHERE slug=$1`, slug, status, now)
+	if err != nil {
+		return nil, err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return nil, err
+	} else if n == 0 {
+		return nil, ErrNotFound
+	}
+	return BySlug(ctx, db, slug)
+}
+
+// Summary is one row of the operator tenant listing: identity, status and the
+// number of user accounts. It never contains credentials.
+type Summary struct {
+	ID        string
+	Slug      string
+	Name      string
+	Status    string
+	UserCount int
+	CreatedAt int64
+	UpdatedAt int64
+}
+
+// List returns every tenant ordered by creation time, with a user count per
+// tenant. It is an operator view: no session or tenant scope applies, and no
+// credential material is selected.
+func List(ctx context.Context, db *sql.DB) ([]Summary, error) {
+	rows, err := db.QueryContext(ctx, `SELECT t.id,t.slug,t.name,t.status,
+		(SELECT COUNT(*) FROM auth_users u WHERE u.tenant_id=t.id),t.created_at,t.updated_at
+		FROM tenants t ORDER BY t.created_at,t.slug`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	list := make([]Summary, 0)
+	for rows.Next() {
+		var item Summary
+		if err = rows.Scan(&item.ID, &item.Slug, &item.Name, &item.Status, &item.UserCount, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, item)
+	}
+	return list, rows.Err()
 }

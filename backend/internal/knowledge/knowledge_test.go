@@ -85,7 +85,7 @@ func TestCreateGetUpdateDeleteAndAudit(t *testing.T) {
 		t.Fatalf("created metadata = %+v", doc)
 	}
 
-	fetched, err := s.Get(ctx, doc.ID)
+	fetched, err := s.Get(ctx, adminActor, doc.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestCreateGetUpdateDeleteAndAudit(t *testing.T) {
 		t.Fatalf("fetched = %+v", fetched)
 	}
 
-	list, total, err := s.List(ctx, ListFilter{Limit: 20, Offset: 0})
+	list, total, err := s.List(ctx, adminActor, ListFilter{Limit: 20, Offset: 0})
 	if err != nil || total != 1 || len(list) != 1 {
 		t.Fatalf("list: %v total=%d len=%d", err, total, len(list))
 	}
@@ -144,7 +144,7 @@ func TestCreateGetUpdateDeleteAndAudit(t *testing.T) {
 	if err = s.Delete(ctx, adminActor, doc.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.Get(ctx, doc.ID); !errors.Is(err, ErrNotFound) {
+	if _, err = s.Get(ctx, adminActor, doc.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("get after delete: %v", err)
 	}
 	audit = auditRows(t, db, doc.ID)
@@ -168,10 +168,10 @@ func TestPermissionsAndValidation(t *testing.T) {
 	doc := createDoc(t, s, "unprivileged", "member cannot write", "")
 
 	// Reads are open to every role.
-	if _, err := s.Get(ctx, doc.ID); err != nil {
+	if _, err := s.Get(ctx, adminActor, doc.ID); err != nil {
 		t.Fatalf("member get: %v", err)
 	}
-	if _, _, err := s.List(ctx, ListFilter{Limit: 20}); err != nil {
+	if _, _, err := s.List(ctx, adminActor, ListFilter{Limit: 20}); err != nil {
 		t.Fatalf("viewer list: %v", err)
 	}
 	// Writes are admin-only in the service itself, not just the HTTP routes.
@@ -217,18 +217,18 @@ func TestPermissionsAndValidation(t *testing.T) {
 	}
 
 	// Filters and ids.
-	if _, _, err := s.List(ctx, ListFilter{Query: strings.Repeat("q", maxQueryBytes+1), Limit: 20}); !errors.Is(err, ErrValidation) {
+	if _, _, err := s.List(ctx, adminActor, ListFilter{Query: strings.Repeat("q", maxQueryBytes+1), Limit: 20}); !errors.Is(err, ErrValidation) {
 		t.Fatalf("long q: %v", err)
 	}
 	for _, filter := range []ListFilter{{Limit: 0}, {Limit: 101}, {Limit: 20, Offset: -1}} {
-		if _, _, err := s.List(ctx, filter); !errors.Is(err, ErrValidation) {
+		if _, _, err := s.List(ctx, adminActor, filter); !errors.Is(err, ErrValidation) {
 			t.Fatalf("filter %+v: %v", filter, err)
 		}
 	}
-	if _, err := s.Get(ctx, "short"); !errors.Is(err, ErrValidation) {
+	if _, err := s.Get(ctx, adminActor, "short"); !errors.Is(err, ErrValidation) {
 		t.Fatalf("invalid id: %v", err)
 	}
-	if _, err := s.Get(ctx, "missing-0000000000001"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Get(ctx, adminActor, "missing-0000000000001"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown id: %v", err)
 	}
 	if _, err := s.Update(ctx, adminActor, "missing-0000000000001", Input{Title: "x"}); !errors.Is(err, ErrNotFound) {
@@ -258,24 +258,24 @@ func TestSearchEscapingOrderingAndPagination(t *testing.T) {
 	}
 
 	// '%' and '_' are literal: 100% must not match 100x.
-	list, total, err := s.List(ctx, ListFilter{Query: "100%", Limit: 20})
+	list, total, err := s.List(ctx, adminActor, ListFilter{Query: "100%", Limit: 20})
 	if err != nil || total != 1 || list[0].ID != percent.ID {
 		t.Fatalf("100%% search: %v total=%d list=%+v", err, total, list)
 	}
-	if list, total, err = s.List(ctx, ListFilter{Query: "a_b", Limit: 20}); err != nil || total != 1 || list[0].ID != underscore.ID {
+	if list, total, err = s.List(ctx, adminActor, ListFilter{Query: "a_b", Limit: 20}); err != nil || total != 1 || list[0].ID != underscore.ID {
 		t.Fatalf("underscore search: %v total=%d list=%+v", err, total, list)
 	}
-	if _, total, err = s.List(ctx, ListFilter{Query: "100", Limit: 20}); err != nil || total != 2 {
+	if _, total, err = s.List(ctx, adminActor, ListFilter{Query: "100", Limit: 20}); err != nil || total != 2 {
 		t.Fatalf("plain substring: %v total=%d", err, total)
 	}
-	if _, total, err = s.List(ctx, ListFilter{Query: "%", Limit: 20}); err != nil || total != 1 {
+	if _, total, err = s.List(ctx, adminActor, ListFilter{Query: "%", Limit: 20}); err != nil || total != 1 {
 		t.Fatalf("literal percent only: %v total=%d", err, total)
 	}
-	if _, total, err = s.List(ctx, ListFilter{Query: "   ", Limit: 20}); err != nil || total != 3 {
+	if _, total, err = s.List(ctx, adminActor, ListFilter{Query: "   ", Limit: 20}); err != nil || total != 3 {
 		t.Fatalf("blank query matches all: %v total=%d", err, total)
 	}
 	// Ordering: newest update first.
-	list, _, err = s.List(ctx, ListFilter{Limit: 20})
+	list, _, err = s.List(ctx, adminActor, ListFilter{Limit: 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +283,7 @@ func TestSearchEscapingOrderingAndPagination(t *testing.T) {
 		t.Fatalf("ordering = %+v", list)
 	}
 	// Pagination shares total and limit/offset between count and page.
-	page, total, err := s.List(ctx, ListFilter{Limit: 1, Offset: 1})
+	page, total, err := s.List(ctx, adminActor, ListFilter{Limit: 1, Offset: 1})
 	if err != nil || total != 3 || len(page) != 1 || page[0].ID != underscore.ID {
 		t.Fatalf("page: %v total=%d page=%+v", err, total, page)
 	}
