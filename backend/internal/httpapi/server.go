@@ -31,6 +31,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/scans"
 	"github.com/yichenfchai/AegisFlow/backend/internal/secrets"
 	"github.com/yichenfchai/AegisFlow/backend/internal/securityevents"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 )
 
 type contextKey int
@@ -400,12 +401,24 @@ func (s *Server) login(c *gin.Context) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 		Remember bool   `json:"remember"`
+		// TenantSlug is optional: a pointer distinguishes "absent" (resolve the
+		// login identifier across tenants) from a provided value; null is
+		// already rejected by the strict JSON decoder.
+		TenantSlug *string `json:"tenantSlug"`
 	}
 	if !s.decode(c, &input) {
 		return
 	}
+	tenantSlug := ""
+	if input.TenantSlug != nil {
+		if !tenants.ValidSlug(*input.TenantSlug) {
+			s.fail(c, 400, "validation_failed", "tenantSlug must be 1-32 lowercase letters, digits and inner hyphens")
+			return
+		}
+		tenantSlug = *input.TenantSlug
+	}
 	ctx := c.Request.Context()
-	tokens, err := s.auth.LoginWithRemember(ctx, input.Username, input.Password, input.Remember, requestID(c))
+	tokens, err := s.auth.LoginWithTenant(ctx, tenantSlug, input.Username, input.Password, input.Remember, requestID(c))
 	s.logger.InfoContext(ctx, "auth.login", "requestId", ctx.Value(requestIDKey), "success", err == nil)
 	if err != nil {
 		s.authError(c, err)
@@ -507,11 +520,11 @@ func (s *Server) requireRole(roles ...string) gin.HandlerFunc {
 func currentUser(c *gin.Context) *auth.User { return c.MustGet(userKey).(*auth.User) }
 func (s *Server) me(c *gin.Context)         { s.respond(c, 200, currentUser(c)) }
 
-// actorFrom builds the audit actor of the authenticated caller. Role comes from
-// the freshly inspected database user, never from the request body.
+// actorFrom builds the audit actor of the authenticated caller. Tenant and role
+// come from the freshly inspected database user, never from the request body.
 func actorFrom(c *gin.Context) auth.Actor {
 	user := currentUser(c)
-	return auth.Actor{ID: user.ID, Username: user.Username, Role: user.Role, RequestID: requestID(c)}
+	return auth.Actor{ID: user.ID, TenantID: user.TenantID, Username: user.Username, Role: user.Role, RequestID: requestID(c)}
 }
 
 // page parses shared limit/offset pagination; the response reports it back.
@@ -541,7 +554,7 @@ func (s *Server) listUsers(c *gin.Context) {
 	if !ok {
 		return
 	}
-	users, total, err := s.auth.ListUsersPage(c.Request.Context(), limit, offset)
+	users, total, err := s.auth.ListUsersPage(c.Request.Context(), actorFrom(c).TenantID, limit, offset)
 	if err != nil {
 		s.authError(c, err)
 		return
@@ -623,7 +636,7 @@ func (s *Server) listAudit(c *gin.Context) {
 	if !ok {
 		return
 	}
-	entries, total, err := s.auth.ListAudit(c.Request.Context(), filter, limit, offset)
+	entries, total, err := s.auth.ListAudit(c.Request.Context(), actorFrom(c).TenantID, filter, limit, offset)
 	if err != nil {
 		s.authError(c, err)
 		return
@@ -1727,7 +1740,7 @@ func (s *Server) changePassword(c *gin.Context) {
 
 func (s *Server) listSessions(c *gin.Context) {
 	user := currentUser(c)
-	sessions, err := s.auth.ListSessions(c.Request.Context(), user.ID, currentSessionID(c))
+	sessions, err := s.auth.ListSessions(c.Request.Context(), user.ID, user.TenantID, currentSessionID(c))
 	if err != nil {
 		s.authError(c, err)
 		return
@@ -1841,6 +1854,10 @@ func (s *Server) authError(c *gin.Context, err error) {
 	case errors.Is(err, auth.ErrUnauthorized):
 		c.Header("WWW-Authenticate", "Bearer")
 		s.fail(c, 401, "unauthorized", "invalid credentials or expired session")
+	case errors.Is(err, auth.ErrTenantRequired):
+		// The identifier exists in more than one tenant. This is a client-
+		// correctable 400 (retry with tenantSlug), not an auth failure.
+		s.fail(c, 400, "tenant_required", "tenantSlug is required: this email exists in multiple tenants")
 	case errors.Is(err, auth.ErrForbidden):
 		s.fail(c, 403, "forbidden", "permission denied")
 	case errors.Is(err, auth.ErrConflict):

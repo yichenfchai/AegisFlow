@@ -80,14 +80,15 @@ func ValidErrorCode(code ErrorCode) bool {
 }
 
 // Accounts is the local account surface the flow needs. *auth.Service
-// implements it; tests may substitute a stub. Keeping it an interface mirrors
-// the project rule that business modules do not depend on Gin or on concrete
-// transport wiring.
+// implements it; tests may substitute a stub. Every method is tenant-scoped:
+// the tenant recorded by the login state selects where the account is looked
+// up or provisioned. Keeping it an interface mirrors the project rule that
+// business modules do not depend on Gin or on concrete transport wiring.
 type Accounts interface {
-	FindUserByEmail(ctx context.Context, email string) (*auth.User, error)
+	FindUserByEmail(ctx context.Context, tenantID, email string) (*auth.User, error)
 	LoginOIDC(ctx context.Context, user auth.User, requestID string) (*auth.Tokens, error)
-	ProvisionOIDCUser(ctx context.Context, preferredUsername, displayName, email, requestID string) (*auth.User, error)
-	RecordOIDCLoginFailure(ctx context.Context, requestID, code string, user *auth.User) error
+	ProvisionOIDCUser(ctx context.Context, tenantID, preferredUsername, displayName, email, requestID string) (*auth.User, error)
+	RecordOIDCLoginFailure(ctx context.Context, tenantID, requestID, code string, user *auth.User) error
 }
 
 // Options is the validated deployment configuration plus test seams.
@@ -161,10 +162,15 @@ func New(ctx context.Context, db *sql.DB, accounts Accounts, options Options) (*
 // Label is the login-page button text; never empty when the service exists.
 func (s *Service) Label() string { return s.label }
 
-// BeginLogin creates a one-time state row and returns the provider
-// authorization URL plus the browser-visible state value (stored in the
-// state cookie). redirectTo must already have passed SafeRedirectTo.
-func (s *Service) BeginLogin(ctx context.Context, redirectTo string) (authorizationURL, state string, err error) {
+// BeginLogin creates a one-time state row pinned to tenantID and returns the
+// provider authorization URL plus the browser-visible state value (stored in
+// the state cookie). redirectTo must already have passed SafeRedirectTo. The
+// tenant is chosen by the caller (the HTTP layer uses the deployment's default
+// tenant in phase F1); the callback then stays inside it.
+func (s *Service) BeginLogin(ctx context.Context, tenantID, redirectTo string) (authorizationURL, state string, err error) {
+	if tenantID == "" {
+		return "", "", errors.New("OIDC login requires a tenant")
+	}
 	state, err = RandomToken(32)
 	if err != nil {
 		return "", "", err
@@ -180,7 +186,7 @@ func (s *Service) BeginLogin(ctx context.Context, redirectTo string) (authorizat
 		return "", "", err
 	}
 	now := s.now()
-	if err = s.states.Create(ctx, StateHash(state), nonce, verifier, SafeRedirectTo(redirectTo), now.Add(StateTTL).Unix(), now.Unix()); err != nil {
+	if err = s.states.Create(ctx, tenantID, StateHash(state), nonce, verifier, SafeRedirectTo(redirectTo), now.Add(StateTTL).Unix(), now.Unix()); err != nil {
 		return "", "", err
 	}
 	return s.provider.AuthorizationURL(state, nonce, PKCEChallenge(verifier)), state, nil
@@ -201,11 +207,14 @@ type CallbackInput struct {
 // code; the returned error is a *LoginError for the HTTP layer.
 func (s *Service) Complete(ctx context.Context, input CallbackInput) (result *CallbackResult, err error) {
 	var user *auth.User
+	// tenantID is learned from the consumed state row, so even failure audits
+	// after that point can be attributed to the tenant that started the flow.
+	var tenantID string
 	defer func() {
 		if err == nil {
 			return
 		}
-		s.recordFailure(ctx, input.RequestID, CodeOf(err), user)
+		s.recordFailure(ctx, tenantID, input.RequestID, CodeOf(err), user)
 	}()
 	// Bind the callback to this browser before touching the state table: a
 	// state that did not originate from this cookie (login CSRF / fixated
@@ -221,6 +230,12 @@ func (s *Service) Complete(ctx context.Context, input CallbackInput) (result *Ca
 		}
 		return nil, fail(CodeServerError, err)
 	}
+	tenantID = state.TenantID
+	if tenantID == "" {
+		// Schema v18 backfills every state row; an empty tenant means the row is
+		// unusable, so restart the flow instead of guessing a tenant.
+		return nil, fail(CodeStateExpired, errors.New("oidc login state has no tenant"))
+	}
 	if len(input.Code) == 0 || len(input.Code) > 4096 {
 		return nil, fail(CodeTokenExchangeFailed, errors.New("authorization code missing or too long"))
 	}
@@ -235,7 +250,7 @@ func (s *Service) Complete(ctx context.Context, input CallbackInput) (result *Ca
 		}
 		return nil, fail(CodeInvalidToken, err)
 	}
-	user, err = s.accounts.FindUserByEmail(ctx, identity.Email)
+	user, err = s.accounts.FindUserByEmail(ctx, tenantID, identity.Email)
 	if err == nil {
 		if user.Disabled {
 			return nil, fail(CodeAccountDisabled, errors.New("linked account is disabled"))
@@ -248,8 +263,11 @@ func (s *Service) Complete(ctx context.Context, input CallbackInput) (result *Ca
 	if !s.autoProvision {
 		return nil, fail(CodeAccountNotFound, errors.New("no local account is linked to the verified email"))
 	}
-	user, err = s.accounts.ProvisionOIDCUser(ctx, identity.PreferredUsername, identity.Name, identity.Email, input.RequestID)
+	user, err = s.accounts.ProvisionOIDCUser(ctx, tenantID, identity.PreferredUsername, identity.Name, identity.Email, input.RequestID)
 	if err != nil {
+		if errors.Is(err, auth.ErrAccountDisabled) {
+			return nil, fail(CodeAccountDisabled, err)
+		}
 		return nil, fail(CodeServerError, err)
 	}
 	return s.issue(ctx, *user, state.RedirectTo, input.RequestID)
@@ -270,14 +288,16 @@ func (s *Service) issue(ctx context.Context, user auth.User, redirectTo, request
 
 // recordFailure writes the audited failure row with a detached, bounded
 // context so a cancelled browser request still leaves evidence. Only the fixed
-// code is stored; the provider cause stays in the process logs.
-func (s *Service) recordFailure(ctx context.Context, requestID string, code ErrorCode, user *auth.User) {
+// code is stored; the provider cause stays in the process logs. tenantID is
+// empty when the failure happened before the one-time state could be consumed;
+// the account service then attributes the row to the deployment default tenant.
+func (s *Service) recordFailure(ctx context.Context, tenantID, requestID string, code ErrorCode, user *auth.User) {
 	if !ValidErrorCode(code) {
 		code = CodeServerError
 	}
 	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
-	if err := s.accounts.RecordOIDCLoginFailure(auditCtx, requestID, string(code), user); err != nil {
+	if err := s.accounts.RecordOIDCLoginFailure(auditCtx, tenantID, requestID, string(code), user); err != nil {
 		s.logger.ErrorContext(auditCtx, "OIDC login failure audit unavailable", "requestId", requestID, "code", string(code), "error", err)
 	}
 }

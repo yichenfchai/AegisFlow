@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
+	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,15 +17,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
-	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
-	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
 const testSecretKey = "0123456789abcdef0123456789abcdef"
 
-var testActor = auth.Actor{ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-deployments"}
+var testActor = auth.Actor{TenantID: tenants.DefaultID, ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-deployments"}
 
 func testService(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()

@@ -55,7 +55,17 @@ func (s *Server) oidcStart(c *gin.Context) {
 	}
 	// Only a same-origin relative path is accepted; anything else becomes "/".
 	redirectTo := oidc.SafeRedirectTo(c.Query("redirectTo"))
-	authorizationURL, state, err := s.oidc.BeginLogin(c.Request.Context(), redirectTo)
+	// OIDC is pinned to the deployment's default tenant in phase F1: the login
+	// state records it, and the callback resolves/provisions accounts only
+	// inside that tenant. Cross-tenant SSO ambiguity is handled by the later
+	// frontend batch that adds an explicit workspace selector.
+	tenant, err := s.auth.DefaultTenant(c.Request.Context())
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "OIDC start default tenant unavailable", "requestId", requestID(c), "error", err)
+		s.fail(c, http.StatusInternalServerError, "internal_error", "internal server error")
+		return
+	}
+	authorizationURL, state, err := s.oidc.BeginLogin(c.Request.Context(), tenant.ID, redirectTo)
 	if err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "OIDC start failed", "requestId", requestID(c), "error", err)
 		s.fail(c, http.StatusInternalServerError, "internal_error", "internal server error")

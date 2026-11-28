@@ -11,13 +11,14 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
 const testPassword = "correct-horse-battery"
 const testSecret = "integration-test-secret-at-least-32-bytes"
 
-var testActor = Actor{ID: "actor-000000000000001", Username: "tester", RequestID: "req-test"}
+var testActor = Actor{ID: "actor-000000000000001", TenantID: tenants.DefaultID, Username: "tester", RequestID: "req-test"}
 
 func testService(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()
@@ -112,6 +113,8 @@ func TestJWTValidation(t *testing.T) {
 		{"missing expiration", jwt.SigningMethodHS256, func(c *accessClaims) { c.ExpiresAt = nil }},
 		{"expired", jwt.SigningMethodHS256, func(c *accessClaims) { c.ExpiresAt = jwt.NewNumericDate(time.Now().Add(-time.Hour)) }},
 		{"missing session", jwt.SigningMethodHS256, func(c *accessClaims) { c.SessionID = "" }},
+		{"missing tenant", jwt.SigningMethodHS256, func(c *accessClaims) { c.TenantID = "" }},
+		{"unknown tenant", jwt.SigningMethodHS256, func(c *accessClaims) { c.TenantID = "tenant_other_00000000000001" }},
 		{"wrong subject", jwt.SigningMethodHS256, func(c *accessClaims) { c.Subject = "another-user" }},
 		{"wrong algorithm", jwt.SigningMethodHS384, func(c *accessClaims) {}},
 	}
@@ -317,7 +320,7 @@ func TestUsersValidationAndCurrentRole(t *testing.T) {
 	if err != nil || next.User.Role != "viewer" {
 		t.Fatalf("refresh current role = %+v, %v", next, err)
 	}
-	users, err := s.ListUsers(ctx)
+	users, err := s.ListUsers(ctx, tenants.DefaultID)
 	if err != nil || len(users) != 5 {
 		t.Fatalf("ListUsers count=%d error=%v", len(users), err)
 	}
@@ -344,14 +347,14 @@ func TestBootstrapIsIdempotentAndConcurrent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	users, err := s.ListUsers(ctx)
+	users, err := s.ListUsers(ctx, tenants.DefaultID)
 	if err != nil || len(users) != 1 || users[0].Role != "admin" {
 		t.Fatalf("bootstrap users=%+v err=%v", users, err)
 	}
 	if err = s.Bootstrap(ctx, "third-admin", "another-long-password"); err != nil {
 		t.Fatal(err)
 	}
-	users, err = s.ListUsers(ctx)
+	users, err = s.ListUsers(ctx, tenants.DefaultID)
 	if err != nil || len(users) != 1 {
 		t.Fatalf("bootstrap not idempotent: %+v %v", users, err)
 	}

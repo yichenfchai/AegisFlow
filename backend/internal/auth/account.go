@@ -15,6 +15,8 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 )
 
 // Audited actions. Failed logins stay in structured logs only: the login rate
@@ -64,13 +66,36 @@ func validatePassword(password string) error {
 	return nil
 }
 
+// auditTenantID resolves the tenant an audit row belongs to. Authenticated
+// actions always carry the actor's tenant. Rows with no resolved identity (for
+// example a failed OIDC callback before its one-time state was read) are
+// attributed to the deployment's default tenant, which is the only tenant in
+// phase F1; they must never silently borrow a tenant from client input.
+func (s *Service) auditTenantID(ctx context.Context, tx *sql.Tx, actor Actor) (string, error) {
+	if actor.TenantID != "" {
+		if err := requireTenantID(actor.TenantID); err != nil {
+			return "", err
+		}
+		return actor.TenantID, nil
+	}
+	tenant, err := tenants.BySlug(ctx, tx, s.tenantSlug())
+	if err != nil {
+		return "", fmt.Errorf("resolve audit tenant: %w", err)
+	}
+	return tenant.ID, nil
+}
+
 func (s *Service) writeAudit(ctx context.Context, tx *sql.Tx, actor Actor, action, objectType, objectID, result, detail string) error {
+	tenantID, err := s.auditTenantID(ctx, tx, actor)
+	if err != nil {
+		return err
+	}
 	id, err := randomToken(18)
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO auth_audit(id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, id, time.Now().Unix(), actor.ID, actor.Username, action, objectType, objectID, result, detail, actor.RequestID)
+	_, err = tx.ExecContext(ctx, `INSERT INTO auth_audit(id,tenant_id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, id, tenantID, time.Now().Unix(), actor.ID, actor.Username, action, objectType, objectID, result, detail, actor.RequestID)
 	return err
 }
 
@@ -92,9 +117,14 @@ func (s *Service) writeAuditStandalone(ctx context.Context, actor Actor, action,
 }
 
 // ChangePassword verifies the current password, replaces the hash, and revokes
-// every session except keepSessionID (the caller's current session).
+// every session except keepSessionID (the caller's current session). The target
+// and every revoked session are scoped to the actor's tenant.
 func (s *Service) ChangePassword(ctx context.Context, actor Actor, userID, currentPassword, newPassword, keepSessionID string) error {
 	if err := s.valid(); err != nil {
+		return err
+	}
+	tenantID, err := actorTenantID(actor)
+	if err != nil {
 		return err
 	}
 	if !ValidID(userID) || (keepSessionID != "" && !ValidID(keepSessionID)) {
@@ -104,7 +134,7 @@ func (s *Service) ChangePassword(ctx context.Context, actor Actor, userID, curre
 		return err
 	}
 	var hash string
-	err := s.db.QueryRowContext(ctx, `SELECT password_hash FROM auth_users WHERE id=$1`, userID).Scan(&hash)
+	err = s.db.QueryRowContext(ctx, `SELECT password_hash FROM auth_users WHERE id=$1 AND tenant_id=$2`, userID, tenantID).Scan(&hash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -126,10 +156,10 @@ func (s *Service) ChangePassword(ctx context.Context, actor Actor, userID, curre
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `UPDATE auth_users SET password_hash=$2 WHERE id=$1`, userID, string(newHash)); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE auth_users SET password_hash=$2 WHERE id=$1 AND tenant_id=$3`, userID, string(newHash), tenantID); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE user_id=$1 AND revoked=0 AND id<>$2`, userID, keepSessionID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE user_id=$1 AND tenant_id=$2 AND revoked=0 AND id<>$3`, userID, tenantID, keepSessionID); err != nil {
 		return err
 	}
 	if err = s.writeAudit(ctx, tx, actor, ActionPasswordChange, "user", userID, ResultSuccess, ""); err != nil {
@@ -139,9 +169,14 @@ func (s *Service) ChangePassword(ctx context.Context, actor Actor, userID, curre
 }
 
 // ResetPassword sets a new password for the target user and revokes all of
-// their sessions; the target must authenticate again afterwards.
+// their sessions; the target must authenticate again afterwards. A user in a
+// different tenant is indistinguishable from a missing one (ErrNotFound, 404).
 func (s *Service) ResetPassword(ctx context.Context, actor Actor, targetUserID, newPassword string) error {
 	if err := s.valid(); err != nil {
+		return err
+	}
+	tenantID, err := actorTenantID(actor)
+	if err != nil {
 		return err
 	}
 	if !ValidID(targetUserID) {
@@ -159,7 +194,7 @@ func (s *Service) ResetPassword(ctx context.Context, actor Actor, targetUserID, 
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE auth_users SET password_hash=$2 WHERE id=$1`, targetUserID, string(hash))
+	result, err := tx.ExecContext(ctx, `UPDATE auth_users SET password_hash=$2 WHERE id=$1 AND tenant_id=$3`, targetUserID, string(hash), tenantID)
 	if err != nil {
 		return err
 	}
@@ -168,7 +203,7 @@ func (s *Service) ResetPassword(ctx context.Context, actor Actor, targetUserID, 
 	} else if n == 0 {
 		return ErrNotFound
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE user_id=$1 AND revoked=0`, targetUserID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE user_id=$1 AND tenant_id=$2 AND revoked=0`, targetUserID, tenantID); err != nil {
 		return err
 	}
 	if err = s.writeAudit(ctx, tx, actor, ActionPasswordReset, "user", targetUserID, ResultSuccess, ""); err != nil {
@@ -177,11 +212,11 @@ func (s *Service) ResetPassword(ctx context.Context, actor Actor, targetUserID, 
 	return tx.Commit()
 }
 
-// ensureRemainingAdmin rejects operations that would leave the deployment
-// without any enabled administrator. It runs under the "users" advisory lock.
-func ensureRemainingAdmin(ctx context.Context, tx *sql.Tx, excludingUserID string) error {
+// ensureRemainingAdmin rejects operations that would leave one tenant without
+// any enabled administrator. It runs under the "users" advisory lock.
+func ensureRemainingAdmin(ctx context.Context, tx *sql.Tx, tenantID, excludingUserID string) error {
 	var count int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM auth_users WHERE role='admin' AND disabled=0 AND id<>$1`, excludingUserID).Scan(&count); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM auth_users WHERE tenant_id=$2 AND role='admin' AND disabled=0 AND id<>$1`, excludingUserID, tenantID).Scan(&count); err != nil {
 		return err
 	}
 	if count == 0 {
@@ -192,9 +227,15 @@ func ensureRemainingAdmin(ctx context.Context, tx *sql.Tx, excludingUserID strin
 
 // UpdateUser applies role and/or disabled changes atomically. The "users"
 // advisory lock serializes administrator edits, so two concurrent callers can
-// never both demote the last remaining administrator.
+// never both demote the last remaining administrator. The target is resolved
+// inside the actor's tenant only: a user from another tenant is a 404, never a
+// cross-tenant write.
 func (s *Service) UpdateUser(ctx context.Context, actor Actor, targetUserID string, role *string, disabled *bool) error {
 	if err := s.valid(); err != nil {
+		return err
+	}
+	tenantID, err := actorTenantID(actor)
+	if err != nil {
 		return err
 	}
 	if !ValidID(targetUserID) {
@@ -216,7 +257,7 @@ func (s *Service) UpdateUser(ctx context.Context, actor Actor, targetUserID stri
 	}
 	var currentRole string
 	var currentDisabled int
-	err = tx.QueryRowContext(ctx, `SELECT role,disabled FROM auth_users WHERE id=$1`, targetUserID).Scan(&currentRole, &currentDisabled)
+	err = tx.QueryRowContext(ctx, `SELECT role,disabled FROM auth_users WHERE id=$1 AND tenant_id=$2`, targetUserID, tenantID).Scan(&currentRole, &currentDisabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -239,17 +280,17 @@ func (s *Service) UpdateUser(ctx context.Context, actor Actor, targetUserID stri
 		// Idempotent: no write and no duplicate audit row.
 		return tx.Commit()
 	}
-	// Losing the last enabled administrator would lock the deployment out.
+	// Losing the tenant's last enabled administrator would lock it out.
 	if currentRole == "admin" && currentDisabled == 0 && (newRole != "admin" || newDisabled == 1) {
-		if err = ensureRemainingAdmin(ctx, tx, targetUserID); err != nil {
+		if err = ensureRemainingAdmin(ctx, tx, tenantID, targetUserID); err != nil {
 			return err
 		}
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE auth_users SET role=$2,disabled=$3 WHERE id=$1`, targetUserID, newRole, newDisabled); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE auth_users SET role=$2,disabled=$3 WHERE id=$1 AND tenant_id=$4`, targetUserID, newRole, newDisabled, tenantID); err != nil {
 		return err
 	}
 	if disabledChanged && newDisabled == 1 {
-		if _, err = tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE user_id=$1 AND revoked=0`, targetUserID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE user_id=$1 AND tenant_id=$2 AND revoked=0`, targetUserID, tenantID); err != nil {
 			return err
 		}
 	}
@@ -283,16 +324,20 @@ func (s *Service) SetUserRole(ctx context.Context, actor Actor, targetUserID, ro
 }
 
 // ListSessions returns the user's active sessions with the current one marked.
-// Token hashes are never exposed.
-func (s *Service) ListSessions(ctx context.Context, userID, currentSessionID string) ([]SessionInfo, error) {
+// Token hashes are never exposed; the tenant filter defends against a session
+// row that does not belong to the caller's tenant.
+func (s *Service) ListSessions(ctx context.Context, userID, tenantID, currentSessionID string) ([]SessionInfo, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
 	}
 	if !ValidID(userID) {
 		return nil, fmt.Errorf("%w: invalid user id", ErrValidation)
 	}
+	if err := requireTenantID(tenantID); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id,created_at,expires_at,remember FROM auth_sessions
-	 WHERE user_id=$1 AND revoked=0 AND expires_at>$2 ORDER BY created_at DESC,id`, userID, time.Now().Unix())
+	 WHERE user_id=$1 AND tenant_id=$2 AND revoked=0 AND expires_at>$3 ORDER BY created_at DESC,id`, userID, tenantID, time.Now().Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -312,9 +357,14 @@ func (s *Service) ListSessions(ctx context.Context, userID, currentSessionID str
 }
 
 // RevokeSession revokes one of the user's own sessions; unknown or foreign
-// session ids return ErrNotFound.
+// session ids return ErrNotFound. Both the user and the session are scoped to
+// the actor's tenant.
 func (s *Service) RevokeSession(ctx context.Context, actor Actor, userID, sessionID string) error {
 	if err := s.valid(); err != nil {
+		return err
+	}
+	tenantID, err := actorTenantID(actor)
+	if err != nil {
 		return err
 	}
 	if !ValidID(userID) || !ValidID(sessionID) {
@@ -325,7 +375,7 @@ func (s *Service) RevokeSession(ctx context.Context, actor Actor, userID, sessio
 		return err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE id=$1 AND user_id=$2 AND revoked=0`, sessionID, userID)
+	result, err := tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE id=$1 AND user_id=$2 AND tenant_id=$3 AND revoked=0`, sessionID, userID, tenantID)
 	if err != nil {
 		return err
 	}
@@ -339,7 +389,7 @@ func (s *Service) RevokeSession(ctx context.Context, actor Actor, userID, sessio
 		}
 	} else {
 		var exists int
-		if err = tx.QueryRowContext(ctx, `SELECT 1 FROM auth_sessions WHERE id=$1 AND user_id=$2`, sessionID, userID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		if err = tx.QueryRowContext(ctx, `SELECT 1 FROM auth_sessions WHERE id=$1 AND user_id=$2 AND tenant_id=$3`, sessionID, userID, tenantID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		} else if err != nil {
 			return err
@@ -355,6 +405,10 @@ func (s *Service) RevokeOtherSessions(ctx context.Context, actor Actor, userID, 
 	if err := s.valid(); err != nil {
 		return 0, err
 	}
+	tenantID, err := actorTenantID(actor)
+	if err != nil {
+		return 0, err
+	}
 	if !ValidID(userID) || !ValidID(keepSessionID) {
 		return 0, fmt.Errorf("%w: invalid user or session id", ErrValidation)
 	}
@@ -363,7 +417,7 @@ func (s *Service) RevokeOtherSessions(ctx context.Context, actor Actor, userID, 
 		return 0, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE user_id=$1 AND revoked=0 AND id<>$2`, userID, keepSessionID)
+	result, err := tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE user_id=$1 AND tenant_id=$2 AND revoked=0 AND id<>$3`, userID, tenantID, keepSessionID)
 	if err != nil {
 		return 0, err
 	}
@@ -390,18 +444,22 @@ func PageBounds(limit, offset int) error {
 	return nil
 }
 
-func (s *Service) ListUsersPage(ctx context.Context, limit, offset int) ([]User, int, error) {
+// ListUsersPage returns one page of the tenant's users, ordered by username.
+func (s *Service) ListUsersPage(ctx context.Context, tenantID string, limit, offset int) ([]User, int, error) {
 	if err := s.valid(); err != nil {
+		return nil, 0, err
+	}
+	if err := requireTenantID(tenantID); err != nil {
 		return nil, 0, err
 	}
 	if err := PageBounds(limit, offset); err != nil {
 		return nil, 0, err
 	}
 	var total int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM auth_users`).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM auth_users WHERE tenant_id=$1`, tenantID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+userColumns+` FROM auth_users ORDER BY lower(username),id LIMIT $1 OFFSET $2`, limit, offset)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+userColumns+` FROM auth_users WHERE tenant_id=$1 ORDER BY lower(username),id LIMIT $2 OFFSET $3`, tenantID, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -446,9 +504,9 @@ func (f AuditFilter) validate() error {
 	return nil
 }
 
-func (f AuditFilter) where() (string, []any) {
-	var clauses []string
-	var args []any
+func (f AuditFilter) where(tenantID string) (string, []any) {
+	args := []any{tenantID}
+	clauses := []string{"tenant_id = $1"}
 	if f.Action != "" {
 		args = append(args, f.Action)
 		clauses = append(clauses, fmt.Sprintf("action = $%d", len(args)))
@@ -473,16 +531,17 @@ func (f AuditFilter) where() (string, []any) {
 		args = append(args, f.To)
 		clauses = append(clauses, fmt.Sprintf("created_at <= $%d", len(args)))
 	}
-	if len(clauses) == 0 {
-		return "", args
-	}
 	return " WHERE " + strings.Join(clauses, " AND "), args
 }
 
-// ListAudit returns one page of the audit trail, newest first. Filters are
-// applied to both the page query and the total so pagination stays consistent.
-func (s *Service) ListAudit(ctx context.Context, filter AuditFilter, limit, offset int) ([]AuditEntry, int, error) {
+// ListAudit returns one page of the tenant's audit trail, newest first. The
+// tenant predicate is mandatory and always applied; filters are applied to both
+// the page query and the total so pagination stays consistent.
+func (s *Service) ListAudit(ctx context.Context, tenantID string, filter AuditFilter, limit, offset int) ([]AuditEntry, int, error) {
 	if err := s.valid(); err != nil {
+		return nil, 0, err
+	}
+	if err := requireTenantID(tenantID); err != nil {
 		return nil, 0, err
 	}
 	if err := PageBounds(limit, offset); err != nil {
@@ -491,7 +550,7 @@ func (s *Service) ListAudit(ctx context.Context, filter AuditFilter, limit, offs
 	if err := filter.validate(); err != nil {
 		return nil, 0, err
 	}
-	where, args := filter.where()
+	where, args := filter.where(tenantID)
 	var total int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM auth_audit`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -519,13 +578,16 @@ func (s *Service) ListAudit(ctx context.Context, filter AuditFilter, limit, offs
 // instead of silently receiving a partial report.
 const AuditExportMaxRows = 10000
 
-// ExportAudit returns at most limit matching entries, newest first, and reports
-// whether more rows exist beyond the limit. Filtering and ordering match
-// ListAudit exactly, so the CSV export mirrors the audit page; the caller owns
-// the response format and the documented header cap. Raising the limit above
-// AuditExportMaxRows is refused: the endpoint must stay bounded.
-func (s *Service) ExportAudit(ctx context.Context, filter AuditFilter, limit int) ([]AuditEntry, bool, error) {
+// ExportAudit returns at most limit matching entries of one tenant, newest
+// first, and reports whether more rows exist beyond the limit. Filtering and
+// ordering match ListAudit exactly, so the CSV export mirrors the audit page;
+// the caller owns the response format and the documented header cap. Raising
+// the limit above AuditExportMaxRows is refused: the endpoint must stay bounded.
+func (s *Service) ExportAudit(ctx context.Context, tenantID string, filter AuditFilter, limit int) ([]AuditEntry, bool, error) {
 	if err := s.valid(); err != nil {
+		return nil, false, err
+	}
+	if err := requireTenantID(tenantID); err != nil {
 		return nil, false, err
 	}
 	if limit < 1 || limit > AuditExportMaxRows {
@@ -534,7 +596,7 @@ func (s *Service) ExportAudit(ctx context.Context, filter AuditFilter, limit int
 	if err := filter.validate(); err != nil {
 		return nil, false, err
 	}
-	where, args := filter.where()
+	where, args := filter.where(tenantID)
 	// Read one extra row: its presence is the truncation signal, and it is never
 	// returned to the caller.
 	args = append(args, limit+1)

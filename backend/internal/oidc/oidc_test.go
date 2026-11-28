@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
@@ -66,14 +67,14 @@ func TestStateStoreIsOneTimeUse(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().Unix()
 	state := StateHash("state-value")
-	if err := store.Create(ctx, state, "nonce", "verifier", "/builds", now+600, now); err != nil {
+	if err := store.Create(ctx, tenants.DefaultID, state, "nonce", "verifier", "/builds", now+600, now); err != nil {
 		t.Fatal(err)
 	}
 	consumed, err := store.Consume(ctx, state, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if consumed.Nonce != "nonce" || consumed.CodeVerifier != "verifier" || consumed.RedirectTo != "/builds" {
+	if consumed.TenantID != tenants.DefaultID || consumed.Nonce != "nonce" || consumed.CodeVerifier != "verifier" || consumed.RedirectTo != "/builds" {
 		t.Fatalf("consumed state = %+v", consumed)
 	}
 	// Replay: the row is already consumed and can never yield a second login.
@@ -82,7 +83,7 @@ func TestStateStoreIsOneTimeUse(t *testing.T) {
 	}
 	// An expired row is rejected exactly like a consumed one.
 	expired := StateHash("expired")
-	if err = store.Create(ctx, expired, "nonce", "verifier", "/", now-1, now); err != nil {
+	if err = store.Create(ctx, tenants.DefaultID, expired, "nonce", "verifier", "/", now-1, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = store.Consume(ctx, expired, now); err != ErrStateNotFound {

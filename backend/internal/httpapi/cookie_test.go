@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
@@ -217,7 +218,7 @@ func TestSecureNotInferredFromForwardingHeaders(t *testing.T) {
 func TestMemberAndViewerCannotManageUsers(t *testing.T) {
 	h, service := testServer(t)
 	for _, role := range []string{"member", "viewer"} {
-		if _, err := service.CreateUser(context.Background(), auth.Actor{}, "user-"+role, "a-strong-password", "", role); err != nil {
+		if _, err := service.CreateUser(context.Background(), auth.Actor{TenantID: tenants.DefaultID}, "user-"+role, "a-strong-password", "", role); err != nil {
 			t.Fatal(err)
 		}
 		tokens, err := service.Login(context.Background(), "user-"+role, "a-strong-password")

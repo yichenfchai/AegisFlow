@@ -4,16 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
+	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
-	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
-	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
-var testActor = auth.Actor{ID: "actor-000000000000001", Username: "tester", Role: "member", RequestID: "req-projects"}
+var testActor = auth.Actor{TenantID: tenants.DefaultID, ID: "actor-000000000000001", Username: "tester", Role: "member", RequestID: "req-projects"}
 
 func testService(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()
@@ -187,17 +187,17 @@ func TestAuditTrail(t *testing.T) {
 // Actors covering the global roles plus one project outsider. IDs must satisfy
 // auth.ValidID so the registry treats them like real accounts.
 var (
-	adminActor    = auth.Actor{ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-admin"}
-	memberActor   = auth.Actor{ID: "member-000000000000001", Username: "mia", Role: "member", RequestID: "req-member"}
-	viewerActor   = auth.Actor{ID: "viewer-000000000000001", Username: "vic", Role: "viewer", RequestID: "req-viewer"}
-	outsiderActor = auth.Actor{ID: "outsider-0000000000001", Username: "otto", Role: "member", RequestID: "req-outsider"}
+	adminActor    = auth.Actor{TenantID: tenants.DefaultID, ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-admin"}
+	memberActor   = auth.Actor{TenantID: tenants.DefaultID, ID: "member-000000000000001", Username: "mia", Role: "member", RequestID: "req-member"}
+	viewerActor   = auth.Actor{TenantID: tenants.DefaultID, ID: "viewer-000000000000001", Username: "vic", Role: "viewer", RequestID: "req-viewer"}
+	outsiderActor = auth.Actor{TenantID: tenants.DefaultID, ID: "outsider-0000000000001", Username: "otto", Role: "member", RequestID: "req-outsider"}
 )
 
 // seedUser inserts an auth account so membership can reference a real user.
 func seedUser(t *testing.T, db *sql.DB, id, username string) {
 	t.Helper()
-	if _, err := db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role)
-	 VALUES($1,$2,'unused',$2,'member')`, id, username); err != nil {
+	if _, err := db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role,tenant_id)
+	 VALUES($1,$2,'unused',$2,'member',$3)`, id, username, tenants.DefaultID); err != nil {
 		t.Fatal(err)
 	}
 }

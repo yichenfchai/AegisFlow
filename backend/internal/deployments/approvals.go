@@ -120,7 +120,9 @@ func (s *Service) expirePendingApproval(ctx context.Context, tx *sql.Tx, approva
 	approval.Reason = "approval expired"
 	approval.DecidedAt = now
 	detail := "deployment=" + approval.DeploymentID + " reason=approval expired"
-	if err := writeAuditObject(ctx, tx, auth.Actor{}, ActionApprovalExpire, "approval", approval.ID, detail); err != nil {
+	// The worker has no session actor: attribute the system row to the
+	// deployment's tenant (phase F1 has exactly one, the default tenant).
+	if err := writeAuditObject(ctx, tx, auth.Actor{TenantID: s.defaultTenantID}, ActionApprovalExpire, "approval", approval.ID, detail); err != nil {
 		return Approval{}, err
 	}
 	if err := s.enqueueApprovalNotification(ctx, tx, approval, notificationExpired); err != nil {

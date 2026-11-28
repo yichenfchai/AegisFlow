@@ -416,6 +416,55 @@ var Migrations = [][]string{{
 	 consumed_at BIGINT,
 	 created_at BIGINT NOT NULL)`,
 	`CREATE INDEX oidc_login_states_expires_idx ON oidc_login_states(expires_at)`,
+}, {
+	// Multi-tenant foundations (phase F1). Tenants are the isolation boundary;
+	// this migration only introduces the tenant registry and the tenant column
+	// on auth-owned tables, so a single-tenant deployment keeps exactly the
+	// previous behavior. Business tables (projects, builds, deployments, ...)
+	// intentionally stay global in F1: no tenant-creation entry point exists
+	// until the batch that adds their tenant_id and isolation predicates, so
+	// this deployment can never hold a second tenant's business data.
+	//
+	// The seeded tenant uses a fixed id rather than a random one because system
+	// rows and startup checks must resolve the deployment's single tenant across
+	// restarts and remains stable when AEGIS_DEFAULT_TENANT_SLUG renames the
+	// slug (the startup rename only touches slug/updated_at). Existing rows are
+	// backfilled before the NOT NULL constraints and foreign keys are added;
+	// auth_users' global username/email uniqueness is replaced by the
+	// per-tenant indexes, and auth_audit gets the tenant-scoped time index that
+	// the admin audit pages will query. oidc_login_states stays nullable so the
+	// one-time-state rows written before a tenant exists (there are none after
+	// this migration) remain representable; new rows always record a tenant.
+	`CREATE TABLE tenants (
+	 id TEXT PRIMARY KEY,
+	 slug TEXT NOT NULL UNIQUE CHECK (slug ~ '^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$'),
+	 name TEXT NOT NULL,
+	 status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended')),
+	 created_at BIGINT NOT NULL,
+	 updated_at BIGINT NOT NULL)`,
+	`INSERT INTO tenants(id,slug,name,status,created_at,updated_at)
+	 VALUES ('tenant_default_0000000000000001','default','Default','active',
+	   (EXTRACT(EPOCH FROM now()))::BIGINT,(EXTRACT(EPOCH FROM now()))::BIGINT)`,
+	`ALTER TABLE auth_users ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE auth_sessions ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE auth_audit ADD COLUMN tenant_id TEXT`,
+	`ALTER TABLE oidc_login_states ADD COLUMN tenant_id TEXT`,
+	`UPDATE auth_users SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE auth_sessions SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE auth_audit SET tenant_id='tenant_default_0000000000000001'`,
+	`UPDATE oidc_login_states SET tenant_id='tenant_default_0000000000000001'`,
+	`ALTER TABLE auth_users ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE auth_sessions ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE auth_audit ALTER COLUMN tenant_id SET NOT NULL`,
+	`ALTER TABLE auth_users ADD CONSTRAINT auth_users_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE auth_sessions ADD CONSTRAINT auth_sessions_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE auth_audit ADD CONSTRAINT auth_audit_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`ALTER TABLE oidc_login_states ADD CONSTRAINT oidc_login_states_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT`,
+	`DROP INDEX auth_users_username_lower_idx`,
+	`DROP INDEX auth_users_email_lower_idx`,
+	`CREATE UNIQUE INDEX auth_users_tenant_username_lower_idx ON auth_users(tenant_id, lower(username))`,
+	`CREATE UNIQUE INDEX auth_users_tenant_email_lower_idx ON auth_users(tenant_id, lower(email)) WHERE email <> ''`,
+	`CREATE INDEX auth_audit_tenant_time_idx ON auth_audit(tenant_id, created_at DESC, id)`,
 }}
 
 // Apply brings the schema to the latest version under a transaction-scoped

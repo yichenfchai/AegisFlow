@@ -4,21 +4,21 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"strings"
-	"testing"
-
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
+	"strings"
+	"testing"
 )
 
 // Actors covering the global roles plus one project outsider.
 var (
-	adminActor    = auth.Actor{ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-admin"}
-	maintainActor = auth.Actor{ID: "maint-0000000000000001", Username: "mira", Role: "member", RequestID: "req-maint"}
-	viewerActor   = auth.Actor{ID: "viewer-000000000000001", Username: "vic", Role: "viewer", RequestID: "req-viewer"}
-	outsiderActor = auth.Actor{ID: "outsider-0000000000001", Username: "otto", Role: "member", RequestID: "req-outsider"}
+	adminActor    = auth.Actor{TenantID: tenants.DefaultID, ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-admin"}
+	maintainActor = auth.Actor{TenantID: tenants.DefaultID, ID: "maint-0000000000000001", Username: "mira", Role: "member", RequestID: "req-maint"}
+	viewerActor   = auth.Actor{TenantID: tenants.DefaultID, ID: "viewer-000000000000001", Username: "vic", Role: "viewer", RequestID: "req-viewer"}
+	outsiderActor = auth.Actor{TenantID: tenants.DefaultID, ID: "outsider-0000000000001", Username: "otto", Role: "member", RequestID: "req-outsider"}
 )
 
 func testService(t *testing.T) (*Service, *projects.Service, *sql.DB) {
@@ -32,8 +32,8 @@ func testService(t *testing.T) (*Service, *projects.Service, *sql.DB) {
 
 func seedUser(t *testing.T, db *sql.DB, actor auth.Actor) {
 	t.Helper()
-	if _, err := db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role)
-	 VALUES($1,$2,'unused',$2,'member')`, actor.ID, actor.Username); err != nil {
+	if _, err := db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role,tenant_id)
+	 VALUES($1,$2,'unused',$2,'member',$3)`, actor.ID, actor.Username, tenants.DefaultID); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -4,10 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"testing"
-
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
+	"testing"
 )
 
 // ageReview moves one review's created_at so global ordering is deterministic
@@ -177,7 +177,7 @@ func TestListVisibleFiltersAndPagination(t *testing.T) {
 	}
 	// An actor without project-level privileges still sees the public reviews
 	// (visibility is not a role matrix) but none of the private ones.
-	anonymous, total, err := s.ListVisible(ctx, auth.Actor{ID: "nobody-00000000000001", Username: "nobody", Role: "viewer"}, ListFilter{Limit: 20})
+	anonymous, total, err := s.ListVisible(ctx, auth.Actor{TenantID: tenants.DefaultID, ID: "nobody-00000000000001", Username: "nobody", Role: "viewer"}, ListFilter{Limit: 20})
 	if err != nil || total != 6 || len(anonymous) != 6 {
 		t.Fatalf("unprivileged list = %d %d err=%v", len(anonymous), total, err)
 	}

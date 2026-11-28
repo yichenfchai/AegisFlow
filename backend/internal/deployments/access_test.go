@@ -4,15 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"testing"
-
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
+	"testing"
 )
 
 var (
-	accessMember = auth.Actor{ID: "member-0000000000000001", Username: "dev", Role: "member", RequestID: "req-access-member"}
-	accessViewer = auth.Actor{ID: "viewer-0000000000000001", Username: "read", Role: "viewer", RequestID: "req-access-viewer"}
+	accessMember = auth.Actor{TenantID: tenants.DefaultID, ID: "member-0000000000000001", Username: "dev", Role: "member", RequestID: "req-access-member"}
+	accessViewer = auth.Actor{TenantID: tenants.DefaultID, ID: "viewer-0000000000000001", Username: "read", Role: "viewer", RequestID: "req-access-viewer"}
 )
 
 // accessService builds a service that owns the real project registry, which is
@@ -22,8 +22,8 @@ func accessService(t *testing.T) (*Service, *sql.DB, *projects.Service) {
 	t.Helper()
 	_, db := testServiceWith(t, Options{SecretKey: []byte(testSecretKey)})
 	for _, actor := range []auth.Actor{accessMember, accessViewer} {
-		if _, err := db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role,disabled,created_at)
-			VALUES($1,$2,'x',$3,$4,0,0)`, actor.ID, actor.Username, actor.Username, actor.Role); err != nil {
+		if _, err := db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role,disabled,created_at,tenant_id)
+			VALUES($1,$2,'x',$3,$4,0,0,$5)`, actor.ID, actor.Username, actor.Username, actor.Role, tenants.DefaultID); err != nil {
 			t.Fatal(err)
 		}
 	}
