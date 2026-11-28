@@ -472,7 +472,18 @@ func (s *Service) ListUsersPage(ctx context.Context, tenantID string, limit, off
 		}
 		users = append(users, *u)
 	}
-	return users, total, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	// Every listed user belongs to the same tenant; resolve the metadata once.
+	tenant, err := loadTenantInfo(ctx, s.db, tenantID)
+	if err != nil {
+		return nil, 0, err
+	}
+	for i := range users {
+		users[i].Tenant = tenant
+	}
+	return users, total, nil
 }
 
 // AuditFilter narrows an audit query. Zero values mean "no constraint"; Actor

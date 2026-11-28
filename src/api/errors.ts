@@ -51,6 +51,9 @@ export const API_ERROR_TEXT: Readonly<Record<string, string>> = {
   conflict: '数据状态已发生变化或存在冲突，请刷新后重试',
   rate_limited: '操作过于频繁，请稍后重试',
   account_disabled: '账号已被禁用，请联系管理员',
+  // 登录标识在多个租户（工作空间）中都存在：后端要求带 tenantSlug 重新登录，
+  // 登录页据此展开「工作空间标识」输入框（F3）。
+  tenant_required: '该邮箱存在于多个工作空间，请输入工作空间标识',
   origin_denied: '当前请求来源不被允许，请从本站页面重试',
   not_ready: '服务尚未就绪，请稍后重试',
   dependencies_unavailable: '服务依赖暂不可用，请稍后重试',

@@ -61,6 +61,17 @@ info:
     creation has no HTTP API: operators use the tenant CLI. The tenant_id column
     is server-side only and never appears in a response.
 
+    Multi-tenancy phase F3: every user payload (login and refresh TokenData.user,
+    GET /auth/me, and the users list/create responses) carries an identical
+    `tenant` object with the workspace id, slug and name. The login page uses
+    tenantSlug to resolve an identifier that exists in multiple workspaces: a
+    login without tenantSlug that matches more than one tenant returns 400
+    tenant_required, and the browser keeps the typed credentials, reveals the
+    "workspace identifier" field and retries with tenantSlug (also prefilled from
+    `?tenant=<slug>`). Clients render the workspace name and keep the slug as the
+    human-readable/tooltip value. No subdomain/path routing, tenant switch UI,
+    platform console or tenant-level quota exists in this phase.
+
     GET /metrics is only offered on the optional separate metrics listener
     (AEGIS_METRICS_ADDR, disabled by default), never on this API listener, and it
     is deliberately unauthenticated so a scraper needs no session; bind it to
@@ -182,7 +193,7 @@ paths:
       tags: [Auth]
       operationId: login
       summary: Authenticate credentials and set refresh cookie
-      description: Username lookup is case-insensitive within the resolved tenant. Optional tenantSlug selects the tenant; without it the username must be unique across tenants, and an ambiguous username returns 400 tenant_required (retry with tenantSlug). Unknown tenant, unknown user, wrong password and a suspended tenant return the same 401 (no tenant/account enumeration). All attempts count toward the Redis shared IP limit (10/minute across instances). Only configured trusted proxy CIDRs may supply X-Forwarded-For. Redis failure returns 503 without local fallback. A correct password for a disabled account returns 403 account_disabled (state is never revealed without password knowledge). No public registration.
+      description: Username lookup is case-insensitive within the resolved tenant. Optional tenantSlug selects the tenant; without it the username must be unique across tenants, and an ambiguous username returns 400 tenant_required (retry with tenantSlug). Unknown tenant, unknown user, wrong password and a suspended tenant return the same 401 (no tenant/account enumeration). The returned user carries tenant {id,slug,name} of the resolved workspace; the same tenant object appears on /auth/me, /auth/refresh and every other user payload. All attempts count toward the Redis shared IP limit (10/minute across instances). Only configured trusted proxy CIDRs may supply X-Forwarded-For. Redis failure returns 503 without local fallback. A correct password for a disabled account returns 403 account_disabled (state is never revealed without password knowledge). No public registration.
       parameters:
         - { $ref: '#/components/parameters/AuthOrigin' }
       requestBody:
@@ -414,7 +425,8 @@ paths:
     get:
       tags: [Auth]
       operationId: currentUser
-      summary: Return the current database-backed user and role
+      summary: Return the current database-backed user, role and tenant
+      description: The user payload is identical to the login/refresh user and includes the tenant object {id,slug,name} of the session's workspace.
       security:
         - bearerAuth: []
       responses:
@@ -3314,9 +3326,10 @@ components:
     User:
       type: object
       additionalProperties: false
-      required: [id, username, displayName, role, disabled, createdAt]
+      required: [id, tenant, username, displayName, role, disabled, createdAt]
       properties:
         id: { type: string }
+        tenant: { $ref: '#/components/schemas/Tenant' }
         username: { $ref: '#/components/schemas/Username' }
         displayName:
           type: string
@@ -3329,6 +3342,21 @@ components:
           type: integer
           format: int64
           description: Unix seconds; 0 means unknown for rows created before the account-management migration
+    Tenant:
+      type: object
+      additionalProperties: false
+      required: [id, slug, name]
+      properties:
+        id:
+          type: string
+          description: Server-side tenant id; stable across slug renames and never accepted from a request body
+        slug:
+          type: string
+          pattern: '^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$'
+          description: Workspace slug shown to the user and sent as tenantSlug when a login identifier exists in multiple tenants
+        name:
+          type: string
+          description: Human-readable workspace name rendered in the app shell
     Username:
       type: string
       minLength: 3
@@ -4039,7 +4067,7 @@ components:
         requestId: { $ref: '#/components/schemas/RequestID' }
   responses:
     Tokens:
-      description: Access token and public user only; refresh secret is Set-Cookie only
+      description: Access token and public user (including the tenant object); refresh secret is Set-Cookie only
       headers:
         Set-Cookie: { $ref: '#/components/headers/RefreshCookie' }
         X-Request-ID: { $ref: '#/components/headers/RequestID' }

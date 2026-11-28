@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/DataTable'
 import type { OIDCConfig } from '@/api/http'
 import { errorMessage, useSession } from '@/stores/session'
 import { SessionGate } from './SessionGate'
+import { runLoginAttempt, tenantSlugFromSearch } from './loginAttempt'
 import { safeReturnTo } from './returnTo'
 import { loadOIDCConfig, ssoButtonLabel, ssoErrorMessage, ssoStartURL } from './sso'
 
@@ -20,6 +21,11 @@ function LoginForm() {
   const [password, setPassword] = useState('')
   const [remember, setRemember] = useState(true)
   const [showPwd, setShowPwd] = useState(false)
+  // 工作空间标识（阶段 F3）：默认收起，单工作空间登录保持原样；?tenant=<slug>
+  // 可预填并展开，tenant_required 时也会自动展开并保留已填邮箱/密码。
+  const [tenantSlug, setTenantSlug] = useState(() => tenantSlugFromSearch(location.search))
+  const [tenantOpen, setTenantOpen] = useState(() => tenantSlugFromSearch(location.search) !== '')
+  const [tenantSlugRequired, setTenantSlugRequired] = useState(false)
   // SSO callback failures arrive as ?sso_error=<固定错误码>；初始 error 直接取映射，
   // 随后把该参数从地址栏清掉，避免刷新重复提示或把错误码留在历史记录里。
   const [error, setError] = useState(() => ssoErrorMessage(new URLSearchParams(location.search).get('sso_error')) ?? '')
@@ -54,20 +60,29 @@ function LoginForm() {
     e?.preventDefault()
     if (loading) return
     setError('')
-    if (!username.trim()) {
-      setError('用户名不能为空')
-      return
-    }
-    if (!password) {
-      setError('密码不能为空')
-      return
-    }
     setLoading(true)
     try {
-      await login(username.trim(), password, remember)
+      const outcome = await runLoginAttempt(
+        { username, password, remember, tenantSlug, tenantSlugRequired },
+        login,
+      )
+      if (outcome.kind === 'invalid') {
+        setError(outcome.message)
+        return
+      }
+      if (outcome.kind === 'tenant_required') {
+        // 歧义登录：保留邮箱/密码，展开工作空间标识并提示，用户补填后重试。
+        setTenantSlugRequired(true)
+        setTenantOpen(true)
+        setError(errorMessage(outcome.error))
+        return
+      }
+      if (outcome.kind === 'failed') {
+        setError(errorMessage(outcome.error))
+        return
+      }
+      setError('')
       nav(safeReturnTo(new URLSearchParams(location.search).get('returnTo')), { replace: true })
-    } catch (cause) {
-      setError(errorMessage(cause))
     } finally {
       setLoading(false)
     }
@@ -163,6 +178,56 @@ function LoginForm() {
               </button>
             </div>
           </div>
+
+          {/* 工作空间标识：默认收起，单工作空间登录不受影响；tenant_required 或
+              ?tenant=<slug> 时展开。格式校验与提交由 loginAttempt.ts 负责。 */}
+          {!tenantOpen && (
+            <button
+              type="button"
+              onClick={() => setTenantOpen(true)}
+              disabled={loading}
+              className="self-start text-label-sm text-primary hover:underline disabled:opacity-50"
+            >
+              填写工作空间标识
+            </button>
+          )}
+          {tenantOpen && (
+            <div>
+              <div className="flex items-center justify-between mb-space-sm">
+                <label htmlFor="login-tenant" className="block text-label-md text-on-surface-variant">工作空间标识</label>
+                {!tenantSlugRequired && (
+                  <button
+                    type="button"
+                    onClick={() => setTenantOpen(false)}
+                    disabled={loading}
+                    className="text-label-sm text-outline hover:text-on-surface disabled:opacity-50"
+                  >
+                    收起
+                  </button>
+                )}
+              </div>
+              <div className="relative">
+                <Icon name="domain" size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-outline" />
+                <input
+                  id="login-tenant"
+                  name="tenantSlug"
+                  autoComplete="organization"
+                  disabled={loading}
+                  autoFocus
+                  value={tenantSlug}
+                  onChange={(e) => setTenantSlug(e.target.value)}
+                  placeholder="例如 acme"
+                  spellCheck={false}
+                  className="w-full bg-surface-container-lowest border border-surface-container-highest rounded pl-9 pr-3 py-space-md text-body-md text-on-surface placeholder:text-text-3 focus:outline-none focus:border-primary/60 transition-colors font-mono"
+                />
+              </div>
+              <p className="mt-space-sm text-label-sm text-outline">
+                {tenantSlugRequired
+                  ? '该邮箱存在于多个工作空间，请输入工作空间标识'
+                  : '工作空间标识由管理员提供，只能包含小写字母、数字和短横线；只有一个工作空间时无需填写。'}
+              </p>
+            </div>
+          )}
 
           {error && (
             <div role="alert" className="flex items-center gap-space-sm text-body-sm text-error bg-error/10 rounded px-space-lg py-space-md">

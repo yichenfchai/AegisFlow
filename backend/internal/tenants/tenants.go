@@ -78,6 +78,22 @@ type Querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// ByID resolves one tenant by its primary key. It backs the public tenant
+// metadata attached to user payloads (the authenticated user's tenant id is
+// always server-derived, never client input). Unknown ids return ErrNotFound.
+func ByID(ctx context.Context, q Querier, id string) (*Tenant, error) {
+	var t Tenant
+	err := q.QueryRowContext(ctx, `SELECT id,slug,name,status,created_at,updated_at FROM tenants WHERE id=$1`, id).
+		Scan(&t.ID, &t.Slug, &t.Name, &t.Status, &t.CreatedAt, &t.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
 // BySlug resolves one tenant by slug. Unknown slugs return ErrNotFound.
 func BySlug(ctx context.Context, q Querier, slug string) (*Tenant, error) {
 	if !ValidSlug(slug) {

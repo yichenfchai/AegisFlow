@@ -68,6 +68,114 @@ func decodeTokenPayload(t *testing.T, accessToken string) map[string]any {
 	return payload
 }
 
+// TestHTTPTenantMetadataOnAuthResponses proves the login, /auth/me and account
+// listing/creation payloads all carry the same tenant object, and that a user's
+// tenant metadata never leaks another tenant's identity.
+func TestHTTPTenantMetadataOnAuthResponses(t *testing.T) {
+	h, service, db := tenantHTTPServer(t)
+	insertHTTPTenant(t, db, httpOtherTenantID, "other")
+	ctx := context.Background()
+	otherActor := auth.Actor{ID: "actor-other-00000000001", TenantID: httpOtherTenantID, Username: "other-admin", RequestID: "req-http-tenant"}
+	if _, err := service.CreateUser(ctx, otherActor, "other-admin", "other-password-01", "", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	wantDefault := auth.TenantInfo{ID: tenants.DefaultID, Slug: tenants.DefaultSlug, Name: "Default"}
+	wantOther := auth.TenantInfo{ID: httpOtherTenantID, Slug: "other", Name: "other"}
+	assertTenant := func(label string, got *auth.TenantInfo, want auth.TenantInfo) {
+		t.Helper()
+		if got == nil || *got != want {
+			t.Fatalf("%s tenant = %+v, want %+v", label, got, want)
+		}
+	}
+
+	// Password login without a slug returns the default tenant metadata.
+	w := request(h, "POST", "/api/v1/auth/login", `{"username":"admin","password":"a-strong-password"}`, "")
+	if w.Code != 200 {
+		t.Fatalf("default login = %d %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"tenant":{`) {
+		t.Fatalf("login payload carries no tenant object: %s", w.Body.String())
+	}
+	var loginResult struct {
+		Data auth.Tokens `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &loginResult); err != nil {
+		t.Fatal(err)
+	}
+	assertTenant("default login", loginResult.Data.User.Tenant, wantDefault)
+
+	// /auth/me uses the same user shape.
+	me := request(h, "GET", "/api/v1/auth/me", "", loginResult.Data.AccessToken)
+	if me.Code != 200 {
+		t.Fatalf("me = %d %s", me.Code, me.Body.String())
+	}
+	var meResult struct {
+		Data auth.User `json:"data"`
+	}
+	if err := json.Unmarshal(me.Body.Bytes(), &meResult); err != nil {
+		t.Fatal(err)
+	}
+	assertTenant("me", meResult.Data.Tenant, wantDefault)
+
+	// A tenant-scoped login and its token carry that tenant's metadata.
+	w = request(h, "POST", "/api/v1/auth/login", `{"username":"other-admin","password":"other-password-01","tenantSlug":"other"}`, "")
+	if w.Code != 200 {
+		t.Fatalf("other login = %d %s", w.Code, w.Body.String())
+	}
+	var otherLogin struct {
+		Data auth.Tokens `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &otherLogin); err != nil {
+		t.Fatal(err)
+	}
+	assertTenant("other login", otherLogin.Data.User.Tenant, wantOther)
+	otherMe := request(h, "GET", "/api/v1/auth/me", "", otherLogin.Data.AccessToken)
+	if otherMe.Code != 200 {
+		t.Fatalf("other me = %d %s", otherMe.Code, otherMe.Body.String())
+	}
+	var otherMeResult struct {
+		Data auth.User `json:"data"`
+	}
+	if err := json.Unmarshal(otherMe.Body.Bytes(), &otherMeResult); err != nil {
+		t.Fatal(err)
+	}
+	assertTenant("other me", otherMeResult.Data.Tenant, wantOther)
+
+	// Administrator account payloads stay inside the caller's tenant: the
+	// listing and the creation response never carry the other tenant's object.
+	created := request(h, "POST", "/api/v1/users", `{"username":"meta-member","password":"meta-password-01","role":"member"}`, loginResult.Data.AccessToken)
+	if created.Code != 201 {
+		t.Fatalf("create user = %d %s", created.Code, created.Body.String())
+	}
+	var createdResult struct {
+		Data auth.User `json:"data"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdResult); err != nil {
+		t.Fatal(err)
+	}
+	assertTenant("created user", createdResult.Data.Tenant, wantDefault)
+
+	listed := request(h, "GET", "/api/v1/users?limit=100&offset=0", "", loginResult.Data.AccessToken)
+	if listed.Code != 200 {
+		t.Fatalf("list users = %d %s", listed.Code, listed.Body.String())
+	}
+	var page struct {
+		Data struct {
+			Items []auth.User `json:"items"`
+			Total int         `json:"total"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(listed.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Data.Total != 2 || len(page.Data.Items) != 2 {
+		t.Fatalf("default user listing = %d/%d", page.Data.Total, len(page.Data.Items))
+	}
+	for _, user := range page.Data.Items {
+		assertTenant("listed user", user.Tenant, wantDefault)
+	}
+}
+
 func TestHTTPLoginTenantSlug(t *testing.T) {
 	h, _, _ := tenantHTTPServer(t)
 	loginAs := func(body string) *httptest.ResponseRecorder {

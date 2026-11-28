@@ -9,7 +9,7 @@ interface SessionState {
   accessToken: string | null
   status: 'loading' | 'authenticated' | 'anonymous' | 'error'
   error: string | null
-  login: (username: string, password: string, remember: boolean) => Promise<void>
+  login: (username: string, password: string, remember: boolean, tenantSlug?: string) => Promise<void>
   restore: () => Promise<void>
   logout: () => Promise<void>
 }
@@ -36,10 +36,10 @@ try { localStorage.removeItem('gp_session') } catch { /* Storage may be disabled
 
 export const useSession = create<SessionState>(() => ({
   user: null, accessToken: null, status: 'loading', error: null,
-  login: async (username, password, remember) => {
+  login: async (username, password, remember, tenantSlug) => {
     const expected = ++revision
     await withSessionLock(async () => {
-      const session = await authAPI.login(username, password, remember)
+      const session = await authAPI.login(username, password, remember, tenantSlug)
       if (expected !== revision) return
       initialized = true
       apply(session)

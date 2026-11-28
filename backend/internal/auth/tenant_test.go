@@ -345,6 +345,76 @@ func TestLoginAuditRecordsTenantSlug(t *testing.T) {
 	}
 }
 
+// TestUserPayloadsCarryTenantMetadata proves that every path that returns a
+// user (login, refresh, token inspection, create and list) attaches the same
+// tenant identity, and that the metadata always belongs to the account's own
+// tenant rather than another tenant in the deployment.
+func TestUserPayloadsCarryTenantMetadata(t *testing.T) {
+	s, db := testService(t)
+	ctx := context.Background()
+	insertTenant(t, db, otherTenantID, "other", tenants.StatusActive)
+	insertTenantUser(t, db, otherTenantID, "other-admin", testPassword, "admin", "")
+
+	wantDefault := TenantInfo{ID: tenants.DefaultID, Slug: tenants.DefaultSlug, Name: "Default"}
+	wantOther := TenantInfo{ID: otherTenantID, Slug: "other", Name: "other"}
+	assertTenant := func(label string, got *TenantInfo, want TenantInfo) {
+		t.Helper()
+		if got == nil || *got != want {
+			t.Fatalf("%s tenant = %+v, want %+v", label, got, want)
+		}
+	}
+
+	defaultLogin := loginTest(t, s)
+	assertTenant("login", defaultLogin.User.Tenant, wantDefault)
+	// The metadata is never trusted from the client: no request can change it.
+	refreshed, err := s.Refresh(ctx, defaultLogin.RefreshToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTenant("refresh", refreshed.User.Tenant, wantDefault)
+	inspected, _, err := s.InspectToken(ctx, refreshed.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTenant("inspect", inspected.Tenant, wantDefault)
+
+	// A login scoped to the other tenant returns that tenant's metadata, and
+	// the token cannot be used to read the first tenant's context.
+	otherLogin, err := s.LoginWithTenant(ctx, "other", "other-admin", testPassword, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTenant("other login", otherLogin.User.Tenant, wantOther)
+	otherUser, _, err := s.InspectToken(ctx, otherLogin.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTenant("other inspect", otherUser.Tenant, wantOther)
+
+	// Account creation and listing attach the actor's tenant, never a tenant
+	// derived from input.
+	actor := Actor{ID: "actor-default-000000001", TenantID: tenants.DefaultID, Username: "admin", RequestID: "req-tenant"}
+	created, err := s.CreateUser(ctx, actor, "tenant-member", testPassword, "", "member")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTenant("created user", created.Tenant, wantDefault)
+	defaultUsers, total, err := s.ListUsersPage(ctx, tenants.DefaultID, 50, 0)
+	if err != nil || total != 2 {
+		t.Fatalf("default user page total = %d, %v", total, err)
+	}
+	for _, user := range defaultUsers {
+		assertTenant("listed default user", user.Tenant, wantDefault)
+	}
+	otherUsers, total, err := s.ListUsersPage(ctx, otherTenantID, 50, 0)
+	if err != nil || total != 1 {
+		t.Fatalf("other user page total = %d, %v", total, err)
+	}
+	for _, user := range otherUsers {
+		assertTenant("listed other user", user.Tenant, wantOther)
+	}
+}
+
 func TestOIDCAccountLinkageIsTenantScoped(t *testing.T) {
 	s, db := testService(t)
 	ctx := context.Background()

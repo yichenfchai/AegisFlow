@@ -114,16 +114,17 @@ func (s *Service) LoginOIDC(ctx context.Context, user User, requestID string) (*
 	// under the same transaction: a suspended tenant cannot start a session.
 	var current User
 	var disabled int
-	var tenantStatus string
-	err = tx.QueryRowContext(ctx, `SELECT `+qualifiedUserColumns+`,t.status FROM auth_users u
+	var tenantStatus, tenantSlug, tenantName string
+	err = tx.QueryRowContext(ctx, `SELECT `+qualifiedUserColumns+`,t.status,t.slug,t.name FROM auth_users u
 		JOIN tenants t ON t.id=u.tenant_id WHERE u.id=$1 FOR SHARE OF u, t`, user.ID).
-		Scan(&current.TenantID, &current.ID, &current.Username, &current.DisplayName, &current.Role, &disabled, &current.CreatedAt, &tenantStatus)
+		Scan(&current.TenantID, &current.ID, &current.Username, &current.DisplayName, &current.Role, &disabled, &current.CreatedAt, &tenantStatus, &tenantSlug, &tenantName)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrUnauthorized
 	}
 	if err != nil {
 		return nil, err
 	}
+	current.Tenant = tenantInfoOf(current.TenantID, tenantSlug, tenantName)
 	current.Disabled = disabled != 0
 	if current.Disabled {
 		return nil, ErrAccountDisabled
