@@ -34,6 +34,18 @@ Docker 未安装时，可单独启动 PostgreSQL/Redis，按 backend/.env.exampl
 - **证书**：可用 ACME webroot（样例保留了 `/.well-known/acme-challenge/`），续期后 `nginx -s reload`。证书私钥与 `AEGIS_JWT_SECRET` 一样属于需要备份的机密。
 - **数据库与 Redis**：样例 compose 中 `sslmode=disable` 且 Redis 无密码，仅适用于隔离本地网络。生产必须启用 PostgreSQL TLS、Redis 认证/TLS 与网络隔离；应用侧只改连接 URL，不改代码。
 
+## LDAP 目录认证部署与 TLS
+
+可选能力，未配置 `AEGIS_LDAP_URL` 时功能完全关闭（登录页与密码登录无变化、探针 `enabled=false`、登录 503），不需要任何目录侧准备。启用时：
+
+- **最小配置**：`AEGIS_LDAP_URL`（`ldaps://directory.example.com` 或 `ldap://...`）、`AEGIS_LDAP_BASE_DN`；其他变量按需设置，默认值见 [backend/.env.example](../backend/.env.example) 与 [后端文档](../backend/README.md)。只设置 URL 之外的任一 `AEGIS_LDAP_*` 会启动失败（fail closed）。
+- **传输加密是硬性要求**：生产必须使用 `ldaps://`（636）或 `ldap://` + `AEGIS_LDAP_STARTTLS=true`；明文 `ldap://` 仅允许 loopback（本地测试），远端明文会在启动时被拒绝。应用使用系统根证书做证书校验并强制 TLS 1.2+，没有跳过校验的配置项；企业私有 CA 需把 CA 证书装进运行镜像/宿主信任库（当前不支持在应用配置里单独指定 CA 文件），并在目标环境验证 StartTLS 证书链与主机名。
+- **服务账号**：`AEGIS_LDAP_BIND_DN`/`AEGIS_LDAP_BIND_PASSWORD` 成对配置（搜索需要 bind 时）；留空表示匿名搜索。凭据应由密钥注入工具/环境变量提供，不要写进镜像或提交到仓库；服务账号只需搜索权限。
+- **网络与高可用**：应用副本需要能访问目录的 389/636 端口（经防火墙白名单），目录不可达时登录返回 503 而不是拖垮进程；`AEGIS_LDAP_TIMEOUT`（默认 5s，最大 30s）限制单次认证，目录故障时注意与入口代理超时的关系。目录本身的高可用由目录侧负责。
+- **账号策略**：默认不自动开通（目录身份必须已关联本地账号）；`AEGIS_LDAP_AUTO_PROVISION=true` 时首登可创建 **member**（永不 admin），并写入请求的租户或 `AEGIS_DEFAULT_TENANT_SLUG` 默认租户，目录必须返回合法 `mail`。目录口令不落本地密码；已有账号的本地密码不受影响，目录账号与本地角色的对应关系由管理员通过本地账号维护（本批不做 LDAP 组→角色映射）。
+- **多租户**：同一份目录配置服务所有租户，账号按租户内用户名/邮箱关联；如需不同租户使用不同目录 BaseDN/服务账号，需要后续批次支持（当前不支持）。
+- **目录侧检查清单**：`AEGIS_LDAP_USER_FILTER` 恰好一个 `{username}` 且与目录属性匹配；`AEGIS_LDAP_BASE_DN` 下能搜到目标用户且 `username/email/displayName` 属性名正确；目录不允许匿名搜索时必须配置服务账号；口令策略、账号锁定与目录审计由目录侧负责，AegisFlow 只记录本地登录成功/自动开通审计。
+
 ## 前端静态资源
 
 前端是 Vite 构建的 SPA，生产由 TLS 入口同源托管（[nginx-tls.example.conf](nginx-tls.example.conf) 的 `root /usr/share/nginx/html` 与 `try_files ... /index.html`）；本地开发继续用 `npm run dev`（Vite 代理 `/api` 到 8080 入口），开发服务器不要对外提供服务。

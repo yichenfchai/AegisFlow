@@ -22,6 +22,9 @@ async function logout(page: Page) {
 test('真实登录、恢复、并发刷新、多标签页和退出撤销', async ({ page, context }) => {
   await page.goto('/settings')
   await expect(page).toHaveURL(/\/login/)
+  // LDAP 目录认证默认未配置：登录页不出现目录登录入口，仍显示既有占位按钮。
+  await expect(page.getByRole('button', { name: 'LDAP 登录', exact: true })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'LDAP 暂未配置' })).toBeVisible()
   await page.getByLabel('用户名', { exact: true }).fill(admin.username)
   await page.getByLabel('密码', { exact: true }).fill('incorrect-password')
   await page.getByRole('button', { name: '登录', exact: true }).click()

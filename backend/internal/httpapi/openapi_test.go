@@ -25,8 +25,10 @@ var openAPIMethods = map[string]bool{
 // requirement: login/refresh/logout rely on the Origin check (and, for
 // refresh/logout, the refresh cookie), the OIDC probe/start/callback are
 // browser navigations protected by the one-time state cookie (and the start
-// request carries no session yet), the health endpoints are not
-// session-scoped, and the signed ingest webhooks (external review results,
+// request carries no session yet), the LDAP probe is a public configuration
+// check and the LDAP login proves credentials against the external directory
+// while sharing the login rate limit and Origin rule, the health endpoints are
+// not session-scoped, and the signed ingest webhooks (external review results,
 // scan results, defense events) prove authorization with their X-AegisFlow HMAC
 // signature headers instead of a user session. Everything else under /api/v1
 // must document a security requirement. /healthz and /readyz are outside the
@@ -39,6 +41,8 @@ var publicOperations = map[string]bool{
 	"GET /api/v1/auth/oidc/config":                     true,
 	"GET /api/v1/auth/oidc/start":                      true,
 	"GET /api/v1/auth/oidc/callback":                   true,
+	"GET /api/v1/auth/ldap/config":                     true,
+	"POST /api/v1/auth/ldap/login":                     true,
 	"POST /api/v1/reviews/{reviewId}/external-results": true,
 	"POST /api/v1/projects/{projectId}/scans":          true,
 	"POST /api/v1/security-events":                     true,

@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { ApiError, authAPI, httpBlobRequest, httpRequest } from '@/api/http'
+import { ApiError, authAPI, httpBlobRequest, httpRequest, ldapAPI } from '@/api/http'
 import type { AuthSession, BlobPayload, SessionUser } from '@/api/http'
 import { errorText } from '@/api/errors'
 
@@ -10,6 +10,9 @@ interface SessionState {
   status: 'loading' | 'authenticated' | 'anonymous' | 'error'
   error: string | null
   login: (username: string, password: string, remember: boolean, tenantSlug?: string) => Promise<void>
+  // LDAP 目录登录：服务端校验目录口令并签发与密码登录相同的会话；没有
+  // remember 选项（目录表单不提供保持登录），因此使用非持久会话 Cookie。
+  loginLDAP: (username: string, password: string, tenantSlug?: string) => Promise<void>
   restore: () => Promise<void>
   logout: () => Promise<void>
 }
@@ -40,10 +43,14 @@ export const useSession = create<SessionState>(() => ({
     const expected = ++revision
     await withSessionLock(async () => {
       const session = await authAPI.login(username, password, remember, tenantSlug)
-      if (expected !== revision) return
-      initialized = true
-      apply(session)
-      channel?.postMessage({ type: 'changed' })
+      completeLogin(expected, session)
+    })
+  },
+  loginLDAP: async (username, password, tenantSlug) => {
+    const expected = ++revision
+    await withSessionLock(async () => {
+      const session = await ldapAPI.login(username, password, tenantSlug)
+      completeLogin(expected, session)
     })
   },
   restore: () => {
@@ -83,6 +90,16 @@ function apply(session: AuthSession) {
   expiresAt = Date.now() + accessLifetimeMs
   scheduleRefresh(Math.max(1000, session.expiresIn * 1000 - Math.min(30_000, session.expiresIn * 200)))
   useSession.setState({ user: session.user, accessToken: session.accessToken, status: 'authenticated', error: null })
+}
+/**
+ * 密码登录与 LDAP 登录共用的收尾逻辑：只有本次尝试仍是最新 revision 时才应用
+ * 会话并广播账号变化，避免并发登录互相覆盖。
+ */
+function completeLogin(expected: number, session: AuthSession) {
+  if (expected !== revision) return
+  initialized = true
+  apply(session)
+  channel?.postMessage({ type: 'changed' })
 }
 function clearSession() {
   clearTimeout(refreshTimer)

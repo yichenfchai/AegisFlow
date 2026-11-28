@@ -174,3 +174,27 @@ export interface OIDCConfig {
 export const oidcAPI = {
   config: () => httpRequest<OIDCConfig>('/auth/oidc/config'),
 }
+
+/**
+ * LDAP 目录认证可用性探针与登录（阶段 G）。
+ *
+ * 未配置 `AEGIS_LDAP_URL` 时后端返回 `{enabled:false,label:''}`，不泄露目录地址、
+ * BaseDN 或过滤器；登录页据此决定是否渲染目录入口，未启用时保持纯密码登录。
+ * 登录只复用 Cookie 之外没有任何本地凭证：服务端校验目录口令后签发与密码登录
+ * 相同的 refresh Cookie。
+ */
+export interface LDAPConfig {
+  enabled: boolean
+  label: string
+}
+
+export const ldapAPI = {
+  config: () => httpRequest<LDAPConfig>('/auth/ldap/config'),
+  // tenantSlug 只在用户显式填写时提交；空串会被后端严格 JSON 校验拒绝，
+  // 省略该字段才保持「跨租户唯一标识」的既有契约。
+  login: (username: string, password: string, tenantSlug?: string) =>
+    httpRequest<AuthSession>('/auth/ldap/login', {
+      method: 'POST',
+      body: JSON.stringify(tenantSlug ? { username, password, tenantSlug } : { username, password }),
+    }),
+}

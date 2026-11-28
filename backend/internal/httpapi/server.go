@@ -226,6 +226,12 @@ func New(service *auth.Service, logger *slog.Logger, ready func(context.Context)
 	authRoutes.GET("/oidc/config", s.oidcConfig)
 	authRoutes.GET("/oidc/start", s.oidcStart)
 	authRoutes.GET("/oidc/callback", s.oidcCallback)
+	// LDAP directory authentication (phase G): the probe is always registered
+	// and answers enabled=false when the feature is unconfigured; the login
+	// route stays registered too but answers 503 while disabled (documented
+	// choice: an operator can tell "not configured" from "wrong path").
+	authRoutes.GET("/ldap/config", s.ldapConfig)
+	authRoutes.POST("/ldap/login", s.ldapLogin)
 	authRoutes.GET("/me", s.authenticate(), s.me)
 	authRoutes.POST("/password", s.authenticate(), s.changePassword)
 	authRoutes.GET("/sessions", s.authenticate(), s.listSessions)
@@ -1892,6 +1898,17 @@ func (s *Server) authError(c *gin.Context, err error) {
 		s.fail(c, 404, "not_found", "resource not found")
 	case errors.Is(err, auth.ErrAccountDisabled):
 		s.fail(c, 403, "account_disabled", "account is disabled; contact an administrator")
+	case errors.Is(err, auth.ErrAccountNotFound):
+		// Directory authentication succeeded but no local account is linked and
+		// auto-provisioning is off (or the requested tenant is unknown).
+		s.fail(c, 403, "account_not_found", "account is not provisioned; contact an administrator")
+	case errors.Is(err, auth.ErrDirectoryEmailMissing):
+		// Auto-provisioning needs a trusted directory email; refuse explicitly
+		// instead of inventing an address.
+		s.fail(c, 403, "account_not_found", "the ldap directory returned no valid email; automatic provisioning requires one")
+	case errors.Is(err, auth.ErrDependencyUnavailable):
+		// The directory endpoint and its diagnostics never reach the client.
+		s.fail(c, 503, "dependencies_unavailable", "dependencies unavailable")
 	default:
 		s.logger.ErrorContext(c.Request.Context(), "request failed", "requestId", c.Request.Context().Value(requestIDKey), "error", err)
 		s.fail(c, 500, "internal_error", "internal server error")

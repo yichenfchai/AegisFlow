@@ -36,6 +36,20 @@ var (
 	// more than one tenant, so the client must retry with tenantSlug. It is a
 	// client-correctable 400, not an authentication failure.
 	ErrTenantRequired = errors.New("tenant required")
+	// ErrAccountNotFound reports a directory identity (LDAP) that has no linked
+	// local account and cannot be auto-provisioned. It is answered as 403
+	// account_not_found.
+	ErrAccountNotFound = errors.New("account not found")
+	// ErrDependencyUnavailable reports that an external authentication
+	// dependency (currently the LDAP directory) could not serve the request.
+	// It is answered 503 dependencies_unavailable with a generic message so the
+	// internal endpoint and directory error never reach the client.
+	ErrDependencyUnavailable = errors.New("dependency unavailable")
+	// ErrDirectoryEmailMissing reports that auto-provisioning was requested but
+	// the directory returned no usable email address. A member account is only
+	// created from a trusted directory email, so this refuses instead of
+	// inventing one.
+	ErrDirectoryEmailMissing = errors.New("directory email missing")
 )
 
 const (
@@ -113,6 +127,12 @@ type Service struct {
 	// login after the password comparison and before the session transaction so
 	// the login/revocation race is reproducible deterministically.
 	testHookAfterPasswordCheck func()
+	// ldapDirectory is the optional external directory authenticator (phase G).
+	// Nil keeps directory login completely disabled.
+	ldapDirectory LDAPDirectory
+	// ldapAutoProvision enables the member-only auto-provision policy for a
+	// directory identity without a linked local account.
+	ldapAutoProvision bool
 }
 
 // afterPasswordCheck runs the test-only hook; production services keep it nil.

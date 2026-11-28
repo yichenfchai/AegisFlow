@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,14 @@ func testServer(t *testing.T) (http.Handler, *auth.Service) {
 // pass explicit deployment options (for example ShutdownContext).
 func testServerWithOptions(t *testing.T, options Options) (http.Handler, *auth.Service) {
 	t.Helper()
+	handler, service, _ := testServerWithDB(t, options)
+	return handler, service
+}
+
+// testServerWithDB is testServerWithOptions plus the real PostgreSQL pool, for
+// tests that need to inspect rows (for example LDAP account linkage).
+func testServerWithDB(t *testing.T, options Options) (http.Handler, *auth.Service, *sql.DB) {
+	t.Helper()
 	db := testutil.OpenPostgres(t)
 	s := auth.New(db, strings.Repeat("k", 32), time.Minute, time.Hour)
 	if err := s.Migrate(context.Background()); err != nil {
@@ -55,7 +64,7 @@ func testServerWithOptions(t *testing.T, options Options) (http.Handler, *auth.S
 	if options.Builds == nil {
 		options.Builds = pipeline
 	}
-	return New(s, logger, db.PingContext, []string{"http://localhost:5173"}, options), s
+	return New(s, logger, db.PingContext, []string{"http://localhost:5173"}, options), s, db
 }
 func request(h http.Handler, method, path, body, token string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
