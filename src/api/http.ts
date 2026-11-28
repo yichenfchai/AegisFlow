@@ -7,11 +7,21 @@ import {
 
 export { ApiError } from './errors'
 
+/**
+ * 当前会话所属的租户（工作空间）元数据。`id` 只在服务端使用；界面展示 `name`
+ * 并在 title/提示里使用 `slug`，登录歧义时把 `slug` 作为 tenantSlug 提交。
+ */
+export interface TenantInfo {
+  id: string
+  slug: string
+  name: string
+}
 export interface SessionUser {
   id: string
   username: string
   displayName: string
   role: 'admin' | 'member' | 'viewer'
+  tenant: TenantInfo
 }
 export interface AuthSession {
   user: SessionUser
@@ -138,7 +148,14 @@ export async function httpBlobRequest(
   return { blob: await response.blob(), headers: response.headers }
 }
 export const authAPI = {
-  login: (username: string, password: string, remember: boolean) => httpRequest<AuthSession>('/auth/login', { method: 'POST', body: JSON.stringify({ username, password, remember }) }),
+  // tenantSlug is only sent when the caller resolved a workspace; the backend
+  // rejects an empty string, and omitting it keeps the single-tenant login
+  // contract (the identifier must then be unique across tenants).
+  login: (username: string, password: string, remember: boolean, tenantSlug?: string) =>
+    httpRequest<AuthSession>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify(tenantSlug ? { username, password, remember, tenantSlug } : { username, password, remember }),
+    }),
   refresh: () => httpRequest<AuthSession>('/auth/refresh', { method: 'POST', body: '{}' }),
   logout: () => httpRequest<{ loggedOut: boolean }>('/auth/logout', { method: 'POST', body: '{}' }),
   me: (token: string) => httpRequest<SessionUser>('/auth/me', {}, token),

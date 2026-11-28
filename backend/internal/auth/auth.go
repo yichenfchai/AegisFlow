@@ -62,13 +62,25 @@ type Actor struct {
 	RequestID string
 }
 
-// User is a local account. A user belongs to exactly one tenant: TenantID is
-// part of the user's identity but is not part of the public JSON yet (the
-// tenant metadata surface is delivered with the frontend batch).
+// TenantInfo is the public tenant metadata attached to every user payload: the
+// account's workspace identity. It is deliberately limited to id/slug/name —
+// status, timestamps and credentials are never exposed through it. Clients use
+// the slug to show the current workspace and to send tenantSlug on a login that
+// is ambiguous across tenants.
+type TenantInfo struct {
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	Name string `json:"name"`
+}
+
+// User is a local account. A user belongs to exactly one tenant. TenantID is
+// the server-side scope that bounds every read/write and is not part of the
+// public JSON; Tenant is the public metadata view of that tenant (id/slug/name).
 type User struct {
-	ID       string `json:"id"`
-	TenantID string `json:"-"`
-	Username string `json:"username"`
+	ID       string      `json:"id"`
+	TenantID string      `json:"-"`
+	Tenant   *TenantInfo `json:"tenant"`
+	Username string      `json:"username"`
 	// DisplayName is the human-facing name.
 	DisplayName string `json:"displayName"`
 	// Role is the tenant-scoped role. It bounds what the actor may see and do.
@@ -320,13 +332,17 @@ func (s *Service) createUserInTenant(ctx context.Context, actor Actor, tenantID,
 	if n == 0 {
 		return nil, fmt.Errorf("%w: username already exists", ErrConflict)
 	}
+	tenant, err := loadTenantInfo(ctx, tx, tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if err = s.writeAudit(ctx, tx, actor, ActionUserCreate, "user", id, ResultSuccess, username); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &User{ID: id, TenantID: tenantID, Username: username, DisplayName: displayName, Role: role, CreatedAt: now}, nil
+	return &User{ID: id, TenantID: tenantID, Tenant: tenant, Username: username, DisplayName: displayName, Role: role, CreatedAt: now}, nil
 }
 
 // isForeignKeyViolation reports a PostgreSQL foreign-key failure. The tenant CLI
@@ -345,6 +361,23 @@ func scanUser(row interface{ Scan(dest ...any) error }) (*User, error) {
 	}
 	u.Disabled = disabled != 0
 	return &u, nil
+}
+
+// tenantInfoOf builds the public tenant metadata from a joined tenants row.
+func tenantInfoOf(id, slug, name string) *TenantInfo {
+	return &TenantInfo{ID: id, Slug: slug, Name: name}
+}
+
+// loadTenantInfo resolves the public tenant metadata for a server-derived
+// tenant id. Login/refresh/token inspection already join the tenants table and
+// build the same object inline; the account-listing and account-creation paths
+// use this helper so every user payload carries an identical tenant object.
+func loadTenantInfo(ctx context.Context, q tenants.Querier, tenantID string) (*TenantInfo, error) {
+	tenant, err := tenants.ByID(ctx, q, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return tenantInfoOf(tenant.ID, tenant.Slug, tenant.Name), nil
 }
 
 const userColumns = `tenant_id,id,username,display_name,role,disabled,created_at`
@@ -375,7 +408,18 @@ func (s *Service) ListUsers(ctx context.Context, tenantID string) ([]User, error
 		}
 		users = append(users, *u)
 	}
-	return users, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	// Every listed user belongs to the same tenant; resolve the metadata once.
+	tenant, err := loadTenantInfo(ctx, s.db, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range users {
+		users[i].Tenant = tenant
+	}
+	return users, nil
 }
 
 // Login keeps the original Go API for non-HTTP callers; sessions default to
@@ -401,12 +445,15 @@ func comparePassword(hash, password string) bool {
 }
 
 // loginCandidate is one row resolved by the login lookup (before the password
-// comparison and before the session transaction).
+// comparison and before the session transaction). It also carries the tenant
+// identity so a successful login returns the tenant metadata without an extra
+// round trip.
 type loginCandidate struct {
 	user         User
 	hash         string
 	disabled     int
 	tenantSlug   string
+	tenantName   string
 	tenantStatus string
 }
 
@@ -417,19 +464,20 @@ type loginCandidate struct {
 //     ErrUnauthorized, more than one is ErrTenantRequired (the caller must pick
 //     the workspace), one match logs in.
 func (s *Service) lookupLoginUser(ctx context.Context, tenantSlug, username string) (*loginCandidate, error) {
-	const columns = `u.tenant_id,u.id,u.username,u.display_name,u.role,u.password_hash,u.disabled,u.created_at,t.slug,t.status`
+	const columns = `u.tenant_id,u.id,u.username,u.display_name,u.role,u.password_hash,u.disabled,u.created_at,t.slug,t.name,t.status`
 	if tenantSlug != "" {
 		var c loginCandidate
 		err := s.db.QueryRowContext(ctx, `SELECT `+columns+` FROM auth_users u
 			JOIN tenants t ON t.id=u.tenant_id
 			WHERE t.slug=$1 AND lower(u.username)=lower($2)`, tenantSlug, username).
-			Scan(&c.user.TenantID, &c.user.ID, &c.user.Username, &c.user.DisplayName, &c.user.Role, &c.hash, &c.disabled, &c.user.CreatedAt, &c.tenantSlug, &c.tenantStatus)
+			Scan(&c.user.TenantID, &c.user.ID, &c.user.Username, &c.user.DisplayName, &c.user.Role, &c.hash, &c.disabled, &c.user.CreatedAt, &c.tenantSlug, &c.tenantName, &c.tenantStatus)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrUnauthorized
 		}
 		if err != nil {
 			return nil, err
 		}
+		c.user.Tenant = tenantInfoOf(c.user.TenantID, c.tenantSlug, c.tenantName)
 		return &c, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+columns+` FROM auth_users u
@@ -442,9 +490,10 @@ func (s *Service) lookupLoginUser(ctx context.Context, tenantSlug, username stri
 	var candidates []loginCandidate
 	for rows.Next() {
 		var c loginCandidate
-		if err = rows.Scan(&c.user.TenantID, &c.user.ID, &c.user.Username, &c.user.DisplayName, &c.user.Role, &c.hash, &c.disabled, &c.user.CreatedAt, &c.tenantSlug, &c.tenantStatus); err != nil {
+		if err = rows.Scan(&c.user.TenantID, &c.user.ID, &c.user.Username, &c.user.DisplayName, &c.user.Role, &c.hash, &c.disabled, &c.user.CreatedAt, &c.tenantSlug, &c.tenantName, &c.tenantStatus); err != nil {
 			return nil, err
 		}
+		c.user.Tenant = tenantInfoOf(c.user.TenantID, c.tenantSlug, c.tenantName)
 		candidates = append(candidates, c)
 	}
 	if err = rows.Err(); err != nil {
@@ -613,12 +662,13 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*Tokens, er
 	var u User
 	var expires int64
 	var revoked, remember, consumed, disabled int
-	var sessionTenantID, tenantStatus string
-	if err = tx.QueryRowContext(ctx, `SELECT u.tenant_id,u.id,u.username,u.display_name,u.role,u.created_at,s.tenant_id,s.expires_at,s.revoked,s.remember,u.disabled,t.status
+	var sessionTenantID, tenantStatus, tenantSlug, tenantName string
+	if err = tx.QueryRowContext(ctx, `SELECT u.tenant_id,u.id,u.username,u.display_name,u.role,u.created_at,s.tenant_id,s.expires_at,s.revoked,s.remember,u.disabled,t.status,t.slug,t.name
  FROM auth_sessions s JOIN auth_users u ON u.id=s.user_id JOIN tenants t ON t.id=u.tenant_id WHERE s.id=$1`, sid).
-		Scan(&u.TenantID, &u.ID, &u.Username, &u.DisplayName, &u.Role, &u.CreatedAt, &sessionTenantID, &expires, &revoked, &remember, &disabled, &tenantStatus); err != nil {
+		Scan(&u.TenantID, &u.ID, &u.Username, &u.DisplayName, &u.Role, &u.CreatedAt, &sessionTenantID, &expires, &revoked, &remember, &disabled, &tenantStatus, &tenantSlug, &tenantName); err != nil {
 		return nil, err
 	}
+	u.Tenant = tenantInfoOf(u.TenantID, tenantSlug, tenantName)
 	if err = tx.QueryRowContext(ctx, `SELECT consumed FROM auth_refresh_tokens WHERE token_hash=$1 AND session_id=$2 FOR UPDATE`, hash, sid).Scan(&consumed); err != nil {
 		return nil, err
 	}
@@ -732,18 +782,20 @@ func (s *Service) InspectToken(ctx context.Context, accessToken string) (*User, 
 		return nil, "", ErrUnauthorized
 	}
 	var u User
-	err = s.db.QueryRowContext(ctx, `SELECT u.tenant_id,u.id,u.username,u.display_name,u.role,u.created_at FROM auth_sessions s
+	var tenantSlug, tenantName string
+	err = s.db.QueryRowContext(ctx, `SELECT u.tenant_id,u.id,u.username,u.display_name,u.role,u.created_at,t.slug,t.name FROM auth_sessions s
 	 JOIN auth_users u ON u.id=s.user_id JOIN tenants t ON t.id=u.tenant_id
 	 WHERE s.id=$1 AND s.user_id=$2 AND s.tenant_id=$3 AND u.tenant_id=$3
 	   AND t.status='active' AND s.revoked=0 AND s.expires_at>$4 AND u.disabled=0`,
 		claims.SessionID, claims.Subject, claims.TenantID, time.Now().Unix()).
-		Scan(&u.TenantID, &u.ID, &u.Username, &u.DisplayName, &u.Role, &u.CreatedAt)
+		Scan(&u.TenantID, &u.ID, &u.Username, &u.DisplayName, &u.Role, &u.CreatedAt, &tenantSlug, &tenantName)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", ErrUnauthorized
 	}
 	if err != nil {
 		return nil, "", err
 	}
+	u.Tenant = tenantInfoOf(u.TenantID, tenantSlug, tenantName)
 	return &u, claims.SessionID, nil
 }
 

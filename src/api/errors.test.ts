@@ -18,6 +18,7 @@ const CONTRACT_CODES = [
   'conflict',
   'rate_limited',
   'account_disabled',
+  'tenant_required',
   'origin_denied',
   'not_ready',
   'dependencies_unavailable',
@@ -36,6 +37,10 @@ describe('apiErrorText', () => {
 
   it('also localizes the documented invalid_request code', () => {
     expect(apiErrorText('invalid_request')).toBe('请求参数不合法，请检查后重试')
+  })
+
+  it('maps tenant_required to the workspace prompt shown by the login page', () => {
+    expect(apiErrorText('tenant_required')).toBe('该邮箱存在于多个工作空间，请输入工作空间标识')
   })
 
   it('appends the Retry-After seconds to rate_limited', () => {

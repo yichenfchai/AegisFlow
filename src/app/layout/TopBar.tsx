@@ -90,9 +90,18 @@ export function TopBar({ onOpenPalette }: { onOpenPalette?: () => void }) {
         </div>
       )}
       <div className="relative flex items-center gap-space-md" ref={menuRef}>
-        <div className="text-right leading-tight">
-          <div className="text-body-sm text-on-surface font-medium">{user?.displayName ?? user?.username}</div>
-          <div className="text-label-sm text-outline">{user?.role ? ROLE_TEXT[user.role] ?? user.role : ''}</div>
+        <div className="text-right leading-tight min-w-0 max-w-[200px]">
+          <div className="text-body-sm text-on-surface font-medium truncate">{user?.displayName ?? user?.username}</div>
+          {/* 当前工作空间（租户）：显示名称，slug 放在 title；窄屏只保留名称。 */}
+          {user?.tenant && (
+            <div className="text-label-sm text-outline truncate" title={user.tenant.slug} data-testid="current-tenant">
+              {user.tenant.name}
+              <span className="hidden sm:inline">{user?.role ? ` · ${ROLE_TEXT[user.role] ?? user.role}` : ''}</span>
+            </div>
+          )}
+          {!user?.tenant && (
+            <div className="text-label-sm text-outline">{user?.role ? ROLE_TEXT[user.role] ?? user.role : ''}</div>
+          )}
         </div>
         <button
           type="button"
@@ -114,7 +123,12 @@ export function TopBar({ onOpenPalette }: { onOpenPalette?: () => void }) {
           >
             <div className="px-space-md py-space-sm border-b border-surface-container-highest mb-space-xs">
               <div className="text-body-sm text-on-surface font-medium truncate">{user?.displayName ?? user?.username}</div>
-              <div className="text-label-sm text-outline">{user?.username}</div>
+              <div className="text-label-sm text-outline truncate">{user?.username}</div>
+              {user?.tenant && (
+                <div className="text-label-sm text-outline truncate" title={user.tenant.slug}>
+                  工作空间：{user.tenant.name}（{user.tenant.slug}）
+                </div>
+              )}
             </div>
             <Link
               role="menuitem"

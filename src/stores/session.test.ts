@@ -11,9 +11,16 @@ interface TestUser {
   username: string
   displayName: string
   role: 'admin' | 'member' | 'viewer'
+  tenant: { id: string; slug: string; name: string }
 }
 
-const user: TestUser = { id: 'u1', username: 'admin', displayName: 'Admin', role: 'admin' }
+const user: TestUser = {
+  id: 'u1',
+  username: 'admin',
+  displayName: 'Admin',
+  role: 'admin',
+  tenant: { id: 'tenant_default_0000000000000001', slug: 'default', name: 'Default' },
+}
 const sessionPayload = { user, accessToken: 'at-1', expiresIn: 900 }
 const expiredPayload = { user, accessToken: 'at-1', expiresIn: -1 }
 
@@ -74,7 +81,32 @@ describe('session store', () => {
     expect(state.status).toBe('authenticated')
     expect(state.accessToken).toBe('at-1')
     expect(state.user?.username).toBe('admin')
+    // The tenant metadata returned by login is kept for the app shell.
+    expect(state.user?.tenant).toEqual({ id: 'tenant_default_0000000000000001', slug: 'default', name: 'Default' })
     expect(posted).toEqual([{ type: 'changed' }])
+  })
+
+  it('login sends tenantSlug only when a workspace was resolved', async () => {
+    const { useSession } = await freshStore()
+    const bodies: Array<Record<string, unknown>> = []
+    fetchMock = (url, init) => {
+      if (url.includes('/auth/login')) {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+        return jsonResponse(200, sessionPayload)
+      }
+      return jsonResponse(404, null)
+    }
+    await useSession.getState().login('admin', 'pw', true)
+    await useSession.getState().login('admin', 'pw', true, 'acme')
+    expect(bodies[0]).toEqual({ username: 'admin', password: 'pw', remember: true })
+    expect(bodies[1]).toEqual({ username: 'admin', password: 'pw', remember: true, tenantSlug: 'acme' })
+  })
+
+  it('restore saves the tenant metadata returned by /auth/me', async () => {
+    const { useSession } = await freshStore()
+    fetchMock = (url) => (url.includes('/auth/refresh') ? jsonResponse(200, sessionPayload) : jsonResponse(200, user))
+    await useSession.getState().restore()
+    expect(useSession.getState().user?.tenant.name).toBe('Default')
   })
 
   it('failed login stays anonymous and surfaces the API error', async () => {
@@ -209,6 +241,8 @@ describe('session store', () => {
     expect(posted).toEqual([{ type: 'changed' }])
     await useSession.getState().logout()
     expect(useSession.getState().status).toBe('anonymous')
+    // Logout clears the user object, so the tenant metadata disappears with it.
+    expect(useSession.getState().user).toBeNull()
     expect(posted).toEqual([{ type: 'changed' }, { type: 'logout' }])
   })
 
@@ -231,6 +265,16 @@ describe('session store', () => {
     const error = await useSession.getState().login('admin', 'pw', false).catch((cause: unknown) => cause)
     expect(errorMessage(error)).toBe('账号已被禁用，请联系管理员')
     expect(errorMessage(error)).not.toContain('api message')
+  })
+
+  it('login surfaces the workspace prompt for a tenant_required failure', async () => {
+    const { useSession, errorMessage } = await freshStore()
+    fetchMock = () => jsonResponse(400, null, 'tenant_required')
+    const error = await useSession.getState().login('admin', 'pw', false).catch((cause: unknown) => cause)
+    expect(errorMessage(error)).toBe('该邮箱存在于多个工作空间，请输入工作空间标识')
+    // No half-authenticated state: the failed attempt keeps the user empty.
+    expect(useSession.getState().user).toBeNull()
+    expect(useSession.getState().accessToken).toBeNull()
   })
 
   it('restore localizes a backend error instead of showing its English message', async () => {
