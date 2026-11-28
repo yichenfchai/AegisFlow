@@ -8,20 +8,20 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"strings"
-	"testing"
-
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
+	"strings"
+	"testing"
 )
 
 // testSecretKey is a fixed 32-byte AES key used only by this test binary.
 var testSecretKey = []byte("0123456789abcdef0123456789abcdef")
 
 var (
-	adminActor  = auth.Actor{ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-admin"}
-	memberActor = auth.Actor{ID: "member-000000000000001", Username: "mia", Role: "member", RequestID: "req-member"}
+	adminActor  = auth.Actor{TenantID: tenants.DefaultID, ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-admin"}
+	memberActor = auth.Actor{TenantID: tenants.DefaultID, ID: "member-000000000000001", Username: "mia", Role: "member", RequestID: "req-member"}
 )
 
 const testSecretValue = "super-secret-value-123"
@@ -33,8 +33,8 @@ func testService(t *testing.T) (*Service, *sql.DB) {
 		t.Fatal(err)
 	}
 	for _, actor := range []auth.Actor{adminActor, memberActor} {
-		if _, err := db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role)
-		 VALUES($1,$2,'unused',$2,$3)`, actor.ID, actor.Username, actor.Role); err != nil {
+		if _, err := db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role,tenant_id)
+		 VALUES($1,$2,'unused',$2,$3,$4)`, actor.ID, actor.Username, actor.Role, tenants.DefaultID); err != nil {
 			t.Fatal(err)
 		}
 	}

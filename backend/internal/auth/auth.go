@@ -1,5 +1,7 @@
 // Package auth implements persistent local users and revocable JWT sessions.
 // Callers must enforce admin authorization before invoking CreateUser/ListUsers.
+// Every user and session belongs to exactly one tenant; the tenant is carried by
+// the JWT `tid` claim and re-verified against the database on every request.
 package auth
 
 import (
@@ -18,6 +20,8 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 )
 
 var (
@@ -27,6 +31,10 @@ var (
 	ErrValidation      = errors.New("validation failed")
 	ErrNotFound        = errors.New("not found")
 	ErrAccountDisabled = errors.New("account disabled")
+	// ErrTenantRequired reports an ambiguous login: the identifier exists in
+	// more than one tenant, so the client must retry with tenantSlug. It is a
+	// client-correctable 400, not an authentication failure.
+	ErrTenantRequired = errors.New("tenant required")
 )
 
 const (
@@ -41,23 +49,31 @@ var idPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
 
 func ValidID(id string) bool { return idPattern.MatchString(id) }
 
-// Actor identifies who performed an auditable operation. RequestID links the
-// audit row to the structured request log. Role is the caller's global role as
-// read for this request; it bounds what the actor may see and do, so callers
-// must never derive it from client-supplied input.
+// Actor identifies who performed an auditable operation. TenantID is the
+// caller's tenant and bounds every read/write of this actor; callers must never
+// derive it (or Role) from client-supplied input. RequestID links the audit row
+// to the structured request log.
 type Actor struct {
 	ID        string
+	TenantID  string
 	Username  string
 	Role      string
 	RequestID string
 }
 
+// User is a local account. A user belongs to exactly one tenant: TenantID is
+// part of the user's identity but is not part of the public JSON yet (the
+// tenant metadata surface is delivered with the frontend batch).
 type User struct {
-	ID          string `json:"id"`
-	Username    string `json:"username"`
+	ID       string `json:"id"`
+	TenantID string `json:"-"`
+	Username string `json:"username"`
+	// DisplayName is the human-facing name.
 	DisplayName string `json:"displayName"`
-	Role        string `json:"role"`
-	Disabled    bool   `json:"disabled"`
+	// Role is the tenant-scoped role. It bounds what the actor may see and do.
+	Role string `json:"role"`
+	// Disabled accounts cannot log in and have no active sessions.
+	Disabled bool `json:"disabled"`
 	// Zero means unknown for rows created before the timestamp migration.
 	CreatedAt int64 `json:"createdAt"`
 }
@@ -76,6 +92,10 @@ type Service struct {
 	secret     []byte
 	accessTTL  time.Duration
 	refreshTTL time.Duration
+	// defaultTenantSlug is the deployment's default tenant slug
+	// (AEGIS_DEFAULT_TENANT_SLUG). It selects where system/identity operations
+	// land and is overridden by EnsureDefaultTenant at startup.
+	defaultTenantSlug string
 	// testHookAfterPasswordCheck is nil in production. Tests use it to pause a
 	// login after the password comparison and before the session transaction so
 	// the login/revocation race is reproducible deterministically.
@@ -91,11 +111,46 @@ func (s *Service) afterPasswordCheck() {
 
 type accessClaims struct {
 	SessionID string `json:"sid"`
+	// TenantID is the tenant the session was opened for. A token without it is
+	// treated as unauthenticated; InspectToken also requires the session and
+	// user rows to carry the same tenant.
+	TenantID string `json:"tid"`
 	jwt.RegisteredClaims
 }
 
 func New(db *sql.DB, secret string, accessTTL, refreshTTL time.Duration) *Service {
-	return &Service{db: db, secret: []byte(secret), accessTTL: accessTTL, refreshTTL: refreshTTL}
+	return &Service{db: db, secret: []byte(secret), accessTTL: accessTTL, refreshTTL: refreshTTL, defaultTenantSlug: tenants.DefaultSlug}
+}
+
+// tenantSlug returns the configured default tenant slug.
+func (s *Service) tenantSlug() string {
+	if s.defaultTenantSlug == "" {
+		return tenants.DefaultSlug
+	}
+	return s.defaultTenantSlug
+}
+
+// EnsureDefaultTenant verifies (and, for a renamed seed, performs) the startup
+// default-tenant guarantee and remembers the configured slug for later system
+// operations. It must run after Migrate and before Bootstrap.
+func (s *Service) EnsureDefaultTenant(ctx context.Context, slug string) (*tenants.Tenant, error) {
+	if err := s.valid(); err != nil {
+		return nil, err
+	}
+	tenant, err := tenants.EnsureDefault(ctx, s.db, slug)
+	if err != nil {
+		return nil, err
+	}
+	s.defaultTenantSlug = slug
+	return tenant, nil
+}
+
+// DefaultTenant resolves the deployment's default tenant row.
+func (s *Service) DefaultTenant(ctx context.Context) (*tenants.Tenant, error) {
+	if err := s.valid(); err != nil {
+		return nil, err
+	}
+	return tenants.BySlug(ctx, s.db, s.tenantSlug())
 }
 
 func (s *Service) valid() error {
@@ -103,6 +158,24 @@ func (s *Service) valid() error {
 		return fmt.Errorf("%w: database, secret and positive token TTLs are required", ErrValidation)
 	}
 	return nil
+}
+
+// requireTenantID validates a tenant scope supplied by an authenticated caller.
+// Operations without a tenant fail closed instead of silently falling back to
+// another tenant's rows.
+func requireTenantID(tenantID string) error {
+	if !ValidID(tenantID) {
+		return fmt.Errorf("%w: tenant is required", ErrValidation)
+	}
+	return nil
+}
+
+// actorTenantID extracts the tenant scope of an audited actor.
+func actorTenantID(actor Actor) (string, error) {
+	if err := requireTenantID(actor.TenantID); err != nil {
+		return "", err
+	}
+	return actor.TenantID, nil
 }
 
 func validateUser(username, password, displayName, role string) error {
@@ -121,7 +194,9 @@ func validateUser(username, password, displayName, role string) error {
 	return nil
 }
 
-// Bootstrap atomically creates the first user only; existing installations are unchanged.
+// Bootstrap atomically creates the first user only; existing installations are
+// unchanged. The administrator is created inside the deployment's default
+// tenant, because no other tenant can exist in phase F1.
 func (s *Service) Bootstrap(ctx context.Context, username, password string) error {
 	if err := s.valid(); err != nil {
 		return err
@@ -145,17 +220,27 @@ func (s *Service) Bootstrap(ctx context.Context, username, password string) erro
 	if err = advisoryLock(ctx, tx, "bootstrap"); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO auth_users(id,username,password_hash,display_name,role,disabled,created_at)
-	 SELECT $1,$2,$3,$4,'admin',0,$5 WHERE NOT EXISTS(SELECT 1 FROM auth_users)`, id, username, string(hash), username, time.Now().Unix())
+	tenant, err := tenants.BySlug(ctx, tx, s.tenantSlug())
+	if err != nil {
+		return fmt.Errorf("bootstrap: default tenant %q is unavailable (run migrations and startup tenant check first): %w", s.tenantSlug(), err)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO auth_users(id,tenant_id,username,password_hash,display_name,role,disabled,created_at)
+	 SELECT $1,$2,$3,$4,$5,'admin',0,$6 WHERE NOT EXISTS(SELECT 1 FROM auth_users)`,
+		id, tenant.ID, username, string(hash), username, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("bootstrap: %w", err)
 	}
 	return tx.Commit()
 }
 
-// CreateUser does not authorize the caller; the HTTP layer must require an admin.
+// CreateUser does not authorize the caller; the HTTP layer must require an
+// admin. The new account always belongs to the actor's tenant.
 func (s *Service) CreateUser(ctx context.Context, actor Actor, username, password, displayName, role string) (*User, error) {
 	if err := s.valid(); err != nil {
+		return nil, err
+	}
+	tenantID, err := actorTenantID(actor)
+	if err != nil {
 		return nil, err
 	}
 	if displayName == "" {
@@ -178,8 +263,9 @@ func (s *Service) CreateUser(ctx context.Context, actor Actor, username, passwor
 	}
 	defer tx.Rollback()
 	now := time.Now().Unix()
-	result, err := tx.ExecContext(ctx, `INSERT INTO auth_users(id,username,password_hash,display_name,role,disabled,created_at)
-	 VALUES($1,$2,$3,$4,$5,0,$6) ON CONFLICT (lower(username)) DO NOTHING`, id, username, string(hash), displayName, role, now)
+	result, err := tx.ExecContext(ctx, `INSERT INTO auth_users(id,tenant_id,username,password_hash,display_name,role,disabled,created_at)
+	 VALUES($1,$2,$3,$4,$5,$6,0,$7) ON CONFLICT (tenant_id, lower(username)) DO NOTHING`,
+		id, tenantID, username, string(hash), displayName, role, now)
 	if err != nil {
 		return nil, err
 	}
@@ -196,26 +282,35 @@ func (s *Service) CreateUser(ctx context.Context, actor Actor, username, passwor
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &User{ID: id, Username: username, DisplayName: displayName, Role: role, CreatedAt: now}, nil
+	return &User{ID: id, TenantID: tenantID, Username: username, DisplayName: displayName, Role: role, CreatedAt: now}, nil
 }
 
 func scanUser(row interface{ Scan(dest ...any) error }) (*User, error) {
 	var u User
 	var disabled int
-	if err := row.Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &disabled, &u.CreatedAt); err != nil {
+	if err := row.Scan(&u.TenantID, &u.ID, &u.Username, &u.DisplayName, &u.Role, &disabled, &u.CreatedAt); err != nil {
 		return nil, err
 	}
 	u.Disabled = disabled != 0
 	return &u, nil
 }
 
-const userColumns = `id,username,display_name,role,disabled,created_at`
+const userColumns = `tenant_id,id,username,display_name,role,disabled,created_at`
 
-func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
+// qualifiedUserColumns is userColumns for queries that join auth_users with
+// another table; every column is qualified so shared names (id) stay unambiguous.
+const qualifiedUserColumns = `u.tenant_id,u.id,u.username,u.display_name,u.role,u.disabled,u.created_at`
+
+// ListUsers returns the users of one tenant. It exists for non-HTTP callers;
+// the admin HTTP route uses ListUsersPage.
+func (s *Service) ListUsers(ctx context.Context, tenantID string) ([]User, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+userColumns+` FROM auth_users ORDER BY lower(username),id`)
+	if err := requireTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+userColumns+` FROM auth_users WHERE tenant_id=$1 ORDER BY lower(username),id`, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +326,8 @@ func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 	return users, rows.Err()
 }
 
-// Login keeps the original Go API for non-HTTP callers; sessions default to non-persistent.
+// Login keeps the original Go API for non-HTTP callers; sessions default to
+// non-persistent and the login identifier must be unique across tenants.
 func (s *Service) Login(ctx context.Context, username, password string) (*Tokens, error) {
 	return s.LoginWithRemember(ctx, username, password, false, "")
 }
@@ -252,23 +348,97 @@ func comparePassword(hash, password string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
-func (s *Service) LoginWithRemember(ctx context.Context, username, password string, remember bool, requestID string) (*Tokens, error) {
-	if err := s.valid(); err != nil {
-		return nil, err
+// loginCandidate is one row resolved by the login lookup (before the password
+// comparison and before the session transaction).
+type loginCandidate struct {
+	user         User
+	hash         string
+	disabled     int
+	tenantSlug   string
+	tenantStatus string
+}
+
+// lookupLoginUser resolves the login identifier to a candidate:
+//   - with a tenant slug, only that tenant is searched; an unknown tenant and an
+//     unknown username are indistinguishable (ErrUnauthorized);
+//   - without a slug, the identifier is searched across tenants. Zero matches is
+//     ErrUnauthorized, more than one is ErrTenantRequired (the caller must pick
+//     the workspace), one match logs in.
+func (s *Service) lookupLoginUser(ctx context.Context, tenantSlug, username string) (*loginCandidate, error) {
+	const columns = `u.tenant_id,u.id,u.username,u.display_name,u.role,u.password_hash,u.disabled,u.created_at,t.slug,t.status`
+	if tenantSlug != "" {
+		var c loginCandidate
+		err := s.db.QueryRowContext(ctx, `SELECT `+columns+` FROM auth_users u
+			JOIN tenants t ON t.id=u.tenant_id
+			WHERE t.slug=$1 AND lower(u.username)=lower($2)`, tenantSlug, username).
+			Scan(&c.user.TenantID, &c.user.ID, &c.user.Username, &c.user.DisplayName, &c.user.Role, &c.hash, &c.disabled, &c.user.CreatedAt, &c.tenantSlug, &c.tenantStatus)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrUnauthorized
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &c, nil
 	}
-	var u User
-	var hash string
-	var disabled int
-	err := s.db.QueryRowContext(ctx, `SELECT id,username,display_name,role,password_hash,disabled,created_at FROM auth_users WHERE lower(username)=lower($1)`, username).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &hash, &disabled, &u.CreatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		// A fixed valid bcrypt hash keeps unknown-user failures comparable to bad passwords.
-		comparePassword(dummyPasswordHash, password)
-		s.afterPasswordCheck()
-		return nil, ErrUnauthorized
-	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+columns+` FROM auth_users u
+		JOIN tenants t ON t.id=u.tenant_id
+		WHERE lower(u.username)=lower($1) ORDER BY u.tenant_id,u.id LIMIT 2`, username)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
+	var candidates []loginCandidate
+	for rows.Next() {
+		var c loginCandidate
+		if err = rows.Scan(&c.user.TenantID, &c.user.ID, &c.user.Username, &c.user.DisplayName, &c.user.Role, &c.hash, &c.disabled, &c.user.CreatedAt, &c.tenantSlug, &c.tenantStatus); err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, c)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	switch len(candidates) {
+	case 0:
+		return nil, ErrUnauthorized
+	case 1:
+		c := candidates[0]
+		return &c, nil
+	default:
+		// Deliberately no password comparison: the response (400 tenant_required)
+		// is chosen before credentials are checked, which is what lets a client
+		// re-submit with the tenant slug.
+		return nil, ErrTenantRequired
+	}
+}
+
+// LoginWithRemember keeps the original no-tenant-slug contract for callers that
+// are not the HTTP login handler.
+func (s *Service) LoginWithRemember(ctx context.Context, username, password string, remember bool, requestID string) (*Tokens, error) {
+	return s.LoginWithTenant(ctx, "", username, password, remember, requestID)
+}
+
+// LoginWithTenant resolves the tenant, verifies the credentials and opens a
+// revocable session bound to that tenant. A non-empty tenantSlug scopes the
+// lookup; an empty one accepts only an identifier unique across tenants.
+func (s *Service) LoginWithTenant(ctx context.Context, tenantSlug, username, password string, remember bool, requestID string) (*Tokens, error) {
+	if err := s.valid(); err != nil {
+		return nil, err
+	}
+	if tenantSlug != "" && !tenants.ValidSlug(tenantSlug) {
+		return nil, fmt.Errorf("%w: tenantSlug must be 1-32 lowercase letters, digits and inner hyphens", ErrValidation)
+	}
+	candidate, err := s.lookupLoginUser(ctx, tenantSlug, username)
+	if err != nil {
+		if errors.Is(err, ErrUnauthorized) {
+			// A fixed valid bcrypt hash keeps unknown-user/unknown-tenant failures
+			// comparable to bad passwords.
+			comparePassword(dummyPasswordHash, password)
+			s.afterPasswordCheck()
+		}
+		return nil, err
+	}
+	u := candidate.user
 	if len(password) > 72 {
 		// bcrypt refuses inputs over 72 bytes without hashing them. Without this
 		// branch a long password would skip bcrypt entirely and return measurably
@@ -279,14 +449,19 @@ func (s *Service) LoginWithRemember(ctx context.Context, username, password stri
 		s.afterPasswordCheck()
 		return nil, ErrUnauthorized
 	}
-	matched := comparePassword(hash, password)
+	matched := comparePassword(candidate.hash, password)
 	s.afterPasswordCheck()
 	if !matched {
 		return nil, ErrUnauthorized
 	}
 	// Only report the disabled state once the caller proved knowledge of the password.
-	if disabled != 0 {
+	if candidate.disabled != 0 {
 		return nil, ErrAccountDisabled
+	}
+	// A suspended tenant cannot authenticate; report the same bare contract as a
+	// bad credential so tenant state is not disclosed without authorization.
+	if candidate.tenantStatus != tenants.StatusActive {
+		return nil, ErrUnauthorized
 	}
 	sid, err := randomToken(18)
 	if err != nil {
@@ -307,24 +482,27 @@ func (s *Service) LoginWithRemember(ctx context.Context, username, password stri
 		return nil, err
 	}
 	defer tx.Rollback()
-	// Re-check the user row under a share lock before creating the session.
-	// ChangePassword, ResetPassword and UpdateUser update auth_users before they
-	// revoke sessions, so their row lock conflicts with this one: either the
-	// revocation committed first (and the stale password/disabled state read
-	// above is rejected here) or this login commits first and the revocation
-	// revokes the session it just created. Without the lock a login that started
-	// before the revocation could insert a session after it, leaving a session
-	// alive that the "revoke immediately" contract says must not exist.
-	var lockedHash string
+	// Re-check the user and tenant rows under share locks before creating the
+	// session. ChangePassword, ResetPassword and UpdateUser update auth_users
+	// before they revoke sessions, so their row lock conflicts with this one:
+	// either the revocation committed first (and the stale password/disabled/
+	// tenant state read above is rejected here) or this login commits first and
+	// the revocation revokes the session it just created. Without the lock a
+	// login that started before the revocation could insert a session after it,
+	// leaving a session alive that the "revoke immediately" contract says must
+	// not exist.
+	var lockedHash, lockedTenantID, lockedTenantStatus string
 	var lockedDisabled int
-	err = tx.QueryRowContext(ctx, `SELECT password_hash,disabled FROM auth_users WHERE id=$1 FOR SHARE`, u.ID).Scan(&lockedHash, &lockedDisabled)
+	err = tx.QueryRowContext(ctx, `SELECT u.password_hash,u.disabled,u.tenant_id,t.status FROM auth_users u
+		JOIN tenants t ON t.id=u.tenant_id WHERE u.id=$1 FOR SHARE OF u, t`, u.ID).
+		Scan(&lockedHash, &lockedDisabled, &lockedTenantID, &lockedTenantStatus)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrUnauthorized
 	}
 	if err != nil {
 		return nil, err
 	}
-	if lockedHash != hash {
+	if lockedHash != candidate.hash {
 		// The password changed while bcrypt was running; verify the credential
 		// against the committed hash instead of trusting the stale comparison.
 		if !comparePassword(lockedHash, password) {
@@ -334,17 +512,22 @@ func (s *Service) LoginWithRemember(ctx context.Context, username, password stri
 	if lockedDisabled != 0 {
 		return nil, ErrAccountDisabled
 	}
+	if lockedTenantID != u.TenantID || lockedTenantStatus != tenants.StatusActive {
+		return nil, ErrUnauthorized
+	}
 	rememberInt := 0
 	if remember {
 		rememberInt = 1
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_sessions(id,user_id,expires_at,remember,created_at) VALUES($1,$2,$3,$4,$5)`, sid, u.ID, expires, rememberInt, now); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_sessions(id,tenant_id,user_id,expires_at,remember,created_at) VALUES($1,$2,$3,$4,$5,$6)`, sid, u.TenantID, u.ID, expires, rememberInt, now); err != nil {
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_refresh_tokens(token_hash,session_id) VALUES($1,$2)`, hashToken(refresh), sid); err != nil {
 		return nil, err
 	}
-	if err = s.writeAudit(ctx, tx, Actor{ID: u.ID, Username: u.Username, RequestID: requestID}, ActionLogin, "user", u.ID, ResultSuccess, ""); err != nil {
+	// The tenant slug is recorded for forensic clarity; it is not a secret.
+	detail := "tenant=" + candidate.tenantSlug
+	if err = s.writeAudit(ctx, tx, Actor{ID: u.ID, TenantID: u.TenantID, Username: u.Username, RequestID: requestID}, ActionLogin, "user", u.ID, ResultSuccess, detail); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -378,8 +561,10 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*Tokens, er
 	var u User
 	var expires int64
 	var revoked, remember, consumed, disabled int
-	if err = tx.QueryRowContext(ctx, `SELECT u.id,u.username,u.display_name,u.role,u.created_at,s.expires_at,s.revoked,s.remember,u.disabled
- FROM auth_sessions s JOIN auth_users u ON u.id=s.user_id WHERE s.id=$1`, sid).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &u.CreatedAt, &expires, &revoked, &remember, &disabled); err != nil {
+	var sessionTenantID, tenantStatus string
+	if err = tx.QueryRowContext(ctx, `SELECT u.tenant_id,u.id,u.username,u.display_name,u.role,u.created_at,s.tenant_id,s.expires_at,s.revoked,s.remember,u.disabled,t.status
+ FROM auth_sessions s JOIN auth_users u ON u.id=s.user_id JOIN tenants t ON t.id=u.tenant_id WHERE s.id=$1`, sid).
+		Scan(&u.TenantID, &u.ID, &u.Username, &u.DisplayName, &u.Role, &u.CreatedAt, &sessionTenantID, &expires, &revoked, &remember, &disabled, &tenantStatus); err != nil {
 		return nil, err
 	}
 	if err = tx.QueryRowContext(ctx, `SELECT consumed FROM auth_refresh_tokens WHERE token_hash=$1 AND session_id=$2 FOR UPDATE`, hash, sid).Scan(&consumed); err != nil {
@@ -398,6 +583,18 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*Tokens, er
 	// Disabled accounts must not rotate refresh tokens either: a disable revokes
 	// sessions, but checking here also rejects a session that raced the revoke.
 	if revoked != 0 || disabled != 0 || expires <= time.Now().Unix() {
+		return nil, ErrUnauthorized
+	}
+	// Tenant isolation: the session row must carry the user's current tenant and
+	// the tenant must be active. A mismatch (for example a forged or stale row)
+	// or a suspended tenant revokes the session permanently, not just the token.
+	if sessionTenantID != u.TenantID || tenantStatus != tenants.StatusActive {
+		if _, err = tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked=1 WHERE id=$1`, sid); err != nil {
+			return nil, err
+		}
+		if err = tx.Commit(); err != nil {
+			return nil, err
+		}
 		return nil, ErrUnauthorized
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE auth_refresh_tokens SET consumed=1 WHERE token_hash=$1`, hash); err != nil {
@@ -465,7 +662,9 @@ func (s *Service) Authenticate(ctx context.Context, accessToken string) (*User, 
 }
 
 // InspectToken additionally returns the session id so callers can identify the
-// current session when listing or selectively revoking sessions.
+// current session when listing or selectively revoking sessions. The JWT must
+// carry a tenant claim, and the session, user and tenant rows must all agree on
+// it and be active; anything else is unauthenticated.
 func (s *Service) InspectToken(ctx context.Context, accessToken string) (*User, string, error) {
 	if err := s.valid(); err != nil {
 		return nil, "", err
@@ -477,12 +676,16 @@ func (s *Service) InspectToken(ctx context.Context, accessToken string) (*User, 
 		}
 		return s.secret, nil
 	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithIssuer(Issuer), jwt.WithAudience(Audience), jwt.WithExpirationRequired(), jwt.WithIssuedAt())
-	if err != nil || !token.Valid || claims.Subject == "" || claims.SessionID == "" {
+	if err != nil || !token.Valid || claims.Subject == "" || claims.SessionID == "" || claims.TenantID == "" {
 		return nil, "", ErrUnauthorized
 	}
 	var u User
-	err = s.db.QueryRowContext(ctx, `SELECT u.id,u.username,u.display_name,u.role,u.created_at FROM auth_sessions s
-	 JOIN auth_users u ON u.id=s.user_id WHERE s.id=$1 AND s.user_id=$2 AND s.revoked=0 AND s.expires_at>$3 AND u.disabled=0`, claims.SessionID, claims.Subject, time.Now().Unix()).Scan(&u.ID, &u.Username, &u.DisplayName, &u.Role, &u.CreatedAt)
+	err = s.db.QueryRowContext(ctx, `SELECT u.tenant_id,u.id,u.username,u.display_name,u.role,u.created_at FROM auth_sessions s
+	 JOIN auth_users u ON u.id=s.user_id JOIN tenants t ON t.id=u.tenant_id
+	 WHERE s.id=$1 AND s.user_id=$2 AND s.tenant_id=$3 AND u.tenant_id=$3
+	   AND t.status='active' AND s.revoked=0 AND s.expires_at>$4 AND u.disabled=0`,
+		claims.SessionID, claims.Subject, claims.TenantID, time.Now().Unix()).
+		Scan(&u.TenantID, &u.ID, &u.Username, &u.DisplayName, &u.Role, &u.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", ErrUnauthorized
 	}
@@ -501,7 +704,17 @@ func (s *Service) issue(u User, sid, refresh string, sessionExpires int64, remem
 	if expires <= now {
 		return nil, ErrUnauthorized
 	}
-	claims := accessClaims{SessionID: sid, RegisteredClaims: jwt.RegisteredClaims{Issuer: Issuer, Subject: u.ID, Audience: jwt.ClaimStrings{Audience}, IssuedAt: jwt.NewNumericDate(time.Unix(now, 0)), ExpiresAt: jwt.NewNumericDate(time.Unix(expires, 0))}}
+	claims := accessClaims{
+		SessionID: sid,
+		TenantID:  u.TenantID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    Issuer,
+			Subject:   u.ID,
+			Audience:  jwt.ClaimStrings{Audience},
+			IssuedAt:  jwt.NewNumericDate(time.Unix(now, 0)),
+			ExpiresAt: jwt.NewNumericDate(time.Unix(expires, 0)),
+		},
+	}
 	access, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.secret)
 	if err != nil {
 		return nil, err

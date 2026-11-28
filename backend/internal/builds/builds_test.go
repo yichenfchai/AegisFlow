@@ -4,18 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
+	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
+	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
-	"github.com/yichenfchai/AegisFlow/backend/internal/dbmigrate"
-	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
-	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
-var testActor = auth.Actor{ID: "actor-000000000000001", Username: "tester", Role: "member", RequestID: "req-builds"}
+var testActor = auth.Actor{TenantID: tenants.DefaultID, ID: "actor-000000000000001", Username: "tester", Role: "member", RequestID: "req-builds"}
 
 func testService(t *testing.T) (*Service, *projects.Service) {
 	t.Helper()
@@ -389,10 +389,10 @@ func TestBuildOutputRedactsMultilinePrivateKey(t *testing.T) {
 }
 
 // outsiderActor is a global member who is not a member of the private project.
-var outsiderActor = auth.Actor{ID: "outsider-0000000000001", Username: "otto", Role: "member", RequestID: "req-outsider"}
+var outsiderActor = auth.Actor{TenantID: tenants.DefaultID, ID: "outsider-0000000000001", Username: "otto", Role: "member", RequestID: "req-outsider"}
 
 // adminActor bypasses project visibility entirely.
-var adminActor = auth.Actor{ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-admin"}
+var adminActor = auth.Actor{TenantID: tenants.DefaultID, ID: "admin-0000000000000001", Username: "root", Role: "admin", RequestID: "req-admin"}
 
 func TestBuildReadsFollowProjectVisibility(t *testing.T) {
 	s, registry := testService(t)
@@ -537,8 +537,8 @@ func TestBuildWritesNeedMaintainerOnPrivateProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Membership references a real account; builds tests create no users.
-	if _, err = s.db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role)
-	 VALUES($1,$2,'unused',$2,'member')`, outsiderActor.ID, outsiderActor.Username); err != nil {
+	if _, err = s.db.Exec(`INSERT INTO auth_users(id,username,password_hash,display_name,role,tenant_id)
+	 VALUES($1,$2,'unused',$2,'member',$3)`, outsiderActor.ID, outsiderActor.Username, tenants.DefaultID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = registry.AddMember(ctx, adminActor, private.ID, outsiderActor.ID, projects.RoleViewer); err != nil {

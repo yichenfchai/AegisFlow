@@ -25,6 +25,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/projects"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 )
 
 var (
@@ -121,6 +122,11 @@ type Options struct {
 	// *http.Transport; a fully custom RoundTripper dials on its own and must
 	// provide an equivalent guard itself.
 	HTTPClient *http.Client
+	// DefaultTenantID is the deployment's tenant for system-generated audit rows
+	// (approval expiry), which have no actor. Phase F1 has exactly one tenant;
+	// business-table tenant isolation arrives with the next batch. Empty falls
+	// back to the seeded default tenant id.
+	DefaultTenantID string
 }
 
 // Target is the public view of a deployment target. Secret material is never
@@ -216,6 +222,10 @@ type Service struct {
 	rekeyBeforeWrite func(targetID string)
 	// leaseRetry overrides the standby lease retry in tests.
 	leaseRetry time.Duration
+	// defaultTenantID scopes system-generated audit rows (approval expiry has
+	// no actor). Phase F1 has a single tenant; deployment rows themselves are
+	// not tenant-scoped yet and get their tenant in the business-isolation batch.
+	defaultTenantID string
 }
 
 // New builds the registry and deployment service. A nil HTTPClient uses a
@@ -282,6 +292,10 @@ func New(db *sql.DB, opts Options) *Service {
 	if healthAttempts < 0 {
 		healthAttempts = 0
 	}
+	defaultTenantID := opts.DefaultTenantID
+	if defaultTenantID == "" {
+		defaultTenantID = tenants.DefaultID
+	}
 	return &Service{
 		db:                     db,
 		projects:               opts.Projects,
@@ -302,6 +316,7 @@ func New(db *sql.DB, opts Options) *Service {
 		healthInterval:         healthInterval,
 		notificationClaimLease: claimLease,
 		leaseRetry:             defaultLeaseRetry,
+		defaultTenantID:        defaultTenantID,
 	}
 }
 
@@ -381,8 +396,8 @@ func writeAuditObject(ctx context.Context, tx *sql.Tx, actor auth.Actor, action,
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO auth_audit(id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,'success',$8,$9)`, id, time.Now().Unix(), actor.ID, actor.Username, action, objectType, objectID, detail, actor.RequestID)
+	_, err = tx.ExecContext(ctx, `INSERT INTO auth_audit(id,tenant_id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,'success',$9,$10)`, id, actor.TenantID, time.Now().Unix(), actor.ID, actor.Username, action, objectType, objectID, detail, actor.RequestID)
 	return err
 }
 

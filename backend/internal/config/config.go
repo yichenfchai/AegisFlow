@@ -16,6 +16,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 )
 
 type Config struct {
@@ -97,6 +99,12 @@ type Config struct {
 	// review gate is opt-in so an upgrade keeps the previous deployment
 	// behavior, and only the three documented environments are valid.
 	RequireReviewEnvironments []string
+	// DefaultTenantSlug is the deployment's default tenant slug
+	// (AEGIS_DEFAULT_TENANT_SLUG). Startup renames the seeded tenant when the
+	// configured slug differs and no other tenant exists, and fails when the
+	// slug is still missing, so a misconfigured deployment never starts with an
+	// unreachable default tenant.
+	DefaultTenantSlug string
 }
 
 // OIDCConfig is the OIDC single sign-on configuration (P5 batch D). Issuer is
@@ -195,6 +203,13 @@ func Load() (Config, error) {
 	}
 	if len(c.JWTSecret) < 32 {
 		return c, errors.New("AEGIS_JWT_SECRET must contain at least 32 bytes")
+	}
+	// The default tenant exists in every deployment; phase F1 never creates a
+	// second one. The slug is validated here so a bad value fails startup rather
+	// than surfacing during the tenant lookup below.
+	c.DefaultTenantSlug = env("AEGIS_DEFAULT_TENANT_SLUG", tenants.DefaultSlug)
+	if !tenants.ValidSlug(c.DefaultTenantSlug) {
+		return c, errors.New("AEGIS_DEFAULT_TENANT_SLUG must be 1-32 lowercase ASCII letters, digits and inner hyphens, and must not start or end with a hyphen")
 	}
 	if _, _, err := net.SplitHostPort(c.Address); err != nil {
 		return c, fmt.Errorf("AEGIS_HTTP_ADDR: %w", err)

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 )
 
 // TestFindUserByEmailLinksOnlyStoredEmails verifies the OIDC account-linkage
@@ -13,10 +15,10 @@ import (
 func TestFindUserByEmailLinksOnlyStoredEmails(t *testing.T) {
 	s, db := testService(t)
 	ctx := context.Background()
-	if _, err := s.FindUserByEmail(ctx, "admin@example.com"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.FindUserByEmail(ctx, tenants.DefaultID, "admin@example.com"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("account without email matched: %v", err)
 	}
-	if _, err := s.FindUserByEmail(ctx, "   "); !errors.Is(err, ErrValidation) {
+	if _, err := s.FindUserByEmail(ctx, tenants.DefaultID, "   "); !errors.Is(err, ErrValidation) {
 		t.Fatalf("empty email accepted: %v", err)
 	}
 	member, err := s.CreateUser(ctx, testActor, "mail-user", testPassword, "", "member")
@@ -26,7 +28,7 @@ func TestFindUserByEmailLinksOnlyStoredEmails(t *testing.T) {
 	if _, err = db.Exec(`UPDATE auth_users SET email='Person@Example.com' WHERE id=$1`, member.ID); err != nil {
 		t.Fatal(err)
 	}
-	found, err := s.FindUserByEmail(ctx, "person@example.COM")
+	found, err := s.FindUserByEmail(ctx, tenants.DefaultID, "person@example.COM")
 	if err != nil || found.ID != member.ID {
 		t.Fatalf("case-insensitive email lookup = %+v, %v", found, err)
 	}
@@ -47,7 +49,7 @@ func TestProvisionOIDCUserCreatesMemberOnly(t *testing.T) {
 	ctx := context.Background()
 	// "admin" collides with the bootstrap administrator, so a suffix is added
 	// instead of touching the existing account.
-	user, err := s.ProvisionOIDCUser(ctx, "admin", "SSO Admin Candidate", "admin@example.com", "req-provision")
+	user, err := s.ProvisionOIDCUser(ctx, tenants.DefaultID, "admin", "SSO Admin Candidate", "admin@example.com", "req-provision")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +68,7 @@ func TestProvisionOIDCUserCreatesMemberOnly(t *testing.T) {
 		t.Fatalf("provisioned account accepted a password: %v", err)
 	}
 	// A retried first login for the same verified email reuses the account.
-	again, err := s.ProvisionOIDCUser(ctx, "someone-else", "", "ADMIN@example.com", "req-provision-2")
+	again, err := s.ProvisionOIDCUser(ctx, tenants.DefaultID, "someone-else", "", "ADMIN@example.com", "req-provision-2")
 	if err != nil || again.ID != user.ID {
 		t.Fatalf("same email did not reuse account: %+v, %v", again, err)
 	}
@@ -99,7 +101,7 @@ func TestLoginOIDCIssuesNormalSession(t *testing.T) {
 	if _, err = db.Exec(`UPDATE auth_users SET email='sso-member@example.com' WHERE id=$1`, member.ID); err != nil {
 		t.Fatal(err)
 	}
-	linked, err := s.FindUserByEmail(ctx, "sso-member@example.com")
+	linked, err := s.FindUserByEmail(ctx, tenants.DefaultID, "sso-member@example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,10 +139,10 @@ func TestLoginOIDCIssuesNormalSession(t *testing.T) {
 func TestRecordOIDCLoginFailureStoresOnlyFixedCodes(t *testing.T) {
 	s, db := testService(t)
 	ctx := context.Background()
-	if err := s.RecordOIDCLoginFailure(ctx, "req-failure", "invalid_token", nil); err != nil {
+	if err := s.RecordOIDCLoginFailure(ctx, "", "req-failure", "invalid_token", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RecordOIDCLoginFailure(ctx, "req-failure-2", "provider said: upstream secret", nil); err != nil {
+	if err := s.RecordOIDCLoginFailure(ctx, "", "req-failure-2", "provider said: upstream secret", nil); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := db.QueryContext(ctx, `SELECT detail FROM auth_audit WHERE action=$1 AND result=$2 ORDER BY created_at, detail`, ActionLogin, ResultFailure)

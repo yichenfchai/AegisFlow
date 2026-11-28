@@ -33,7 +33,7 @@ func (s *Server) exportAuditCSV(c *gin.Context) {
 	if !ok {
 		return
 	}
-	entries, truncated, err := s.auth.ExportAudit(c.Request.Context(), filter, auditExportLimit)
+	entries, truncated, err := s.auth.ExportAudit(c.Request.Context(), actorFrom(c).TenantID, filter, auditExportLimit)
 	if err != nil {
 		s.authError(c, err)
 		return

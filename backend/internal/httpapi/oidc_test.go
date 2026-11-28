@@ -23,6 +23,7 @@ import (
 
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
 	"github.com/yichenfchai/AegisFlow/backend/internal/oidc"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
@@ -498,7 +499,7 @@ func refreshWithCookie(t *testing.T, h http.Handler, cookie *http.Cookie) auth.T
 
 func linkedMember(t *testing.T, service *auth.Service, db *sql.DB, username, email string) *auth.User {
 	t.Helper()
-	user, err := service.CreateUser(context.Background(), auth.Actor{}, username, "a-strong-password", "", "member")
+	user, err := service.CreateUser(context.Background(), auth.Actor{TenantID: tenants.DefaultID}, username, "a-strong-password", "", "member")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -692,7 +693,7 @@ func TestOIDCDisabledAccountIsRefused(t *testing.T) {
 	idp := newFakeOIDCProvider(t)
 	h, service, db := oidcTestServer(t, idp, false, "企业单点登录", Options{})
 	member := linkedMember(t, service, db, "disabled-sso", "disabled@example.com")
-	if err := service.SetUserDisabled(context.Background(), auth.Actor{}, member.ID, true); err != nil {
+	if err := service.SetUserDisabled(context.Background(), auth.Actor{TenantID: tenants.DefaultID}, member.ID, true); err != nil {
 		t.Fatal(err)
 	}
 	idp.setIdentity(fakeOIDCIdentity{email: "disabled@example.com", preferredUsername: "disabled", name: "Disabled", emailVerified: true})

@@ -247,9 +247,9 @@ func writeAudit(ctx context.Context, tx *sql.Tx, actor auth.Actor, action, objec
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO auth_audit(id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,'success',$8,$9)`,
-		id, time.Now().Unix(), actor.ID, actor.Username, action, ObjectType, objectID, detail, actor.RequestID)
+	_, err = tx.ExecContext(ctx, `INSERT INTO auth_audit(id,tenant_id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,'success',$9,$10)`,
+		id, actor.TenantID, time.Now().Unix(), actor.ID, actor.Username, action, ObjectType, objectID, detail, actor.RequestID)
 	return err
 }
 

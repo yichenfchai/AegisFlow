@@ -29,7 +29,7 @@ func unsetEnv(t *testing.T, key string) {
 
 func setup(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_SECRET_KEY_PREVIOUS", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_DEPLOY_HEALTH_ATTEMPTS", "AEGIS_DEPLOY_HEALTH_INTERVAL", "AEGIS_APPROVAL_TTL", "AEGIS_APPROVAL_WEBHOOK_URL", "AEGIS_APPROVAL_WEBHOOK_SECRET", "AEGIS_APPROVAL_WEBHOOK_TIMEOUT", "AEGIS_REVIEW_WEBHOOK_SECRET", "AEGIS_INGEST_WEBHOOK_SECRET", "AEGIS_OIDC_ISSUER", "AEGIS_OIDC_CLIENT_ID", "AEGIS_OIDC_CLIENT_SECRET", "AEGIS_OIDC_REDIRECT_URL", "AEGIS_OIDC_SCOPES", "AEGIS_OIDC_AUTO_PROVISION", "AEGIS_OIDC_LABEL", "AEGIS_OIDC_DISCOVERY_TIMEOUT"} {
+	for _, key := range []string{"AEGIS_HTTP_ADDR", "AEGIS_DATABASE_PATH", "AEGIS_BOOTSTRAP_USERNAME", "AEGIS_BOOTSTRAP_PASSWORD", "AEGIS_ACCESS_TTL", "AEGIS_REFRESH_TTL", "AEGIS_ALLOWED_ORIGINS", "AEGIS_COOKIE_SECURE", "AEGIS_BUILD_SANDBOX", "AEGIS_BUILD_IMAGE", "AEGIS_BUILD_CPU", "AEGIS_BUILD_MEMORY", "AEGIS_BUILD_PIDS", "AEGIS_BUILD_USER", "AEGIS_BUILD_DISK", "AEGIS_BUILD_CLONE", "AEGIS_BUILD_ALLOW_LOCAL_REPO", "AEGIS_AUDIT_RETENTION", "AEGIS_METRICS_ADDR", "AEGIS_SECRET_KEY", "AEGIS_SECRET_KEY_PREVIOUS", "AEGIS_DEPLOY_CHECK_TIMEOUT", "AEGIS_DEPLOY_TIMEOUT", "AEGIS_DEPLOY_HEALTH_ATTEMPTS", "AEGIS_DEPLOY_HEALTH_INTERVAL", "AEGIS_APPROVAL_TTL", "AEGIS_APPROVAL_WEBHOOK_URL", "AEGIS_APPROVAL_WEBHOOK_SECRET", "AEGIS_APPROVAL_WEBHOOK_TIMEOUT", "AEGIS_REVIEW_WEBHOOK_SECRET", "AEGIS_INGEST_WEBHOOK_SECRET", "AEGIS_DEFAULT_TENANT_SLUG", "AEGIS_OIDC_ISSUER", "AEGIS_OIDC_CLIENT_ID", "AEGIS_OIDC_CLIENT_SECRET", "AEGIS_OIDC_REDIRECT_URL", "AEGIS_OIDC_SCOPES", "AEGIS_OIDC_AUTO_PROVISION", "AEGIS_OIDC_LABEL", "AEGIS_OIDC_DISCOVERY_TIMEOUT"} {
 		t.Setenv(key, "")
 	}
 	unsetEnv(t, "AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS")
@@ -841,4 +841,48 @@ func TestOIDCConfig(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestDefaultTenantSlugConfig pins the AEGIS_DEFAULT_TENANT_SLUG contract: the
+// documented slug shape (1-32 lowercase letters, digits and inner hyphens) and
+// the "default" fallback when the variable is unset.
+func TestDefaultTenantSlugConfig(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    string
+		invalid bool
+	}{
+		{"", "default", false},
+		{"default", "default", false},
+		{"acme", "acme", false},
+		{"acme-corp", "acme-corp", false},
+		{"a", "a", false},
+		{"team-01", "team-01", false},
+		{strings.Repeat("a", 32), strings.Repeat("a", 32), false},
+		{"-acme", "", true},
+		{"acme-", "", true},
+		{"Acme", "", true},
+		{"acme corp", "", true},
+		{"acme_corp", "", true},
+		{"中", "", true},
+		{strings.Repeat("a", 33), "", true},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			setup(t)
+			t.Setenv("AEGIS_DEFAULT_TENANT_SLUG", tc.value)
+			c, err := Load()
+			if tc.invalid {
+				if err == nil {
+					t.Fatalf("slug %q accepted", tc.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("slug %q rejected: %v", tc.value, err)
+			}
+			if c.DefaultTenantSlug != tc.want {
+				t.Fatalf("DefaultTenantSlug = %q, want %q", c.DefaultTenantSlug, tc.want)
+			}
+		})
+	}
 }

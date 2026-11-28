@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 )
 
 func TestChangePassword(t *testing.T) {
@@ -178,7 +180,7 @@ func TestSessionsListAndRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := s.ListSessions(ctx, user.ID, sid)
+	sessions, err := s.ListSessions(ctx, user.ID, tenants.DefaultID, sid)
 	if err != nil || len(sessions) != 2 {
 		t.Fatalf("sessions=%+v err=%v", sessions, err)
 	}
@@ -212,7 +214,7 @@ func TestSessionsListAndRevoke(t *testing.T) {
 	if err = s.RevokeSession(ctx, testActor, user.ID, "missing-0000000000000001"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown session error = %v", err)
 	}
-	if sessions, err = s.ListSessions(ctx, user.ID, sid); err != nil || len(sessions) != 1 || !sessions[0].Current {
+	if sessions, err = s.ListSessions(ctx, user.ID, tenants.DefaultID, sid); err != nil || len(sessions) != 1 || !sessions[0].Current {
 		t.Fatalf("session list after revoke: %+v %v", sessions, err)
 	}
 	third, err := s.Login(ctx, "admin", testPassword)
@@ -239,7 +241,7 @@ func TestAuditTrailAndPagination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actor := Actor{ID: user.ID, Username: user.Username, RequestID: "req-audit"}
+	actor := Actor{ID: user.ID, TenantID: user.TenantID, Username: user.Username, RequestID: "req-audit"}
 	created, err := s.CreateUser(ctx, actor, "audited-member", testPassword, "", "member")
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +259,7 @@ func TestAuditTrailAndPagination(t *testing.T) {
 	if err = s.SetUserDisabled(ctx, actor, created.ID, true); err != nil {
 		t.Fatal(err)
 	}
-	entries, total, err := s.ListAudit(ctx, AuditFilter{}, 50, 0)
+	entries, total, err := s.ListAudit(ctx, tenants.DefaultID, AuditFilter{}, 50, 0)
 	if err != nil || total != 5 || len(entries) != 5 {
 		t.Fatalf("audit total=%d len=%d err=%v", total, len(entries), err)
 	}
@@ -283,29 +285,29 @@ func TestAuditTrailAndPagination(t *testing.T) {
 			t.Fatalf("action %s count=%d want=%d", action, actions[action], want)
 		}
 	}
-	if entries, total, err = s.ListAudit(ctx, AuditFilter{}, 2, 0); err != nil || total != 5 || len(entries) != 2 {
+	if entries, total, err = s.ListAudit(ctx, tenants.DefaultID, AuditFilter{}, 2, 0); err != nil || total != 5 || len(entries) != 2 {
 		t.Fatalf("audit page 1: %d %d %v", len(entries), total, err)
 	}
-	if entries, _, err = s.ListAudit(ctx, AuditFilter{}, 2, 4); err != nil || len(entries) != 1 {
+	if entries, _, err = s.ListAudit(ctx, tenants.DefaultID, AuditFilter{}, 2, 4); err != nil || len(entries) != 1 {
 		t.Fatalf("audit page 3: %d %v", len(entries), err)
 	}
-	if _, _, err = s.ListAudit(ctx, AuditFilter{}, 0, 0); !errors.Is(err, ErrValidation) {
+	if _, _, err = s.ListAudit(ctx, tenants.DefaultID, AuditFilter{}, 0, 0); !errors.Is(err, ErrValidation) {
 		t.Fatalf("limit 0 accepted: %v", err)
 	}
-	if _, _, err = s.ListAudit(ctx, AuditFilter{}, 101, 0); !errors.Is(err, ErrValidation) {
+	if _, _, err = s.ListAudit(ctx, tenants.DefaultID, AuditFilter{}, 101, 0); !errors.Is(err, ErrValidation) {
 		t.Fatalf("limit 101 accepted: %v", err)
 	}
-	users, total, err := s.ListUsersPage(ctx, 50, 0)
+	users, total, err := s.ListUsersPage(ctx, tenants.DefaultID, 50, 0)
 	if err != nil || total != 2 || len(users) != 2 {
 		t.Fatalf("users page: %d %d %v", len(users), total, err)
 	}
 	if users[0].CreatedAt == 0 || users[1].CreatedAt == 0 {
 		t.Fatalf("user createdAt missing: %+v", users)
 	}
-	if users, total, err = s.ListUsersPage(ctx, 1, 1); err != nil || total != 2 || len(users) != 1 {
+	if users, total, err = s.ListUsersPage(ctx, tenants.DefaultID, 1, 1); err != nil || total != 2 || len(users) != 1 {
 		t.Fatalf("users offset page: %d %d %v", len(users), total, err)
 	}
-	if _, _, err = s.ListUsersPage(ctx, 10, -1); !errors.Is(err, ErrValidation) {
+	if _, _, err = s.ListUsersPage(ctx, tenants.DefaultID, 10, -1); !errors.Is(err, ErrValidation) {
 		t.Fatalf("negative offset accepted: %v", err)
 	}
 }
@@ -327,8 +329,8 @@ func TestAuditFiltersAndRetention(t *testing.T) {
 		{ActionLogin, "session", "u2", "bob", ResultSuccess, now - 500},
 	}
 	for i, row := range seed {
-		if _, err := db.ExecContext(ctx, `INSERT INTO auth_audit(id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
-		 VALUES($1,$2,$3,$4,$5,$6,'obj',$7,'','req')`, fmt.Sprintf("audit-000000000000000%d", i), row.createdAt, row.actorID, row.actorUsername, row.action, row.objectType, row.result); err != nil {
+		if _, err := db.ExecContext(ctx, `INSERT INTO auth_audit(id,tenant_id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,'obj',$8,'','req')`, fmt.Sprintf("audit-000000000000000%d", i), tenants.DefaultID, row.createdAt, row.actorID, row.actorUsername, row.action, row.objectType, row.result); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -348,7 +350,7 @@ func TestAuditFiltersAndRetention(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			entries, total, err := s.ListAudit(ctx, tc.filter, 100, 0)
+			entries, total, err := s.ListAudit(ctx, tenants.DefaultID, tc.filter, 100, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -366,7 +368,7 @@ func TestAuditFiltersAndRetention(t *testing.T) {
 		})
 	}
 	// Filters are applied to the page window too, not just the total.
-	entries, total, err := s.ListAudit(ctx, AuditFilter{Actor: "bob"}, 2, 1)
+	entries, total, err := s.ListAudit(ctx, tenants.DefaultID, AuditFilter{Actor: "bob"}, 2, 1)
 	if err != nil || total != 3 || len(entries) != 2 {
 		t.Fatalf("filtered page: total=%d len=%d err=%v", total, len(entries), err)
 	}
@@ -376,7 +378,7 @@ func TestAuditFiltersAndRetention(t *testing.T) {
 		{Action: strings.Repeat("a", 129)},
 		{Action: "bad\nnewline"},
 	} {
-		if _, _, err = s.ListAudit(ctx, bad, 10, 0); !errors.Is(err, ErrValidation) {
+		if _, _, err = s.ListAudit(ctx, tenants.DefaultID, bad, 10, 0); !errors.Is(err, ErrValidation) {
 			t.Fatalf("filter %+v accepted: %v", bad, err)
 		}
 	}
@@ -385,7 +387,7 @@ func TestAuditFiltersAndRetention(t *testing.T) {
 	if err != nil || purged != 2 {
 		t.Fatalf("purge = %d, %v", purged, err)
 	}
-	if _, total, err = s.ListAudit(ctx, AuditFilter{}, 100, 0); err != nil || total != 3 {
+	if _, total, err = s.ListAudit(ctx, tenants.DefaultID, AuditFilter{}, 100, 0); err != nil || total != 3 {
 		t.Fatalf("rows after purge: total=%d err=%v", total, err)
 	}
 	if _, err = s.PurgeAudit(ctx, 0); !errors.Is(err, ErrValidation) {
@@ -409,13 +411,13 @@ func TestExportAuditTruncationBoundsAndOrder(t *testing.T) {
 		{ActionUserDisable, "user", now - 10},
 	}
 	for i, row := range seed {
-		if _, err := db.ExecContext(ctx, `INSERT INTO auth_audit(id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
-		 VALUES($1,$2,'u1','alice',$3,$4,'obj','success','','req')`, fmt.Sprintf("export-audit-0000000000%d", i), row.createdAt, row.action, row.objectType); err != nil {
+		if _, err := db.ExecContext(ctx, `INSERT INTO auth_audit(id,tenant_id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
+		 VALUES($1,$2,$3,'u1','alice',$4,$5,'obj','success','','req')`, fmt.Sprintf("export-audit-0000000000%d", i), tenants.DefaultID, row.createdAt, row.action, row.objectType); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	entries, truncated, err := s.ExportAudit(ctx, AuditFilter{}, 2)
+	entries, truncated, err := s.ExportAudit(ctx, tenants.DefaultID, AuditFilter{}, 2)
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
@@ -425,19 +427,19 @@ func TestExportAuditTruncationBoundsAndOrder(t *testing.T) {
 	if entries[0].CreatedAt != now-10 || entries[1].CreatedAt != now-20 {
 		t.Fatalf("export order = %+v, want newest first", entries)
 	}
-	if entries, truncated, err = s.ExportAudit(ctx, AuditFilter{}, 3); err != nil || len(entries) != 3 || truncated {
+	if entries, truncated, err = s.ExportAudit(ctx, tenants.DefaultID, AuditFilter{}, 3); err != nil || len(entries) != 3 || truncated {
 		t.Fatalf("export exactly at the count: %d rows truncated=%v err=%v", len(entries), truncated, err)
 	}
-	if entries, truncated, err = s.ExportAudit(ctx, AuditFilter{ObjectType: "user"}, AuditExportMaxRows); err != nil || len(entries) != 2 || truncated {
+	if entries, truncated, err = s.ExportAudit(ctx, tenants.DefaultID, AuditFilter{ObjectType: "user"}, AuditExportMaxRows); err != nil || len(entries) != 2 || truncated {
 		t.Fatalf("filtered export: %d rows truncated=%v err=%v", len(entries), truncated, err)
 	}
 	for _, bad := range []int{0, -1, AuditExportMaxRows + 1} {
-		if _, _, err = s.ExportAudit(ctx, AuditFilter{}, bad); !errors.Is(err, ErrValidation) {
+		if _, _, err = s.ExportAudit(ctx, tenants.DefaultID, AuditFilter{}, bad); !errors.Is(err, ErrValidation) {
 			t.Fatalf("export limit %d accepted: %v", bad, err)
 		}
 	}
 	for _, filter := range []AuditFilter{{Result: "maybe"}, {From: now, To: now - 10}} {
-		if _, _, err = s.ExportAudit(ctx, filter, 10); !errors.Is(err, ErrValidation) {
+		if _, _, err = s.ExportAudit(ctx, tenants.DefaultID, filter, 10); !errors.Is(err, ErrValidation) {
 			t.Fatalf("export filter %+v accepted: %v", filter, err)
 		}
 	}

@@ -38,6 +38,16 @@ info:
     Keep access tokens in memory, do not store refresh tokens in JavaScript storage.
     Serialize refresh calls: replay of a consumed token revokes the whole session.
 
+    Multi-tenancy phase F1: every user belongs to exactly one tenant. Schema v18
+    seeds the deployment's default tenant and startup guarantees the slug configured
+    by AEGIS_DEFAULT_TENANT_SLUG exists (it may rename the seeded slug once). Access
+    tokens carry a tenant claim (tid) and are rejected unless the session row, the
+    user row and the tenant row agree and the tenant is active. POST /auth/login
+    accepts an optional tenantSlug: with it the lookup is scoped to that tenant,
+    without it the username must be unique across tenants (an ambiguous username
+    returns 400 tenant_required). Administrative user routes and the audit list/export
+    only ever read or mutate the caller's tenant; users of other tenants are 404.
+
     GET /metrics is only offered on the optional separate metrics listener
     (AEGIS_METRICS_ADDR, disabled by default), never on this API listener, and it
     is deliberately unauthenticated so a scraper needs no session; bind it to
@@ -159,7 +169,7 @@ paths:
       tags: [Auth]
       operationId: login
       summary: Authenticate credentials and set refresh cookie
-      description: Username lookup is case-insensitive. All attempts count toward the Redis shared IP limit (10/minute across instances). Only configured trusted proxy CIDRs may supply X-Forwarded-For. Redis failure returns 503 without local fallback. Invalid credentials return the same 401. A correct password for a disabled account returns 403 account_disabled (state is never revealed without password knowledge). No public registration.
+      description: Username lookup is case-insensitive within the resolved tenant. Optional tenantSlug selects the tenant; without it the username must be unique across tenants, and an ambiguous username returns 400 tenant_required (retry with tenantSlug). Unknown tenant, unknown user, wrong password and a suspended tenant return the same 401 (no tenant/account enumeration). All attempts count toward the Redis shared IP limit (10/minute across instances). Only configured trusted proxy CIDRs may supply X-Forwarded-For. Redis failure returns 503 without local fallback. A correct password for a disabled account returns 403 account_disabled (state is never revealed without password knowledge). No public registration.
       parameters:
         - { $ref: '#/components/parameters/AuthOrigin' }
       requestBody:
@@ -169,7 +179,11 @@ paths:
             schema: { $ref: '#/components/schemas/LoginInput' }
       responses:
         '200': { $ref: '#/components/responses/Tokens' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '400':
+          description: Invalid JSON/unknown/null field (invalid_request), invalid tenantSlug format (validation_failed), or username exists in multiple tenants without tenantSlug (tenant_required)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
@@ -3330,6 +3344,12 @@ components:
         username: { type: string }
         password: { type: string, format: password, writeOnly: true }
         remember: { type: boolean, default: false }
+        tenantSlug:
+          type: string
+          minLength: 1
+          maxLength: 32
+          pattern: '^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$'
+          description: Optional workspace slug. When omitted the username must be unique across the deployment's tenants; an ambiguous username returns 400 tenant_required and the login must be retried with this field.
     CreateUserInput:
       type: object
       additionalProperties: false
@@ -3993,7 +4013,7 @@ components:
           properties:
             code:
               type: string
-              enum: [invalid_request, validation_failed, unauthorized, forbidden, account_disabled, origin_denied, conflict, unsupported_media_type, rate_limited, not_found, not_ready, dependencies_unavailable, secrets_not_configured, internal_error]
+              enum: [invalid_request, validation_failed, unauthorized, forbidden, account_disabled, tenant_required, origin_denied, conflict, unsupported_media_type, rate_limited, not_found, not_ready, dependencies_unavailable, secrets_not_configured, internal_error]
             message: { type: string, description: Human-readable safe detail; clients should branch on code/status }
         requestId: { $ref: '#/components/schemas/RequestID' }
   responses:

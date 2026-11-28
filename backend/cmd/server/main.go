@@ -107,6 +107,14 @@ func run(logger *slog.Logger) error {
 	if err = service.Migrate(ctx); err != nil {
 		return err
 	}
+	// Guarantee the deployment's default tenant before anything can reference
+	// it: the first start after migration may rename the seeded slug to
+	// AEGIS_DEFAULT_TENANT_SLUG, and a configured slug with no tenant fails
+	// startup instead of leaving the deployment unable to log anyone in.
+	defaultTenant, err := service.EnsureDefaultTenant(ctx, cfg.DefaultTenantSlug)
+	if err != nil {
+		return err
+	}
 	if cfg.BootstrapUsername != "" {
 		if err = service.Bootstrap(ctx, cfg.BootstrapUsername, cfg.BootstrapPassword); err != nil {
 			return err
@@ -190,6 +198,9 @@ func run(logger *slog.Logger) error {
 		// The per-project automation policy composes on top of the environment
 		// gate; projects without a stored policy stay exactly as before.
 		PolicyGate: policyStore,
+		// System-generated deployment audits (approval expiry) have no session
+		// actor; they are scoped to the deployment's default tenant.
+		DefaultTenantID: defaultTenant.ID,
 	})
 	// Metrics are opt-in and live on their own listener: the public API origin
 	// must not expose deployment-wide counters, and scraping needs no session.

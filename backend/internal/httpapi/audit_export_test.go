@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yichenfchai/AegisFlow/backend/internal/auth"
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 	"github.com/yichenfchai/AegisFlow/backend/internal/testutil"
 )
 
@@ -38,9 +39,9 @@ func auditExportTestServer(t *testing.T) (http.Handler, *sql.DB) {
 // produced it.
 func seedAuditEntry(t *testing.T, db *sql.DB, id string, createdAt int64, actorID, actorUsername, action, objectType, objectID, result, detail string) {
 	t.Helper()
-	if _, err := db.Exec(`INSERT INTO auth_audit(id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
-	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'req-export')`,
-		id, createdAt, actorID, actorUsername, action, objectType, objectID, result, detail); err != nil {
+	if _, err := db.Exec(`INSERT INTO auth_audit(id,tenant_id,created_at,actor_id,actor_username,action,object_type,object_id,result,detail,request_id)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'req-export')`,
+		id, tenants.DefaultID, createdAt, actorID, actorUsername, action, objectType, objectID, result, detail); err != nil {
 		t.Fatal(err)
 	}
 }

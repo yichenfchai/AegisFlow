@@ -18,6 +18,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/yichenfchai/AegisFlow/backend/internal/tenants"
 )
 
 // MaxEmailLength bounds the verified email used for account linkage.
@@ -48,18 +50,24 @@ func NormalizeEmail(raw string) (string, error) {
 	return email, nil
 }
 
-// FindUserByEmail resolves the local account linked to a verified OIDC email.
-// Only a non-empty email can match; an account without a stored email is never
-// assumed to be the same person. Unknown email returns ErrNotFound.
-func (s *Service) FindUserByEmail(ctx context.Context, email string) (*User, error) {
+// FindUserByEmail resolves the local account linked to a verified OIDC email
+// inside one tenant. Only a non-empty email can match; an account without a
+// stored email is never assumed to be the same person. Unknown email returns
+// ErrNotFound. The same email may belong to different users in different
+// tenants, which is exactly why the lookup is tenant-scoped.
+func (s *Service) FindUserByEmail(ctx context.Context, tenantID, email string) (*User, error) {
 	if err := s.valid(); err != nil {
+		return nil, err
+	}
+	if err := requireTenantID(tenantID); err != nil {
 		return nil, err
 	}
 	normalized, err := NormalizeEmail(email)
 	if err != nil {
 		return nil, err
 	}
-	user, err := scanUser(s.db.QueryRowContext(ctx, `SELECT `+userColumns+` FROM auth_users WHERE email <> '' AND lower(email)=lower($1)`, normalized))
+	user, err := scanUser(s.db.QueryRowContext(ctx, `SELECT `+userColumns+` FROM auth_users
+		WHERE tenant_id=$1 AND email <> '' AND lower(email)=lower($2)`, tenantID, normalized))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -82,6 +90,9 @@ func (s *Service) LoginOIDC(ctx context.Context, user User, requestID string) (*
 	if !ValidID(user.ID) {
 		return nil, fmt.Errorf("%w: invalid user id", ErrValidation)
 	}
+	if err := requireTenantID(user.TenantID); err != nil {
+		return nil, err
+	}
 	sid, err := randomToken(18)
 	if err != nil {
 		return nil, err
@@ -99,11 +110,14 @@ func (s *Service) LoginOIDC(ctx context.Context, user User, requestID string) (*
 	defer tx.Rollback()
 	// The share lock mirrors password login: a concurrent disable/revoke either
 	// commits first (and this callback sees disabled here) or runs after this
-	// transaction, revoking the session it just created.
+	// transaction, revoking the session it just created. The tenant row is read
+	// under the same transaction: a suspended tenant cannot start a session.
 	var current User
 	var disabled int
-	err = tx.QueryRowContext(ctx, `SELECT `+userColumns+` FROM auth_users WHERE id=$1 FOR SHARE`, user.ID).
-		Scan(&current.ID, &current.Username, &current.DisplayName, &current.Role, &disabled, &current.CreatedAt)
+	var tenantStatus string
+	err = tx.QueryRowContext(ctx, `SELECT `+qualifiedUserColumns+`,t.status FROM auth_users u
+		JOIN tenants t ON t.id=u.tenant_id WHERE u.id=$1 FOR SHARE OF u, t`, user.ID).
+		Scan(&current.TenantID, &current.ID, &current.Username, &current.DisplayName, &current.Role, &disabled, &current.CreatedAt, &tenantStatus)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrUnauthorized
 	}
@@ -114,17 +128,27 @@ func (s *Service) LoginOIDC(ctx context.Context, user User, requestID string) (*
 	if current.Disabled {
 		return nil, ErrAccountDisabled
 	}
+	if current.TenantID != user.TenantID {
+		return nil, ErrUnauthorized
+	}
+	// A suspended tenant cannot open an SSO session. The OIDC callback only has
+	// the fixed browser-facing code set, and account_disabled is the closest
+	// "this account cannot sign in" outcome; the tenant state itself is never
+	// disclosed.
+	if tenantStatus != tenants.StatusActive {
+		return nil, ErrAccountDisabled
+	}
 	tokens, err := s.issue(current, sid, refresh, expires, false)
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_sessions(id,user_id,expires_at,remember,created_at) VALUES($1,$2,$3,0,$4)`, sid, current.ID, expires, now); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_sessions(id,tenant_id,user_id,expires_at,remember,created_at) VALUES($1,$2,$3,$4,0,$5)`, sid, current.TenantID, current.ID, expires, now); err != nil {
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_refresh_tokens(token_hash,session_id) VALUES($1,$2)`, hashToken(refresh), sid); err != nil {
 		return nil, err
 	}
-	if err = s.writeAudit(ctx, tx, Actor{ID: current.ID, Username: current.Username, RequestID: requestID}, ActionLogin, "user", current.ID, ResultSuccess, "method=oidc"); err != nil {
+	if err = s.writeAudit(ctx, tx, Actor{ID: current.ID, TenantID: current.TenantID, Username: current.Username, RequestID: requestID}, ActionLogin, "user", current.ID, ResultSuccess, "method=oidc"); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -135,17 +159,21 @@ func (s *Service) LoginOIDC(ctx context.Context, user User, requestID string) (*
 
 // RecordOIDCLoginFailure writes the failure half of the OIDC audit trail. Only
 // a fixed error code is stored: provider error bodies, tokens and claims stay
-// out of the database and logs. The caller already applied the shared login
-// rate limiter, so failed callbacks cannot be used to grow the audit table
-// without bound.
-func (s *Service) RecordOIDCLoginFailure(ctx context.Context, requestID, code string, user *User) error {
+// out of the database and logs. tenantID is the tenant recorded by the
+// consumed login state (empty when the failure happened before it was read);
+// the auth service attributes a missing tenant to the deployment's default
+// tenant, which is the only tenant in phase F1. The caller already applied the
+// shared login rate limiter, so failed callbacks cannot be used to grow the
+// audit table without bound.
+func (s *Service) RecordOIDCLoginFailure(ctx context.Context, tenantID, requestID, code string, user *User) error {
 	if !oidcFailureCodes[code] {
 		code = "server_error"
 	}
-	actor := Actor{RequestID: requestID}
+	actor := Actor{TenantID: tenantID, RequestID: requestID}
 	objectID := ""
 	if user != nil {
 		actor.ID = user.ID
+		actor.TenantID = user.TenantID
 		actor.Username = user.Username
 		objectID = user.ID
 	}
@@ -153,14 +181,28 @@ func (s *Service) RecordOIDCLoginFailure(ctx context.Context, requestID, code st
 }
 
 // ProvisionOIDCUser creates the local member account for a verified external
-// identity. It can never create an admin and never overrides an existing
-// username: a collision gets a random suffix. The password is cryptographically
-// random and discarded, so the account is only reachable through OIDC until an
-// administrator resets or disables it. If a concurrent first login already
-// linked the same email, that existing account is returned instead of failing.
-func (s *Service) ProvisionOIDCUser(ctx context.Context, preferredUsername, displayName, email, requestID string) (*User, error) {
+// identity inside the given tenant. It can never create an admin and never
+// overrides an existing username: a collision gets a random suffix. The
+// password is cryptographically random and discarded, so the account is only
+// reachable through OIDC until an administrator resets or disables it. If a
+// concurrent first login already linked the same email in this tenant, that
+// existing account is returned instead of failing.
+func (s *Service) ProvisionOIDCUser(ctx context.Context, tenantID, preferredUsername, displayName, email, requestID string) (*User, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
+	}
+	if err := requireTenantID(tenantID); err != nil {
+		return nil, err
+	}
+	var tenantStatus string
+	if err := s.db.QueryRowContext(ctx, `SELECT status FROM tenants WHERE id=$1`, tenantID).Scan(&tenantStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("%w: tenant", ErrNotFound)
+		}
+		return nil, err
+	}
+	if tenantStatus != tenants.StatusActive {
+		return nil, ErrAccountDisabled
 	}
 	normalized, err := NormalizeEmail(email)
 	if err != nil {
@@ -197,8 +239,8 @@ func (s *Service) ProvisionOIDCUser(ctx context.Context, preferredUsername, disp
 		if txErr != nil {
 			return nil, txErr
 		}
-		_, insertErr := tx.ExecContext(ctx, `INSERT INTO auth_users(id,username,password_hash,display_name,role,disabled,created_at,email)
-		 VALUES($1,$2,$3,$4,'member',0,$5,$6)`, id, username, string(hash), display, now, normalized)
+		_, insertErr := tx.ExecContext(ctx, `INSERT INTO auth_users(id,tenant_id,username,password_hash,display_name,role,disabled,created_at,email)
+		 VALUES($1,$2,$3,$4,$5,'member',0,$6,$7)`, id, tenantID, username, string(hash), display, now, normalized)
 		if insertErr != nil {
 			_ = tx.Rollback()
 			if !isUniqueViolation(insertErr) {
@@ -206,7 +248,7 @@ func (s *Service) ProvisionOIDCUser(ctx context.Context, preferredUsername, disp
 			}
 			// A concurrent callback may have just created the same email link:
 			// reuse it instead of creating a duplicate identity.
-			existing, findErr := s.FindUserByEmail(ctx, normalized)
+			existing, findErr := s.FindUserByEmail(ctx, tenantID, normalized)
 			if findErr == nil {
 				return existing, nil
 			}
@@ -218,13 +260,13 @@ func (s *Service) ProvisionOIDCUser(ctx context.Context, preferredUsername, disp
 		}
 		// The account is created by the provider-backed identity itself, so the
 		// actor stays empty and only the method is recorded (no email in audit).
-		if auditErr := s.writeAudit(ctx, tx, Actor{RequestID: requestID}, ActionUserCreate, "user", id, ResultSuccess, "method=oidc"); auditErr != nil {
+		if auditErr := s.writeAudit(ctx, tx, Actor{TenantID: tenantID, RequestID: requestID}, ActionUserCreate, "user", id, ResultSuccess, "method=oidc"); auditErr != nil {
 			return nil, auditErr
 		}
 		if commitErr := tx.Commit(); commitErr != nil {
 			return nil, commitErr
 		}
-		return &User{ID: id, Username: username, DisplayName: display, Role: "member", CreatedAt: now}, nil
+		return &User{ID: id, TenantID: tenantID, Username: username, DisplayName: display, Role: "member", CreatedAt: now}, nil
 	}
 	return nil, fmt.Errorf("provision OIDC account: %w", lastErr)
 }
