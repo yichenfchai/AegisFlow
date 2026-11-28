@@ -4,7 +4,9 @@
 Verifies the AegisFlow PostgreSQL schema after a migration, restore or import.
 
 .DESCRIPTION
-Runs read-only checks against one database and reports each result:
+Runs read-only checks against one database and reports each result. The checks
+describe the v19 (multi-tenant isolation) schema, so the script only applies to
+schema version 19 or newer:
 
   * schema_migrations exists, is contiguous from 1 and (optionally) matches
     -ExpectedVersion;
@@ -17,16 +19,24 @@ Runs read-only checks against one database and reports each result:
   * 5 representative tenant-scoped unique indexes exist and are unique;
   * row counts for every table are printed as a summary.
 
-Exit code 0 means every check passed; any failure prints "[FAIL]" lines, a
-summary and exits 1 (script errors exit 1 as well). The script never writes to
-the database and never prints credentials.
+Exit codes:
+  0  every check passed;
+  1  at least one check failed (script errors exit 1 as well);
+  2  skipped: the database (or the requested -ExpectedVersion) is older than
+     v19. The v19 structure checks do not apply to a v18 baseline; use the psql
+     checks documented in scripts/ops/README.md instead (migration ledger,
+     tenants seed row, and tenant_id still absent on the 14 business tables).
+
+The script never writes to the database and never prints credentials.
 
 .PARAMETER Database
 Database to verify (required).
 
 .PARAMETER ExpectedVersion
 Optional migration version the database must be at (for example 19 for the
-schema that introduced tenant isolation). Omit to accept any contiguous version.
+schema that introduced tenant isolation). A value below 19 makes the script
+skip with exit code 2: the structural checks only describe v19+ schemas. Omit
+to accept any contiguous version.
 
 .EXAMPLE
 $env:PGPASSWORD = Get-Content C:\secrets\pg.txt
@@ -56,6 +66,12 @@ $ErrorActionPreference = 'Stop'
 $script:Failures = New-Object System.Collections.Generic.List[string]
 $script:PassCount = 0
 $script:CheckCount = 0
+$script:Skipped = $false
+
+# First schema version whose structure this script actually describes. Older
+# databases (v18 baseline) are skipped with exit code 2 instead of reporting a
+# long list of [FAIL] lines for columns/indexes that can only exist after v19.
+$script:MinimumSupportedVersion = 19
 
 function Add-CheckResult {
     param([bool] $Ok, [string] $Message)
@@ -116,6 +132,19 @@ function Invoke-VerifyMain {
     $ledgerLines = @(Get-QueryLines -Sql "SELECT COALESCE(to_regclass('public.schema_migrations')::text, '')")
     if ($ledgerLines.Count -eq 1 -and $ledgerLines[0] -eq 'schema_migrations') { $ledgerExists = $true }
     Add-CheckResult -Ok $ledgerExists -Message 'schema_migrations table exists'
+
+    # --- version gate -------------------------------------------------------
+    # The structural checks below describe schema v19. A v18 baseline (or an
+    # explicit request for a version below 19) is NOT a failure of the database:
+    # skip with exit code 2 and point at the psql baseline checks instead of
+    # emitting dozens of misleading [FAIL] lines for columns/indexes that can
+    # only exist after v19.
+    if ($ExpectedVersion -gt 0 -and $ExpectedVersion -lt $script:MinimumSupportedVersion) {
+        Write-OpsLog '[SKIP] verify-schema supports schema >= 19; for a v18 baseline use the psql checks documented in scripts/ops/README.md'
+        Write-OpsLog ("       reason: -ExpectedVersion $ExpectedVersion targets a schema older than v19, but these checks describe v19 columns, foreign keys and indexes")
+        $script:Skipped = $true
+        return
+    }
     $schemaVersion = 0
     if ($ledgerExists) {
         $ledgerParts = @(Get-QueryLines -Sql 'SELECT COALESCE(MAX(version),0)::text || ''|'' || COUNT(*)::text || ''|'' || COALESCE(MIN(version),0)::text FROM schema_migrations')
@@ -123,6 +152,12 @@ function Invoke-VerifyMain {
             $schemaVersion = [int]$matches[1]
             $ledgerRows = [int]$matches[2]
             $ledgerMin = [int]$matches[3]
+            if ($schemaVersion -ge 1 -and $schemaVersion -lt $script:MinimumSupportedVersion) {
+                Write-OpsLog '[SKIP] verify-schema supports schema >= 19; for a v18 baseline use the psql checks documented in scripts/ops/README.md'
+                Write-OpsLog ("       reason: detected schema version $schemaVersion; record the v18 baseline with psql (max version, tenants seed row, absent tenant_id columns) before upgrading")
+                $script:Skipped = $true
+                return
+            }
             Add-CheckResult -Ok ($schemaVersion -ge 1) -Message ("schema_migrations has at least one applied migration (max version $schemaVersion)")
             Add-CheckResult -Ok ($ledgerRows -eq $schemaVersion -and $ledgerMin -eq 1) -Message ("schema_migrations is contiguous from 1 to $schemaVersion ($ledgerRows rows)")
             if ($ExpectedVersion -gt 0) {
@@ -266,4 +301,5 @@ catch {
     Write-OpsError ('verify-schema failed: ' + $_.Exception.Message)
     exit 1
 }
+if ($script:Skipped) { exit 2 }
 exit 0

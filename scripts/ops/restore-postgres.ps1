@@ -14,9 +14,13 @@ Restores one custom-format pg_dump archive into a target database. Safety rules:
     malformed or mismatching sidecar aborts before the target is touched;
   * pg_restore runs with --exit-on-error --single-transaction, so a failed
     archive leaves no half-restored schema;
-  * after the restore the script checks that schema_migrations is present and
-    contiguous, that all 24 schema-v19 tables exist, and prints a row-count
-    summary for the tables operators check in a disaster-recovery drill.
+  * after the restore the script reads the restored schema_migrations version,
+    checks that the ledger is present and contiguous and that the 24 tables this
+    script expects are present, then prints a "schema version X / table count /
+    row summary" block. The schema version is whatever the dump contains:
+    restoring an older dump is a legitimate rollback path, so an archive below
+    v19 is reported with a warning and is NOT treated as a failure (the v19
+    tenant-column checks are not applied to an older archive).
 
 The password is never a parameter; use PGPASSWORD/PGPASSFILE/pgpass or a
 peer/trust connection exactly like pg_restore itself.
@@ -195,6 +199,11 @@ function Invoke-RestoreMain {
     if ($ledgerRows -ne $schemaVersion -or $ledgerMin -ne 1) {
         $structureFailures.Add("schema_migrations is not contiguous (min=$ledgerMin max=$schemaVersion rows=$ledgerRows)")
     }
+    if ($schemaVersion -ge 1 -and $schemaVersion -lt 19) {
+        Write-OpsWarn ("the restored archive is at schema version $schemaVersion, which is older than the v19 structure this script is written for.")
+        Write-OpsWarn 'Restoring an older backup is a legitimate rollback path and is NOT a failure; the checks below only verify'
+        Write-OpsWarn 'the required table set and row counts. Point the matching older server binary at this database.'
+    }
 
     $tableNamesSql = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
     $presentTables = @(Invoke-OpsPsqlQuery -PsqlPath $psql -Database $TargetDatabase -DatabaseHost $DatabaseHost -Port $Port -UserName $User -Sql $tableNamesSql)
@@ -204,7 +213,7 @@ function Invoke-RestoreMain {
         $structureFailures.Add('missing tables: ' + ($missingTables -join ', '))
     }
     else {
-        Write-OpsLog ("tables: all " + $requiredTables.Count + ' required tables are present')
+        Write-OpsLog ("tables: " + $requiredTables.Count + '/' + $requiredTables.Count + " required tables are present (schema version is determined by the archive: v$schemaVersion)")
     }
 
     $countSelects = @(
@@ -266,14 +275,32 @@ function Invoke-RestoreMain {
     Write-OpsStage 'restore result'
     Write-OpsLog "database:      $TargetDatabase"
     Write-OpsLog "schema:        version $schemaVersion ($ledgerRows migrations)"
+    Write-OpsLog ("tables:        " + ($requiredTables.Count - $missingTables.Count) + '/' + $requiredTables.Count + ' required tables present')
+    if ($counts.Count -gt 0) {
+        $summaryKeys = @('tenants', 'auth_users', 'projects', 'builds', 'deployment_targets', 'deployments', 'approvals', 'secrets')
+        $summaryParts = @()
+        foreach ($key in $summaryKeys) {
+            if ($counts.ContainsKey($key)) { $summaryParts += ($key + '=' + $counts[$key]) }
+        }
+        if ($summaryParts.Count -gt 0) { Write-OpsLog ('row summary:   ' + ($summaryParts -join ' ')) }
+    }
     Write-OpsLog 'verification:  OK (ledger, tables and row counts)'
     Write-OpsLog 'restore: OK'
     Write-OpsLog ''
     Write-OpsLog 'Next steps for a drill:'
-    Write-OpsLog "  1. verify sealed credentials with the same AEGIS_SECRET_KEY (and AEGIS_SECRET_KEY_PREVIOUS) that"
-    Write-OpsLog '     existed when this backup was taken, for example: cd backend; AEGIS_DATABASE_URL=<restore URL> go run ./cmd/rekey'
+    Write-OpsLog '  1. verify sealed credentials can be decrypted with the AEGIS_SECRET_KEY that existed when this backup'
+    Write-OpsLog '     was taken. cmd/rekey is a ROTATION tool, not a restore check: it requires AEGIS_SECRET_KEY_PREVIOUS'
+    Write-OpsLog '     and that key must differ from AEGIS_SECRET_KEY, so a single-key run fails with exit 1. To use it as a'
+    Write-OpsLog '     readability probe, run a rotation simulation (new random key as AEGIS_SECRET_KEY, the backup-time key as'
+    Write-OpsLog '     AEGIS_SECRET_KEY_PREVIOUS) and require failed=0 on the default dry run; never pass -apply against a'
+    Write-OpsLog '     restore you want to keep comparable. Prefer the application path (temporary instance, admin login,'
+    Write-OpsLog '     deployment-target probe) to prove the backup-time key still opens credentials. See scripts/ops/README.md.'
     Write-OpsLog '  2. start a temporary API instance against this database with a separate Redis namespace and confirm'
     Write-OpsLog '     /readyz, an admin login and a project listing before switching production to it.'
+    if ($schemaVersion -ge 1 -and $schemaVersion -lt 19) {
+        Write-OpsLog ("  3. this restore is at schema v" + $schemaVersion + ": run the matching older server binary and record its")
+        Write-OpsLog '     structural baseline with the psql checks in scripts/ops/README.md (verify-schema only supports v19+).'
+    }
 }
 
 try {
