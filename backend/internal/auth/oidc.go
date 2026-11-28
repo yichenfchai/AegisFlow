@@ -79,11 +79,19 @@ func (s *Service) FindUserByEmail(ctx context.Context, tenantID, email string) (
 
 // LoginOIDC issues the same revocable session and refresh cookie as a password
 // login for an account whose identity was proven by the OIDC provider. The
-// audit row reuses auth.login with detail "method=oidc"; the user row is
-// re-read under a share lock so a disable that raced the IdP callback cannot
-// leave a live session. Sessions are non-persistent (like an unchecked
-// password login), because the start request carries no remember choice.
+// audit row reuses auth.login with detail "method=oidc".
 func (s *Service) LoginOIDC(ctx context.Context, user User, requestID string) (*Tokens, error) {
+	return s.loginVerifiedUser(ctx, user, requestID, "method=oidc")
+}
+
+// loginVerifiedUser issues a revocable session for an account whose external
+// identity (OIDC or LDAP) has already been verified. The audit row reuses
+// auth.login with the caller-supplied fixed detail (never a credential, DN or
+// claim). Sessions are non-persistent: neither SSO flow carries a remember
+// choice. The user row is re-read under a share lock so a disable that raced
+// the external callback cannot leave a live session; the tenant row is read
+// under the same transaction so a suspended tenant cannot start a session.
+func (s *Service) loginVerifiedUser(ctx context.Context, user User, requestID, detail string) (*Tokens, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
 	}
@@ -110,8 +118,7 @@ func (s *Service) LoginOIDC(ctx context.Context, user User, requestID string) (*
 	defer tx.Rollback()
 	// The share lock mirrors password login: a concurrent disable/revoke either
 	// commits first (and this callback sees disabled here) or runs after this
-	// transaction, revoking the session it just created. The tenant row is read
-	// under the same transaction: a suspended tenant cannot start a session.
+	// transaction, revoking the session it just created.
 	var current User
 	var disabled int
 	var tenantStatus, tenantSlug, tenantName string
@@ -132,10 +139,10 @@ func (s *Service) LoginOIDC(ctx context.Context, user User, requestID string) (*
 	if current.TenantID != user.TenantID {
 		return nil, ErrUnauthorized
 	}
-	// A suspended tenant cannot open an SSO session. The OIDC callback only has
-	// the fixed browser-facing code set, and account_disabled is the closest
-	// "this account cannot sign in" outcome; the tenant state itself is never
-	// disclosed.
+	// A suspended tenant cannot open an external-login session. The browser-
+	// facing code set of both flows only distinguishes "cannot sign in", and
+	// account_disabled is the closest documented outcome; the tenant state
+	// itself is never disclosed.
 	if tenantStatus != tenants.StatusActive {
 		return nil, ErrAccountDisabled
 	}
@@ -149,7 +156,7 @@ func (s *Service) LoginOIDC(ctx context.Context, user User, requestID string) (*
 	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_refresh_tokens(token_hash,session_id) VALUES($1,$2)`, hashToken(refresh), sid); err != nil {
 		return nil, err
 	}
-	if err = s.writeAudit(ctx, tx, Actor{ID: current.ID, TenantID: current.TenantID, Username: current.Username, RequestID: requestID}, ActionLogin, "user", current.ID, ResultSuccess, "method=oidc"); err != nil {
+	if err = s.writeAudit(ctx, tx, Actor{ID: current.ID, TenantID: current.TenantID, Username: current.Username, RequestID: requestID}, ActionLogin, "user", current.ID, ResultSuccess, detail); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -189,6 +196,20 @@ func (s *Service) RecordOIDCLoginFailure(ctx context.Context, tenantID, requestI
 // concurrent first login already linked the same email in this tenant, that
 // existing account is returned instead of failing.
 func (s *Service) ProvisionOIDCUser(ctx context.Context, tenantID, preferredUsername, displayName, email, requestID string) (*User, error) {
+	normalized, err := NormalizeEmail(email)
+	if err != nil {
+		return nil, err
+	}
+	return s.provisionExternalUser(ctx, tenantID, preferredUsername, displayName, normalized, requestID, "oidc")
+}
+
+// provisionExternalUser is the single auto-provisioning path for verified
+// external identities (OIDC and LDAP). The caller must already have normalized
+// a trusted email. The created account is always a member, the password is a
+// random unusable value and the audit row records only the fixed method. An
+// existing account linked to the same email in this tenant (a concurrent first
+// login) is reused instead of creating a duplicate identity.
+func (s *Service) provisionExternalUser(ctx context.Context, tenantID, preferredUsername, displayName, email, requestID, method string) (*User, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
 	}
@@ -205,11 +226,7 @@ func (s *Service) ProvisionOIDCUser(ctx context.Context, tenantID, preferredUser
 	if tenantStatus != tenants.StatusActive {
 		return nil, ErrAccountDisabled
 	}
-	normalized, err := NormalizeEmail(email)
-	if err != nil {
-		return nil, err
-	}
-	base := oidcUsernameBase(preferredUsername, normalized)
+	base := oidcUsernameBase(preferredUsername, email)
 	display := oidcDisplayName(displayName, base)
 	// A valid bcrypt hash of a random, unused password keeps the row shape of a
 	// normal account while making password login impossible for it.
@@ -221,6 +238,7 @@ func (s *Service) ProvisionOIDCUser(ctx context.Context, tenantID, preferredUser
 	if err != nil {
 		return nil, err
 	}
+	detail := "method=" + method
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
 		username := base
@@ -241,7 +259,7 @@ func (s *Service) ProvisionOIDCUser(ctx context.Context, tenantID, preferredUser
 			return nil, txErr
 		}
 		_, insertErr := tx.ExecContext(ctx, `INSERT INTO auth_users(id,tenant_id,username,password_hash,display_name,role,disabled,created_at,email)
-		 VALUES($1,$2,$3,$4,$5,'member',0,$6,$7)`, id, tenantID, username, string(hash), display, now, normalized)
+		 VALUES($1,$2,$3,$4,$5,'member',0,$6,$7)`, id, tenantID, username, string(hash), display, now, email)
 		if insertErr != nil {
 			_ = tx.Rollback()
 			if !isUniqueViolation(insertErr) {
@@ -249,7 +267,7 @@ func (s *Service) ProvisionOIDCUser(ctx context.Context, tenantID, preferredUser
 			}
 			// A concurrent callback may have just created the same email link:
 			// reuse it instead of creating a duplicate identity.
-			existing, findErr := s.FindUserByEmail(ctx, tenantID, normalized)
+			existing, findErr := s.FindUserByEmail(ctx, tenantID, email)
 			if findErr == nil {
 				return existing, nil
 			}
@@ -261,7 +279,7 @@ func (s *Service) ProvisionOIDCUser(ctx context.Context, tenantID, preferredUser
 		}
 		// The account is created by the provider-backed identity itself, so the
 		// actor stays empty and only the method is recorded (no email in audit).
-		if auditErr := s.writeAudit(ctx, tx, Actor{TenantID: tenantID, RequestID: requestID}, ActionUserCreate, "user", id, ResultSuccess, "method=oidc"); auditErr != nil {
+		if auditErr := s.writeAudit(ctx, tx, Actor{TenantID: tenantID, RequestID: requestID}, ActionUserCreate, "user", id, ResultSuccess, detail); auditErr != nil {
 			return nil, auditErr
 		}
 		if commitErr := tx.Commit(); commitErr != nil {
@@ -269,7 +287,7 @@ func (s *Service) ProvisionOIDCUser(ctx context.Context, tenantID, preferredUser
 		}
 		return &User{ID: id, TenantID: tenantID, Username: username, DisplayName: display, Role: "member", CreatedAt: now}, nil
 	}
-	return nil, fmt.Errorf("provision OIDC account: %w", lastErr)
+	return nil, fmt.Errorf("provision external account: %w", lastErr)
 }
 
 // isUniqueViolation reports a PostgreSQL unique-constraint violation, which is

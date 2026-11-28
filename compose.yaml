@@ -80,6 +80,24 @@ x-api: &api
     AEGIS_OIDC_AUTO_PROVISION: ${AEGIS_OIDC_AUTO_PROVISION:-}
     AEGIS_OIDC_LABEL: ${AEGIS_OIDC_LABEL:-}
     AEGIS_OIDC_DISCOVERY_TIMEOUT: ${AEGIS_OIDC_DISCOVERY_TIMEOUT:-}
+    # Optional LDAP directory authentication. An empty URL keeps the feature
+    # completely disabled (login page unchanged, config probe enabled=false,
+    # login 503); setting any other AEGIS_LDAP_* variable while the URL is empty
+    # fails startup on purpose. Prefer ldaps:// or set AEGIS_LDAP_STARTTLS=true;
+    # plain ldap:// is only accepted for a loopback host or with StartTLS.
+    # Empty values fall back to the documented defaults when the URL is set.
+    AEGIS_LDAP_URL: ${AEGIS_LDAP_URL:-}
+    AEGIS_LDAP_STARTTLS: ${AEGIS_LDAP_STARTTLS:-}
+    AEGIS_LDAP_BIND_DN: ${AEGIS_LDAP_BIND_DN:-}
+    AEGIS_LDAP_BIND_PASSWORD: ${AEGIS_LDAP_BIND_PASSWORD:-}
+    AEGIS_LDAP_BASE_DN: ${AEGIS_LDAP_BASE_DN:-}
+    AEGIS_LDAP_USER_FILTER: ${AEGIS_LDAP_USER_FILTER:-}
+    AEGIS_LDAP_USERNAME_ATTRIBUTE: ${AEGIS_LDAP_USERNAME_ATTRIBUTE:-}
+    AEGIS_LDAP_EMAIL_ATTRIBUTE: ${AEGIS_LDAP_EMAIL_ATTRIBUTE:-}
+    AEGIS_LDAP_DISPLAY_NAME_ATTRIBUTE: ${AEGIS_LDAP_DISPLAY_NAME_ATTRIBUTE:-}
+    AEGIS_LDAP_AUTO_PROVISION: ${AEGIS_LDAP_AUTO_PROVISION:-}
+    AEGIS_LDAP_LABEL: ${AEGIS_LDAP_LABEL:-}
+    AEGIS_LDAP_TIMEOUT: ${AEGIS_LDAP_TIMEOUT:-}
     AEGIS_ALLOWED_ORIGINS: ${AEGIS_ALLOWED_ORIGINS:-http://localhost:5173}
     AEGIS_COOKIE_SECURE: ${AEGIS_COOKIE_SECURE:-false}
     AEGIS_TRUSTED_PROXIES: 172.30.88.10/32

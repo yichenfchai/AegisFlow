@@ -93,6 +93,10 @@ type Config struct {
 	// zero value disables the feature completely: no route gains a working
 	// authorization flow and the login page keeps its password-only behavior.
 	OIDC OIDCConfig
+	// LDAP is the optional directory authentication configuration (phase G).
+	// AEGIS_LDAP_URL is the master switch: the zero value keeps the feature
+	// completely disabled, so an upgrade without the variable changes nothing.
+	LDAP LDAPConfig
 	// RequireReviewEnvironments lists target environments whose deployments
 	// must reference an approved review. Empty (the default, including an
 	// explicitly empty value or only commas/whitespace) disables the gate: the
@@ -143,6 +147,50 @@ type OIDCConfig struct {
 // is disabled, so a deployment that sets none of the AEGIS_OIDC_* variables
 // keeps exactly the previous password-only surface.
 func (c OIDCConfig) Enabled() bool { return c.Issuer != "" }
+
+// LDAPConfig is the optional LDAP directory authentication configuration
+// (phase G). URL is the master switch: an empty URL disables the feature
+// completely, and every other AEGIS_LDAP_* variable then fails startup instead
+// of being silently ignored. The directory is only a credential source: no
+// directory data is persisted and no local password is written.
+type LDAPConfig struct {
+	// URL is the directory endpoint (ldap:// or ldaps://). It never contains
+	// userinfo, query, fragment or a path; plain ldap:// is accepted only for a
+	// loopback host or with StartTLS.
+	URL string
+	// StartTLS upgrades a plain ldap:// connection before the first bind. It is
+	// rejected together with ldaps://, which is already encrypted.
+	StartTLS bool
+	// BindDN/BindPassword are the optional service account used to run the
+	// search. Both are set or both are empty (anonymous search).
+	BindDN       string
+	BindPassword string
+	// BaseDN is the search base. Required when the feature is enabled.
+	BaseDN string
+	// UserFilter is the search filter with exactly one {username} placeholder;
+	// the placeholder is replaced with the RFC 4515-escaped login name.
+	UserFilter string
+	// UsernameAttribute, EmailAttribute and DisplayNameAttribute select the
+	// attributes read from the single matching entry.
+	UsernameAttribute    string
+	EmailAttribute       string
+	DisplayNameAttribute string
+	// AutoProvision creates a member account on first login when the directory
+	// identity matches no local account. It never creates an admin and requires
+	// a valid directory email.
+	AutoProvision bool
+	// Label is the login-page entry text; never an empty string.
+	Label string
+	// Timeout bounds one directory authentication: connect, optional StartTLS,
+	// service bind, search and the user bind share the same deadline (default
+	// 5s, at most 30s).
+	Timeout time.Duration
+}
+
+// Enabled reports whether LDAP directory authentication is configured. The
+// zero LDAPConfig is disabled, so a deployment that sets none of the
+// AEGIS_LDAP_* variables keeps exactly the previous password-only surface.
+func (c LDAPConfig) Enabled() bool { return c.URL != "" }
 
 // BuildSandbox is how build commands are executed. It mirrors the options in
 // the build execution design (maintained locally, not committed): "none" runs
@@ -440,6 +488,12 @@ func Load() (Config, error) {
 	// feature completely, including route effects. Setting any other OIDC
 	// variable without the issuer is a configuration mistake and fails closed.
 	if err = loadOIDC(&c); err != nil {
+		return c, err
+	}
+	// LDAP directory authentication (phase G) is opt-in the same way: an unset
+	// URL disables it completely, and any other AEGIS_LDAP_* variable without
+	// the URL fails closed.
+	if err = loadLDAP(&c); err != nil {
 		return c, err
 	}
 	for _, origin := range strings.Split(env("AEGIS_ALLOWED_ORIGINS", "http://localhost:5173"), ",") {

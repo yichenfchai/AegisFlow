@@ -21,6 +21,7 @@ import (
 	"github.com/yichenfchai/AegisFlow/backend/internal/deployments"
 	"github.com/yichenfchai/AegisFlow/backend/internal/httpapi"
 	"github.com/yichenfchai/AegisFlow/backend/internal/knowledge"
+	"github.com/yichenfchai/AegisFlow/backend/internal/ldap"
 	"github.com/yichenfchai/AegisFlow/backend/internal/metrics"
 	"github.com/yichenfchai/AegisFlow/backend/internal/oidc"
 	"github.com/yichenfchai/AegisFlow/backend/internal/policies"
@@ -119,6 +120,33 @@ func run(logger *slog.Logger) error {
 		if err = service.Bootstrap(ctx, cfg.BootstrapUsername, cfg.BootstrapPassword); err != nil {
 			return err
 		}
+	}
+	// LDAP directory authentication (phase G) is opt-in and fail-closed: when
+	// AEGIS_LDAP_URL is configured the client is built (and re-validated) before
+	// the listener opens, but the directory is only contacted on a login attempt.
+	// Without the URL the client stays nil and the feature has no effect at all.
+	var directory *ldap.Client
+	if cfg.LDAP.Enabled() {
+		directory, err = ldap.New(ldap.Options{
+			URL:                  cfg.LDAP.URL,
+			StartTLS:             cfg.LDAP.StartTLS,
+			BindDN:               cfg.LDAP.BindDN,
+			BindPassword:         cfg.LDAP.BindPassword,
+			BaseDN:               cfg.LDAP.BaseDN,
+			UserFilter:           cfg.LDAP.UserFilter,
+			UsernameAttribute:    cfg.LDAP.UsernameAttribute,
+			EmailAttribute:       cfg.LDAP.EmailAttribute,
+			DisplayNameAttribute: cfg.LDAP.DisplayNameAttribute,
+			Label:                cfg.LDAP.Label,
+			Timeout:              cfg.LDAP.Timeout,
+			Logger:               logger,
+		})
+		if err != nil {
+			return fmt.Errorf("LDAP directory authentication: %w", err)
+		}
+		service.WithLDAPDirectory(directory, cfg.LDAP.AutoProvision)
+		logger.Info("LDAP directory authentication enabled",
+			"startTLS", cfg.LDAP.StartTLS, "autoProvision", cfg.LDAP.AutoProvision)
 	}
 	registry := projects.New(db)
 	// Per-project automation policy (P5 batch C): gate rules stored in the

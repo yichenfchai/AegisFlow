@@ -285,4 +285,39 @@ describe('session store', () => {
     expect(useSession.getState().error).toBe('服务器内部错误，请稍后重试')
     expect(useSession.getState().error).not.toContain('api message')
   })
+
+  it('loginLDAP stores the session and tenant returned by the directory endpoint', async () => {
+    const { useSession } = await freshStore()
+    const bodies: Array<Record<string, unknown>> = []
+    fetchMock = (url, init) => {
+      if (url.includes('/auth/ldap/login')) {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+        return jsonResponse(200, sessionPayload)
+      }
+      return jsonResponse(404, null)
+    }
+    await useSession.getState().loginLDAP('alice', 'directory-password')
+    await useSession.getState().loginLDAP('alice', 'directory-password', 'acme')
+    const state = useSession.getState()
+    expect(state.status).toBe('authenticated')
+    expect(state.accessToken).toBe('at-1')
+    expect(state.user?.tenant).toEqual({ id: 'tenant_default_0000000000000001', slug: 'default', name: 'Default' })
+    expect(posted).toEqual([{ type: 'changed' }, { type: 'changed' }])
+    // No remember field: the directory form has no persistent-session choice.
+    expect(bodies[0]).toEqual({ username: 'alice', password: 'directory-password' })
+    expect(bodies[1]).toEqual({ username: 'alice', password: 'directory-password', tenantSlug: 'acme' })
+  })
+
+  it('loginLDAP surfaces the localized directory error codes', async () => {
+    const { useSession, errorMessage } = await freshStore()
+    fetchMock = () => jsonResponse(401, null)
+    const unauthorized = await useSession.getState().loginLDAP('alice', 'bad').catch((cause: unknown) => cause)
+    expect(errorMessage(unauthorized)).toContain('账号、密码错误')
+    expect(useSession.getState().user).toBeNull()
+
+    fetchMock = () => jsonResponse(403, null, 'account_not_found')
+    const unlinked = await useSession.getState().loginLDAP('alice', 'pw').catch((cause: unknown) => cause)
+    expect(errorMessage(unlinked)).toBe('账号未开通，请联系管理员')
+    expect(useSession.getState().accessToken).toBeNull()
+  })
 })

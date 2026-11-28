@@ -421,6 +421,91 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorEnvelope' }
         '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/auth/ldap/config:
+    get:
+      tags: [Auth]
+      operationId: ldapConfig
+      summary: Report whether LDAP directory authentication is configured
+      description: |
+        Public probe used by the login page. When AEGIS_LDAP_URL is unset the
+        response is enabled=false with an empty label, and the directory URL,
+        base DN, bind DN, filter and attributes are never revealed. When enabled
+        it returns the configured login entry label (default LDAP 登录). GET
+        only, so no Origin header applies, and the probe does not count against
+        the login limit.
+      security: []
+      responses:
+        '200':
+          description: LDAP availability
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [data, requestId]
+                properties:
+                  data: { $ref: '#/components/schemas/LDAPConfig' }
+                  requestId: { $ref: '#/components/schemas/RequestID' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /api/v1/auth/ldap/login:
+    post:
+      tags: [Auth]
+      operationId: ldapLogin
+      summary: Authenticate against the LDAP directory and set the refresh cookie
+      description: |
+        The directory proves the password: a connection (LDAPS or StartTLS per
+        configuration, one shared deadline), an optional service-account bind,
+        a subtree search whose configured filter has the RFC 4515-escaped
+        login name substituted, and finally a bind as the single matched entry.
+        Zero or more than one matching entry is a generic 401. The local account
+        is then resolved by directory email or username inside tenantSlug, or
+        across tenants when tenantSlug is omitted (more than one match returns
+        400 tenant_required, retry with tenantSlug). A disabled linked account
+        returns 403 account_disabled. When no account is linked and
+        AEGIS_LDAP_AUTO_PROVISION=true, a member account (never admin) is
+        created in the requested tenant or the deployment's default tenant; the
+        directory must return a valid email, otherwise 403 account_not_found.
+        Without auto-provisioning an unlinked identity returns 403
+        account_not_found. Success issues the same session/refresh cookie and
+        returns the same user payload (including tenant) as POST /auth/login;
+        the session is non-persistent because the LDAP form has no remember
+        option. The login audit detail is method=ldap tenant=<slug> and an
+        auto-provision also writes user.create with method=ldap in the same
+        transaction; no password, bind credential, DN or email is ever audited.
+        Every attempt counts against the shared Redis login limit (10/minute
+        across instances); a Redis failure returns 503 with no local fallback.
+      parameters:
+        - { $ref: '#/components/parameters/AuthOrigin' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LDAPLoginInput' }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        '400':
+          description: Invalid JSON/unknown/null field (invalid_request), invalid username/password bounds or tenantSlug format (validation_failed), or the identity exists in multiple tenants without tenantSlug (tenant_required)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429':
+          description: Login rate limit exceeded; error.code is rate_limited
+          headers:
+            Retry-After:
+              description: Retry delay in seconds
+              schema: { type: string, pattern: '^[1-9][0-9]*$' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '503':
+          description: LDAP is unconfigured (error.message `ldap is not configured`), the directory is unreachable or the service bind failed (generic dependencies_unavailable message, endpoint never disclosed), or the shared limiter is unavailable (fail closed); error.code is dependencies_unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '500': { $ref: '#/components/responses/InternalError' }
   /api/v1/auth/me:
     get:
       tags: [Auth]
@@ -3374,6 +3459,30 @@ components:
         label:
           type: string
           description: Login-page button label when enabled; empty when disabled (issuer and client id are never exposed)
+    LDAPConfig:
+      type: object
+      additionalProperties: false
+      required: [enabled, label]
+      properties:
+        enabled:
+          type: boolean
+          description: True only when AEGIS_LDAP_URL is configured
+        label:
+          type: string
+          description: Login-page directory entry label when enabled; empty when disabled (URL, base DN, bind DN, filter and attributes are never exposed)
+    LDAPLoginInput:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username: { type: string, minLength: 1, maxLength: 256, description: Trimmed directory login name, 1-256 UTF-8 bytes without control characters }
+        password: { type: string, format: password, writeOnly: true, minLength: 1, maxLength: 1024, description: Directory password, 1-1024 bytes; never stored locally }
+        tenantSlug:
+          type: string
+          minLength: 1
+          maxLength: 32
+          pattern: '^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$'
+          description: Optional workspace slug. When omitted the directory identity must resolve to a single local account across tenants; multiple matches return 400 tenant_required and the login must be retried with this field.
     Password:
       type: string
       format: password
@@ -4062,7 +4171,7 @@ components:
           properties:
             code:
               type: string
-              enum: [invalid_request, validation_failed, unauthorized, forbidden, account_disabled, tenant_required, origin_denied, conflict, unsupported_media_type, rate_limited, not_found, not_ready, dependencies_unavailable, secrets_not_configured, internal_error]
+              enum: [invalid_request, validation_failed, unauthorized, forbidden, account_disabled, account_not_found, tenant_required, origin_denied, conflict, unsupported_media_type, rate_limited, not_found, not_ready, dependencies_unavailable, secrets_not_configured, internal_error]
             message: { type: string, description: Human-readable safe detail; clients should branch on code/status }
         requestId: { $ref: '#/components/schemas/RequestID' }
   responses:
