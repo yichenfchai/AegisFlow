@@ -77,7 +77,7 @@ nginx -t && nginx -s reload
 - PostgreSQL 与 Redis 均使用网络隔离、认证和 TLS。Compose 的 sslmode=disable、无 Redis 密码仅适用于隔离本地联调。
 - PostgreSQL 是用户、密码哈希、会话的权威来源；需要独立备份、恢复演练与高可用方案，见下文「备份与恢复」。Redis 中断会阻止新登录并使 readyz 返回503，不退回各副本自己的限流。
 - 连接预算 = 应用副本数 × AEGIS_DB_MAX_OPEN，须为迁移、管理和其他服务预留空间。应用不持有本地数据库文件。
-- 迁移和 bootstrap 使用数据库事务 advisory 锁，版本迁移账本检查未知新版本。滚动升级要求 schema 变更遵循先扩展后收缩，见下文「滚动升级」。
+- 迁移和 bootstrap 使用数据库事务 advisory 锁，版本迁移账本检查未知新版本。滚动升级要求 schema 变更遵循先扩展后收缩，见下文「滚动升级」；**带 NOT NULL 新列并回填的迁移（如 v19 的 `tenant_id`）不支持滚动升级，必须全停窗口**，见「生产化运维」→「升级步骤」。
 - PostgreSQL/Redis/Nginx 在示例中各只有一个副本；扩容应用不等于消除依赖单点。生产需按可用性目标配置托管服务、主备或集群及告警。
 - 构建 worker 由 PostgreSQL 会话锁保证每个部署只有一个副本执行与恢复（不提供并行吞吐）；停止持锁副本时，其正在运行的构建会被标记为 `interrupted`，由下一个持锁副本接管恢复。
 - 审批 Webhook 通知（可选）使用 PostgreSQL outbox 与独立 notifier；生产必须使用 HTTPS（仅回环测试允许 HTTP），配置 `AEGIS_APPROVAL_WEBHOOK_SECRET` 时接收方应校验 `X-AegisFlow-Signature`，并按 `X-AegisFlow-Delivery` 幂等处理。投递失败不会改变审批状态，失败行保留在 `approval_notifications` 供排查。同一通道自 P5-A E4 起同时投递 `review.*` 审查事件（`review_notifications` outbox，签名/重试语义相同），接收方需同时处理 `approval.*` 与 `review.*`。
@@ -85,7 +85,7 @@ nginx -t && nginx -s reload
 - 扫描结果与防御事件回写（可选，P5 剩余模块批次 A）：设置 `AEGIS_INGEST_WEBHOOK_SECRET`（16–256 字节，与审查回写密钥独立）后启用 `POST /api/v1/projects/{id}/scans` 与 `POST /api/v1/security-events`，外部扫描/检测工具使用相同的 `X-AegisFlow-Timestamp`/`X-AegisFlow-Signature`/`X-AegisFlow-Delivery` 约定回写（delivery 幂等，`Content-Type: application/json`）；未设置时两个入站接口返回 503，扫描读取接口与防御事件 admin 读取/确认接口仍可用。平台不自研扫描或检测引擎，扫描结果按项目可见性只读展示，防御事件仅管理员可确认（同事务写审计）。
 - 部署审查门禁（可选，P5-A E2）：`AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS` 未设置或为空（默认）时不启用，部署创建/回滚行为与之前完全一致。用逗号分隔填写 `development`/`staging`/`production` 后，这些环境的部署创建与回滚必须引用**同一项目**已批准审查的 `reviewId`；缺失、跨项目或未批准统一返回 400 `validation_failed`，请求不会进入审批队列。审查门禁与 `AEGIS_DEPLOY_APPROVAL_ENVIRONMENTS` **叠加**：先校验审查，再走审批状态机。部署行会快照 `deployments.review_id`（schema v12，可空），审计 detail 追加 `review=<id>`。启用前先确认全部副本都升级到包含 v13 的版本：迁移账本不允许数据库版本高于代码支持范围，因此**升级后不能直接回退到旧二进制**，回退需同时恢复数据库备份（见「滚动升级」）。
 - 项目自动化策略（P5 剩余模块批次 C，schema v16）：策略是**数据库配置**，不新增环境变量；在项目「策略」页由全局 admin 或项目 maintainer 写入 `requireReview`/`requiredScanVerdict`。策略叠加在 `AEGIS_DEPLOY_REQUIRE_REVIEW_ENVIRONMENTS` 之上，只会加严：`requireReview=true` 时任何目标环境都要求同项目已批准审查，`requiredScanVerdict=passed` 时项目最新一条扫描必须存在且结论为 passed；无策略行 = 默认关闭，既有部署行为不变。创建与回滚走同一套门禁（审查 → 最新扫描 → 审批），命中策略时审计 detail 追加 `policy=<projectId>`。与既有门禁一样，迁移账本不允许数据库版本高于代码支持范围：升级到包含 v16 的版本后**不能直接回退到旧二进制**，回退需同时恢复数据库备份（见「滚动升级」）。审计 CSV 导出（admin-only）只读 `auth_audit`，不改变任何部署状态，也不存在额外的数据面依赖。
-- 多租户（阶段 F1–F2）：同一部署内的租户共享 PostgreSQL/Redis 与 worker，隔离由 `tenant_id` 与查询谓词保证（业务数据、审计、凭据互不可见，跨租户一律 404）；租户创建/列出/禁用只通过 `backend/cmd/tenant`（复用 `AEGIS_DATABASE_URL`），没有 HTTP 开通入口；升级到 schema v19 后不能直接回退旧二进制，回退需同时恢复数据库备份。尚无子域/路径路由、租户切换、平台控制台与每租户配额。其余业务对象级权限按 TODO 推进。
+- 多租户（阶段 F1–F2）：同一部署内的租户共享 PostgreSQL/Redis 与 worker，隔离由 `tenant_id` 与查询谓词保证（业务数据、审计、凭据互不可见，跨租户一律 404）；租户创建/列出/禁用只通过 `backend/cmd/tenant`（复用 `AEGIS_DATABASE_URL`），没有 HTTP 开通入口；升级到 schema v19 后不能直接回退旧二进制，回退需同时恢复数据库备份；**v18→v19 升级与回滚都必须全停窗口，不支持滚动升级**（旧代码写入不兼容、旧二进制拒绝启动）。尚无子域/路径路由、租户切换、平台控制台与每租户配额。其余业务对象级权限按 TODO 推进。
 - 部署目标 endpoint 由 admin 配置，admin 是可信配置者，目标 endpoint 属于受信配置面：允许私网/回环（自托管内网场景），拒绝 link-local 与云元数据地址（169.254.0.0/16、fe80::/10、100.100.100.200、fd00:ec2::254）；创建/更新返回 400，运行时在连接建立前按解析后的 IP 再校验一次（防 DNS rebinding）。
 
 ## 备份与恢复
@@ -137,16 +137,22 @@ psql "$RESTORE_URL" -c "SELECT count(*) FROM deployments WHERE review_id IS NOT 
 psql "$RESTORE_URL" -c "SELECT count(*) FROM review_external_results"
 psql "$RESTORE_URL" -c "SELECT count(*) FROM review_notifications WHERE status <> 'delivered'"
 
-# 4) 凭据可解密性：rekey 默认只读 dry run，不会改写恢复库。
-#    必须在 backend 模块目录执行（仓库根目录没有 go.mod）。
+# 4) 凭据可解密性（可选冒烟）：cmd/rekey 是“轮换”工具，不是恢复校验工具。
+#    它强制要求 AEGIS_SECRET_KEY_PREVIOUS 且必须与 AEGIS_SECRET_KEY 不同；
+#    单钥运行会失败（rekey: AEGIS_SECRET_KEY_PREVIOUS is required，exit 1），
+#    因此不要用“备份时同一密钥”直接跑 rekey。
+#    若确实要用它做只读冒烟，只能做“轮换模拟”：新随机钥当当前钥、备份时点钥当 previous，
+#    在 backend 模块目录执行（仓库根目录没有 go.mod），且不要对恢复库加 -apply：
 cd backend
 AEGIS_DATABASE_URL="$RESTORE_URL" \
-AEGIS_SECRET_KEY=<备份记录中的当前钥> \
-AEGIS_SECRET_KEY_PREVIOUS=<轮换期旧钥> \
+AEGIS_SECRET_KEY=<本次演练新生成的随机钥> \
+AEGIS_SECRET_KEY_PREVIOUS=<备份时点的当前钥> \
 go run ./cmd/rekey
 ```
 
-第 4 步输出 `dry run: scanned=N already_current=... reencrypted=... failed=0` 表示所有 `deployment_targets.secret_cipher` 都能用备份的密钥解开；`failed>0` 说明恢复出的密文与提供的密钥不匹配，先核对备份记录，**不要删除旧钥**。恢复演练不需要 `-apply`（那会改变恢复库的校验基线）。`rekey` 要求同时提供当前钥与退役钥；从未轮换过的环境没有退役钥，此时改为在临时实例登录管理员，对带凭据的部署目标执行一次「检查」——探测会在内存中解密凭据并发请求，成功即证明密文可解。
+第 4 步输出 `dry run: scanned=N already_current=... reencrypted=... failed=0` 表示恢复出的 `deployment_targets.secret_cipher` 能被**备份时点的钥**解开（`reencrypted>0` 即旧钥可解；`already_current` 表示已用本次提供的新钥密封）。`failed>0` 说明恢复出的密文与提供的钥不匹配，先核对备份记录，**不要删除旧钥**；恢复演练不要 `-apply`（会改变恢复库的校验基线）。
+
+**备份恢复后的密钥一致性校验不要用 `cmd/rekey` 单钥进行**，应优先走应用路径：用恢复库启动临时实例，登录管理员并对带凭据的部署目标执行一次「检查」——探测会在内存中解密凭据并发请求，成功即证明密文可解；`secrets` 表按设计没有读取路径，只能通过密钥管理流程确认。`cmd/rekey` 的正式用法是部署凭据轮换（见下文「部署凭据密钥轮换」与 [scripts/ops/README.md](../scripts/ops/README.md) 第 2 节）。
 
 把恢复出的库指向一个**临时**应用实例（不同端口、独立 Redis namespace），等 `/readyz` 返回 200、能登录并读到项目后，再按变更窗口切换生产连接。不要在副本仍在运行时直接覆盖生产库：`pg_restore --clean` 会与在线连接和迁移锁冲突。
 
@@ -181,6 +187,8 @@ go run ./cmd/rekey
 
 应用启动时自动执行版本化迁移，并用 advisory 事务锁保证多副本串行；发现数据库版本高于代码支持范围时**拒绝启动**。因此升级的基本约束是「schema 先扩展、代码后使用、旧列最后删除」。
 
+> **例外（硬限制）：v18→v19 不能滚动升级。** v19 给 14 张业务表新增 `tenant_id NOT NULL` 并回填收紧：迁移完成后仍在运行的旧 v18 副本执行 INSERT 会失败（旧代码不写 `tenant_id`），且旧二进制看到 schema 19 会直接拒绝启动（`unsupported schema migration version 19`，exit 1）。凡带 NOT NULL 新列并需要回填的迁移都不能按本节“逐副本替换”执行，必须按「生产化运维」→「升级步骤」的全停窗口流程操作。本节其余内容适用于纯加法迁移。
+
 1. **升级前**：完成一次备份并确认可恢复；记录当前 `SELECT max(version) FROM schema_migrations`；确认后端与前端来自同一发布版本。
 2. **逐副本替换**：一次下线一个副本，等新副本 `/readyz` 返回 200 再处理下一个。入口应在此期间把该副本摘除；未持 worker 租约的副本可以安全替换。
 3. **构建 worker**：停止持锁副本会把正在运行的构建标记为 `interrupted`（不是业务失败，可重试）。升级窗口尽量避开构建高峰，或提前清空排队构建。
@@ -196,14 +204,17 @@ go run ./cmd/rekey
 
 本节把升级、回滚、备份恢复与租户迁移串成可执行的运维流程；脚本用法、参数与故障排查见 [scripts/ops/README.md](../scripts/ops/README.md)，脚本本身（`scripts/ops/backup-postgres.ps1`、`restore-postgres.ps1`、`export-tenant.ps1`、`import-tenant.ps1`、`verify-schema.ps1`）面向 Windows PowerShell 5.1 与 `pwsh`，且**不在 CI 中运行**（需要真实数据库与凭据）。多租户阶段的 schema 版本是 v19：从 v19 起迁移只向前、没有 down migration，回滚必须走"恢复升级前备份 + 旧二进制"。
 
+**本版本的硬限制：v18→v19 必须全停窗口，不能滚动升级。** v19 迁移给 14 张业务表新增 `tenant_id NOT NULL` 并回填收紧：旧 v18 代码的 INSERT 不写该列（迁移后仍写入会失败），旧二进制看到 schema 19 会拒绝启动（实测 exit 1，`unsupported schema migration version 19`）。因此不能按“滚动升级/先起新副本”执行；回滚同样需要停全部副本。以下升级步骤即按全停窗口编写。
+
 ### 升级前检查清单
 
 - [ ] 已用当前版本完成一次全库备份，`.dump` 与 `.sha256` 均落盘、**离线/加密保存**，并记录 SHA-256 到变更单。
-- [ ] 已记录当前 `SELECT max(version) FROM schema_migrations`（例如 19），并确认目标版本所需迁移清单来自同一发布线。
+- [ ] 已记录当前 `SELECT max(version) FROM schema_migrations`（例如此次升级前是 18），并确认目标版本所需迁移清单来自同一发布线；v18 基线另用 psql 记录结构/行数（见 [scripts/ops/README.md](../scripts/ops/README.md) 第 5 节；`verify-schema.ps1` 只适用于 v19+，对 v18 会 `[SKIP]`/exit 2）。
 - [ ] 已确认磁盘空间：备份大小、恢复演练库、PostgreSQL 数据目录与 WAL 均有足够余量（恢复需要一份额外全库空间）。
 - [ ] `AEGIS_SECRET_KEY`（轮换期还有 `AEGIS_SECRET_KEY_PREVIOUS`）、`AEGIS_JWT_SECRET`、TLS 私钥等机密已单独备份，且与数据库备份**分开存放**；轮换中的密钥不要提前删除。
 - [ ] 已确认所有副本/worker 都能在窗口内停止与重启，构建/部署队列已排空或允许 `interrupted`，网关摘流与恢复步骤明确。
-- [ ] 已安排变更窗口与回滚决策人，通知 tenant 管理员登录会短暂中断（滚动替换期间按副本摘流，正常无需全停）。
+- [ ] 已确认这是**全停窗口**：起新版本前所有旧副本与 worker 都会停止（v18→v19 不支持逐副本滚动或“先起新副本”），且已用 `pg_stat_activity` 确认没有旧应用连接在写库；回滚同样需要全停。
+- [ ] 已安排变更窗口与回滚决策人，并通知管理员/用户登录与在线请求会在窗口内中断（可接受会话连续，或按策略强制重新登录，见「升级后的会话与 token」）。
 - [ ] 已确认部署的 `AEGIS_DEFAULT_TENANT_SLUG` 在数据库中仍存在（v18/v19 升级与租户导入后尤其重要），否则 server 会拒绝启动。
 
 ### 全库备份（升级前必须）
@@ -219,9 +230,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/ops/backup-postg
 
 ### 升级步骤
 
-1. **停写/摘流**：把副本从网关摘除并停止旧版本进程（滚动替换时逐副本进行；本仓库迁移采用"先扩展后收缩"，但本批不改变 schema，升级窗口内仍建议避免新写入的部署/审批操作）。确认没有持锁的构建 worker 正在写库。
-2. **备份**：按上一节执行全库备份并校验归档；记录 `schema_migrations` 当前最大版本。
-3. **起新版本**：用新二进制启动（应用启动时在事务 advisory 锁下自动执行迁移，遇到未知更高版本会拒绝启动）。等待 `/readyz` 返回 200；观察启动日志确认迁移版本已推进到目标版本。
+> **适用范围与硬限制**：本节按 v18→v19 的**全停窗口**编写。v19 给 14 张业务表新增 `tenant_id NOT NULL`（先加列、回填、再 `SET NOT NULL` 并建新索引），旧 v18 代码的 INSERT 不写该列，因此迁移完成后不能有任何旧副本继续写入；旧二进制看到 schema 19 也会拒绝启动（实测 exit 1：`unsupported schema migration version 19`）。**不得按“滚动升级/先起新副本”操作**；以后凡带 NOT NULL 新列并需要回填的迁移同样必须全停。
+
+1. **停写/摘流（全停）**：入口摘流后**停掉全部旧版本副本与 worker**，不要保留任何旧进程；用 `pg_stat_activity` 确认没有旧应用连接在写库。停 worker 时正在运行的构建会被标记 `interrupted`（不是业务失败，可重试），排空或接受该状态。
+2. **备份**：按上一节执行全库备份并校验归档（`pg_restore --list` 失败不得继续）；记录 `schema_migrations` 当前最大版本。升级前 v18 基线另用 psql 记录（见 [scripts/ops/README.md](../scripts/ops/README.md) 第 5 节）：账本 18、默认租户行、14 张业务表 `tenant_id` 查询返回 0 行、关键表行数；`verify-schema.ps1` 只适用于 v19+，对 v18 会 `[SKIP]`/exit 2，这是预期而不是失败。
+3. **起单个新版本实例完成迁移**：只启动**一个** v19 实例（多副本虽由 advisory 锁串行迁移，但窗口期保持单实例便于定位），等待 `/readyz` 返回 200，观察启动日志确认 `schema_migrations` 已推进到目标版本；**迁移校验通过前不要启动其余副本**。
 4. **校验 schema**：
 
    ```powershell
@@ -229,20 +242,27 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/ops/backup-postg
      -Database aegisflow -Host db.internal -Port 5432 -User aegis_backup -ExpectedVersion 19
    ```
 
-   要求全部 `[PASS]`：`schema_migrations` 连续、24 张表齐全、14 张业务表 `tenant_id` NOT NULL 且外键/唯一索引存在。
-5. **冒烟**：`/healthz` 与 `/readyz` 200；管理员与一个普通租户用户（带 `tenantSlug`）登录成功；项目列表、构建详情、部署目标与审查/审批列表可读；触发一次构建并看到日志；设置页审计出现对应记录。多租户环境再抽查另一个租户数据不可见（跨租户 404）。
-6. **恢复流量**：把副本按依赖顺序重新接入网关并恢复写入，观察错误率、`/readyz`、构建/部署 worker 日志。
+   要求 48/48 `[PASS]`：`schema_migrations` 连续、24 张表齐全、14 张业务表 `tenant_id` NOT NULL 且外键/唯一索引存在。再用 psql 抽查回填：14 张表 `tenant_id` 全部非空并回填到默认租户（如 `SELECT count(*) FROM projects WHERE tenant_id IS NULL` 应为 0；单租户部署中 `SELECT DISTINCT tenant_id FROM projects` 只有默认租户）。
+5. **冒烟（单实例）**：`/healthz` 与 `/readyz` 200；管理员与一个普通租户用户（带 `tenantSlug`）登录成功；项目列表、构建详情、部署目标与审查/审批列表可读；多租户环境抽查另一个租户数据不可见（跨租户 404）。
+6. **起其余副本并恢复流量**：确认迁移与冒烟通过后，再按依赖顺序启动其余副本、接回网关并恢复写入，观察错误率、`/readyz`、构建/部署 worker 日志。
 7. **收尾**：确认构建/部署 worker 已领取租约、队列恢复；把备份哈希、迁移版本、冒烟结果、负责人写入演练记录。
+
+**升级后的会话与 token（v18→v19）**：不要默认声称升级会让 token 失效。v18（阶段 F1，自 commit `9c0bb46` 起）签发的 access token 已带 `tid`（租户 id），v19 迁移不改 `auth_sessions`/`auth_refresh_tokens`，因此**升级前签发的 access token 与 refresh 会话在升级后通常仍然有效**（实测旧 access token 访问 `/auth/me`、`/projects` 均 200；会话连续不影响隔离，租户 id 已在 token 内强制）。若安全策略要求升级窗口强制全体重新登录，可选：
+
+- **接受会话连续（默认）**：不做额外操作；v18 起 token 已带租户 id，升级不降低隔离强度。
+- **强制重新登录**：轮换 `AEGIS_JWT_SECRET`（所有副本统一使用新密钥并重启）使**所有 access token 立即失效**；refresh token 是数据库中的不透明令牌，不受 JWT 密钥影响，还需**清理或等待 refresh 会话过期**（默认 `AEGIS_REFRESH_TTL=720h`/30 天）：DBA 按运维策略删除 `auth_sessions`/`auth_refresh_tokens`（当前没有会话吊销运维 CLI，需按租户/时间批量执行 SQL）或等待其过期，也可通过禁用/重设账号等既有策略撤销会话。
+
+两种方式影响不同：只轮换 JWT 密钥会让在线 access token 立即 401、前端触发重新登录，但未清理的 refresh 会话仍可换取新 access token；清理 refresh 会话则所有用户必须重新登录。请在变更单记录所选策略与执行时间。
 
 ### 回滚策略（v19 起不可 down migrate）
 
 迁移账本没有 down migration，且 v13/v16/v19 之后旧二进制无法读取更高版本 schema（启动时拒绝）。因此：
 
 - **回滚 = 恢复升级前备份 + 回退旧二进制**，不是执行反向 SQL。升级前备份是唯一可信回滚点，没有可用备份就不应在生产执行不可逆迁移。
-- 回滚步骤：全部副本停写 → 新库恢复升级前 dump（`restore-postgres.ps1` 默认拒绝覆盖，建议恢复到新库）→ `verify-schema.ps1` 校验 → 用旧版本二进制指向恢复库启动 → `/readyz`+登录+关键列表冒烟 → 切流量。不要用 `pg_restore --clean` 直接覆盖在线库（会与在线连接/迁移锁冲突）。
-- 恢复出的库同样需要 `AEGIS_SECRET_KEY`（及轮换期旧钥），先跑 `cmd/rekey` dry run 确认密文可解（见「备份与恢复」第 4 步），再切生产。
+- **v18→v19 回滚同样需要全停窗口**：停掉**全部** v19 副本与 worker → 在**新库**恢复升级前 dump（`restore-postgres.ps1` 默认拒绝覆盖；建议恢复到新库；脚本会打印恢复库的 `schema version X / 表数 / 行数摘要`）→ 校验恢复库：v18 版本时 `verify-schema.ps1` 会 `[SKIP]`/exit 2（预期行为），改用 psql 基线检查（账本 18、默认租户行、14 张业务表 `tenant_id` 返回 0 行、关键表行数与升级前一致）→ 用旧版本二进制指向恢复库启动 → `/readyz`+登录+关键列表冒烟 → 切流量。不要用 `pg_restore --clean` 直接覆盖在线库（会与在线连接/迁移锁冲突）。
+- 恢复出的库同样需要备份时点的 `AEGIS_SECRET_KEY`（及轮换期旧钥）。**不要用单钥 `cmd/rekey` 校验**：rekey 是轮换工具（要求 `AEGIS_SECRET_KEY_PREVIOUS` 且与当前钥不同）；可做“轮换模拟”dry run（新随机钥当当前钥、备份时点钥当 previous，`failed=0`）或用临时实例登录 + 部署目标探测路径验证，见「备份与恢复」。
 - 前端静态资源可独立回滚到上一版 `dist/` 并 `nginx -s reload`；API 与前端允许分开回退，但 schema 只能通过恢复备份回退。
-- 若只是应用版本问题而 schema 未变（本批只加脚本/文档，不改 schema），可以只回退二进制；一旦迁移已应用，回退二进制前必须确认它兼容当前 schema 版本。
+- 若只是应用版本问题而 schema 未变，可以只回退二进制；一旦迁移已应用，回退二进制前必须确认它兼容当前 schema 版本（v19 迁移后旧 v18 二进制会拒绝启动）。
 
 ### 租户级备份/恢复（tenant 迁移）
 
@@ -267,8 +287,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/ops/backup-postg
      -Host db-new.internal -Port 5432 -User aegis_backup
    ```
 
-   导入前会校验 manifest、每个 CSV 的 SHA-256 与表头、目标 schema 版本；目标库已有同 slug/同 id 租户时默认拒绝，确认替换才用 `-Force`（同一事务内删除并重建该租户数据，失败整体回滚）。目标 schema 更高时需显式 `-AllowNewerSchema`，并先确认新增迁移是加法变更。
-5. **校验**：`verify-schema.ps1` 全 PASS；逐表行数/关键数据与源库比对；用带 `tenantSlug` 的登录、项目/构建/部署/审查/审批列表与跨租户 404 做冒烟。**密钥要求**：目标部署必须配置与源部署相同的 `AEGIS_SECRET_KEY`（轮换期还需 `AEGIS_SECRET_KEY_PREVIOUS`），否则 `secrets` 与 `deployment_targets` 密文不可解密，只能重新录入；可用 `cmd/rekey` dry run 验证。
+   导入前会校验 manifest、每个 CSV 的 SHA-256 与表头、目标 schema 版本；目标库已有同 slug/同 id 租户时默认拒绝，确认替换才用 `-Force`（同一事务内删除并重建该租户数据，失败整体回滚）。目标 schema 更高时需显式 `-AllowNewerSchema`，并先确认新增迁移是加法变更。**全新迁移库首次导入默认租户必须 `-Force`**：目标库由 server 迁移后已 seed 同 id/slug 的默认租户（同一 `tenant_default_0000000000000001`/`default`），默认租户导出包携带同一 id/slug，不带 `-Force` 会失败（`already contains tenant 'default' ... refusing to import without -Force`）；`-Force` 语义=只替换该租户（含目标库 seed 的 bootstrap 管理员），同一事务、失败回滚，其他租户不动。导入其他租户或目标库没有同 slug/同 id 冲突时不需要 `-Force`。示例见 [scripts/ops/README.md](../scripts/ops/README.md) 第 4 节。
+5. **校验**：`verify-schema.ps1` 全 PASS；逐表行数/关键数据与源库比对；用带 `tenantSlug` 的登录、项目/构建/部署/审查/审批列表与跨租户 404 做冒烟。**密钥要求**：目标部署必须配置与源部署相同的 `AEGIS_SECRET_KEY`（轮换期还需 `AEGIS_SECRET_KEY_PREVIOUS`），否则 `secrets` 与 `deployment_targets` 密文不可解密，只能重新录入。**不要用单钥 `cmd/rekey` 验证**（它是轮换工具，要求 `AEGIS_SECRET_KEY_PREVIOUS` 且必须与当前钥不同）；按「备份与恢复」做轮换模拟 dry run（`failed=0`）或走登录/部署目标探测路径核对。
 6. **切换与回退**：确认目标部署 `AEGIS_DEFAULT_TENANT_SLUG` 指向仍存在的租户后切流量；保留源库数据与导出包直到租户验收完成。若导入出错，事务已回滚，修复后重试；若目标租户已被部分使用，用 `-Force` 从同一导出包重建（先确认目标库数据可丢弃）。
 
 ### 密钥轮换注意
@@ -286,12 +306,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/ops/backup-postg
 | 备份 | dump 文件名、大小、SHA-256、存储位置（加密/异地） |
 | 恢复 | 目标库、`restore-postgres.ps1` 结果、恢复后行数摘要、`verify-schema` 结果 |
 | 租户迁移 | 租户 slug/id、导出目录、manifest 总行数、导入目标库、导入后总行数、逐表比对结果 |
-| 密钥校验 | `cmd/rekey` dry run 输出（scanned/already_current/reencrypted/failed）、使用的密钥标识 |
+| 密钥校验 | 备份时点 `AEGIS_SECRET_KEY`（及轮换期旧钥）的可解性验证方式与结果：轮换模拟 `cmd/rekey` dry run（scanned/already_current/reencrypted/failed）或临时实例登录/部署目标探测路径；注意 rekey 需要两把不同的钥，不要记录“单钥 rekey”结果 |
 | 冒烟 | `/readyz`、管理员登录、项目/构建/部署/审查列表、跨租户 404 |
 | 实测 RTO/RPO | 从开始恢复到可登录的耗时、最近可恢复数据时间点 |
 | 负责人/结论 | 执行人、复核人、是否通过、遗留问题与后续动作 |
 
 演练至少每季度一次，在隔离环境进行，不接触生产凭据；演练记录按内部合规要求留存，不写入仓库。
+
+#### 真实演练结论（2026-11-28，批次 O2）
+
+- **范围**：v18（commit `9c0bb46`，schema 18）→ v19（commit `ca45eed`，schema 19）全量真实演练（真实 PostgreSQL 17.6 / Redis / 编译二进制），覆盖升级、升级前后数据一致性、租户隔离、整库备份/恢复、v18 回滚路径、租户导出/导入，**全部通过**。完整时间线、命令与证据路径见内部报告 `reports/ops-rehearsal-2026-11-28.md`（`reports/` 被 `.gitignore` 忽略，仅本地/内部留存）。
+- **v18→v19 关键结论**：迁移只加列/回填/索引，升级前后 23 张表行数与 20 个数据摘要完全一致（仅 `schema_migrations` 版本 18→19 不同）；14 张业务表 `tenant_id` 回填后每表 `NOT NULL` 行数=总行数、`DISTINCT tenant_id`=1（默认租户）；`verify-schema.ps1 -ExpectedVersion 19` **48/48 PASS**；A/B 双向跨租户访问均 404；备份 SHA-256 与 `.sha256` sidecar 一致。v18 二进制指向 schema-19 库实测 **exit 1**（`unsupported schema migration version 19`），是“全停窗口 + 恢复备份回滚”结论的直接证据；升级前 v18 access token 在 v19 上仍有效（v18 已带 `tid`，见「升级后的会话与 token」）。
+- **耗时（小数据量，dump 61.9 KiB）**：迁移随启动完成 0.44s、备份 0.1s、恢复 0.81s、租户导入 0.92s（导出 0.63s）。**这些数字只验证流程，不代表生产 RTO**：v19 的全表 `UPDATE` 回填 + `SET NOT NULL` 会随数据量放大，GB 级/大表必须用接近生产规模的数据重新演练，并测量维护窗口、锁等待、WAL 与磁盘余量。
+- **本次未覆盖（生产前待验证）**：大库 RTO、`/metrics` 监控与告警、备份调度/保留/校验自动化、多副本摘流顺序、含排队或运行中构建/部署的完整升级窗口。详见报告 §7。
 
 ## 监控与健康检查
 
